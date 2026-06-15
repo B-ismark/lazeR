@@ -1,0 +1,39 @@
+# --- Secrets / machine-local (never commit) ---
+server/.lazer_key
+server/.lazer_token
+android/local.properties
+
+# --- Python ---
+__pycache__/
+*.pyc
+
+# --- PyInstaller / native build output ---
+/build/
+*.spec
+
+# --- Android / Gradle build output ---
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/build_icon.log
+.gradle/
+
+# --- Distribution: keep helper scripts + docs, drop built binaries & dupes ---
+dist/LazeR.exe
+dist/LazeR.apk
+dist/server/
+dist/PROTOCOL.md
+dist/_*.txt
+
+# --- Top-level build artifacts ---
+*.apk
+*.exe
+*.zip
+
+# --- Vendored 3rd-party binary ---
+tools/upx/
+
+# --- Editor ---
+.vscode/
+.idea/
