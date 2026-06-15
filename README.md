@@ -1,0 +1,2 @@
+# lazeR
+My lazy remote
