@@ -170,9 +170,13 @@ def make_brightness():
         _flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
         def _ps(cmd):
+            # stdin=DEVNULL is essential under the --windowed PyInstaller exe: a
+            # windowed process has no valid stdin handle, and without redirecting it
+            # PowerShell fails to start — which silently made the brightness probe
+            # (and reads) fail in the packaged build while working from source.
             return subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
-                                  capture_output=True, text=True, timeout=4,
-                                  creationflags=_flags)
+                                  stdin=subprocess.DEVNULL, capture_output=True,
+                                  text=True, timeout=4, creationflags=_flags)
 
         def get_win():
             try:
