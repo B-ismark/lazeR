@@ -50,6 +50,7 @@ ICON_FILE = os.path.join(_BUNDLE_DIR, "LazeR.ico")
 CONTROL_VERBS = {
     "MOVE", "SCROLL", "CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP",
     "COMBO", "ASW", "SYS", "PRES", "VOL", "MEDIA", "KEY", "KEYSP",
+    "BRIGHT", "CLIP",
 }
 
 mouse = MouseController()
@@ -153,6 +154,163 @@ def make_volume():
 
 
 get_volume, set_volume, VOLUME_BACKEND = make_volume()
+
+
+# ── brightness ──────────────────────────────────────────────────────────────
+def make_brightness():
+    """Return (get_brightness, set_brightness, label); fns may be None if absent.
+    Same shape as make_volume — best effort per OS, integrated display only."""
+    plat = sys.platform
+
+    if plat.startswith("win"):
+        # WMI's WmiMonitorBrightness(Methods) drive the integrated panel. Reached
+        # via PowerShell so we need no extra dependency. CREATE_NO_WINDOW keeps the
+        # console from flashing each call.
+        import subprocess
+        _flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        def _ps(cmd):
+            return subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                                  capture_output=True, text=True, timeout=4,
+                                  creationflags=_flags)
+
+        def get_win():
+            try:
+                out = _ps("(Get-CimInstance -Namespace root/WMI "
+                          "-ClassName WmiMonitorBrightness).CurrentBrightness")
+                return int(out.stdout.strip().splitlines()[0])
+            except Exception:
+                return 0
+
+        def set_win(pct):
+            try:
+                _ps("(Get-CimInstance -Namespace root/WMI "
+                    "-ClassName WmiMonitorBrightnessMethods)."
+                    f"WmiSetBrightness(1,{int(pct)})")
+            except Exception:
+                pass
+
+        # Probe once: laptops expose it, most desktops don't.
+        try:
+            chk = _ps("(Get-CimInstance -Namespace root/WMI "
+                      "-ClassName WmiMonitorBrightness).CurrentBrightness")
+            if chk.stdout.strip():
+                return get_win, set_win, "wmi"
+        except Exception:
+            pass
+        return None, None, None
+
+    if plat == "darwin":
+        import shutil, subprocess
+        if shutil.which("brightness"):           # the `brightness` CLI (brew)
+            def get_mac():
+                try:
+                    out = subprocess.check_output(["brightness", "-l"]).decode()
+                    import re
+                    m = re.search(r"brightness\s+([0-9.]+)", out)
+                    return int(round(float(m.group(1)) * 100)) if m else 0
+                except Exception:
+                    return 0
+
+            def set_mac(pct):
+                subprocess.run(["brightness", str(max(0, min(100, int(pct))) / 100.0)],
+                               check=False)
+            return get_mac, set_mac, "brightness"
+        return None, None, None
+
+    # Linux: sysfs backlight (read always; write needs a udev rule or root).
+    import glob
+    bls = glob.glob("/sys/class/backlight/*")
+    if bls:
+        bl = bls[0]
+
+        def get_linux():
+            try:
+                with open(f"{bl}/brightness") as f:
+                    cur = int(f.read().strip())
+                with open(f"{bl}/max_brightness") as f:
+                    mx = int(f.read().strip())
+                return int(round(cur / mx * 100)) if mx else 0
+            except Exception:
+                return 0
+
+        def set_linux(pct):
+            try:
+                with open(f"{bl}/max_brightness") as f:
+                    mx = int(f.read().strip())
+                with open(f"{bl}/brightness", "w") as f:
+                    f.write(str(int(round(max(0, min(100, pct)) / 100 * mx))))
+            except Exception:
+                pass
+        return get_linux, set_linux, "sysfs"
+
+    return None, None, None
+
+
+get_brightness, set_brightness, BRIGHTNESS_BACKEND = make_brightness()
+
+
+# ── clipboard ───────────────────────────────────────────────────────────────
+def set_clipboard(text):
+    """Put text on the OS clipboard (no extra dependency). Returns True on success."""
+    plat = sys.platform
+    try:
+        if plat.startswith("win"):
+            import ctypes
+            from ctypes import wintypes
+            CF_UNICODETEXT = 13
+            GMEM_MOVEABLE = 0x0002
+            u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+            # Pin signatures: without these, 64-bit HANDLEs are truncated to c_int
+            # and the lock/SetClipboardData calls silently corrupt the handle.
+            u32.OpenClipboard.argtypes = [wintypes.HWND]
+            u32.OpenClipboard.restype = wintypes.BOOL
+            k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+            k32.GlobalAlloc.restype = wintypes.HGLOBAL
+            k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+            k32.GlobalLock.restype = ctypes.c_void_p
+            k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+            u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+            u32.SetClipboardData.restype = wintypes.HANDLE
+            if not u32.OpenClipboard(None):
+                return False
+            try:
+                u32.EmptyClipboard()
+                buf = text.encode("utf-16-le") + b"\x00\x00"
+                h = k32.GlobalAlloc(GMEM_MOVEABLE, len(buf))
+                ptr = k32.GlobalLock(h)
+                if not ptr:
+                    return False
+                ctypes.memmove(ptr, buf, len(buf))
+                k32.GlobalUnlock(h)
+                # On success the system owns the memory block — don't free it.
+                return bool(u32.SetClipboardData(CF_UNICODETEXT, h))
+            finally:
+                u32.CloseClipboard()
+        import subprocess
+        if plat == "darwin":
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
+            return True
+        import shutil
+        for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]):
+            if shutil.which(cmd[0]):
+                subprocess.run(cmd, input=text.encode("utf-8"), check=False)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def do_clip(text):
+    """Set the clipboard to text, then paste it (Ctrl+V / Cmd+V)."""
+    if not text or not set_clipboard(text):
+        return
+    paste_mod = Key.cmd if sys.platform == "darwin" else Key.ctrl
+    keyboard.press(paste_mod)
+    keyboard.press("v")
+    keyboard.release("v")
+    keyboard.release(paste_mod)
+
 
 MEDIA_KEYS = {
     "play_pause": Key.media_play_pause,
@@ -604,6 +762,18 @@ def handle_packet(verb, rest, sock, addr):
             except OSError:
                 pass
 
+    elif verb == "BRIGHT":
+        if set_brightness is None:
+            return
+        try:
+            pct = max(0, min(100, int(rest.split()[0])))
+        except (IndexError, ValueError):
+            return
+        set_brightness(pct)
+
+    elif verb == "CLIP":
+        do_clip(rest)
+
     elif verb == "MEDIA":
         key = MEDIA_KEYS.get(rest.strip())
         if key is not None:
@@ -853,6 +1023,8 @@ _ACTION_LABELS = {
     "SYS":    lambda r: (f"System · {r.strip()}", "act"),
     "PRES":   lambda r: (f"Slides · {r.strip()}", "act"),
     "VOL":    lambda r: (f"Volume → {r.strip()}%", "act"),
+    "BRIGHT": lambda r: (f"Brightness → {r.strip()}%", "act"),
+    "CLIP":   lambda r: (f'Paste · “{r[:24]}”', "act") if r else None,
 }
 
 
@@ -999,6 +1171,10 @@ def serve_loop(wire, emit, net, hostname):
         if verb == "VGET":
             if get_volume is not None:
                 wire.reply(sock, addr, f"VOL {get_volume()}")
+            continue
+        if verb == "BGET":
+            if get_brightness is not None:
+                wire.reply(sock, addr, f"BRI {get_brightness()}")
             continue
 
         # Local input wins: while the user has taken over (or after a panic),

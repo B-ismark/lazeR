@@ -7,6 +7,7 @@ data class Settings(
     val sensitivity: Float = 1.6f,    // cursor speed multiplier
     val naturalScroll: Boolean = true,  // touchscreen feel: content follows fingers
     val haptics: Boolean = true,
+    val acceleration: Boolean = true,   // fast flicks travel farther (pointer accel curve)
 )
 
 class SettingsStore(context: Context) {
@@ -16,6 +17,7 @@ class SettingsStore(context: Context) {
         sensitivity = prefs.getFloat("sensitivity", 1.6f),
         naturalScroll = prefs.getBoolean("naturalScroll", true),
         haptics = prefs.getBoolean("haptics", true),
+        acceleration = prefs.getBoolean("acceleration", true),
     )
 
     fun save(s: Settings) {
@@ -23,6 +25,7 @@ class SettingsStore(context: Context) {
             .putFloat("sensitivity", s.sensitivity)
             .putBoolean("naturalScroll", s.naturalScroll)
             .putBoolean("haptics", s.haptics)
+            .putBoolean("acceleration", s.acceleration)
             .apply()
     }
 

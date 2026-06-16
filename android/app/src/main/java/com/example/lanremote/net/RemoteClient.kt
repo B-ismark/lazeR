@@ -86,6 +86,8 @@ class RemoteClient {
     fun mouseDown() = send("MDOWN")                        // drag-lock press
     fun mouseUp() = send("MUP")                            // drag-lock release
     fun setVolume(percent: Int) = send("VOL ${percent.coerceIn(0, 100)}")
+    fun setBrightness(percent: Int) = send("BRIGHT ${percent.coerceIn(0, 100)}")
+    fun clipboardPaste(text: String) = send("CLIP $text")  // set laptop clipboard + paste
     fun media(action: String) = send("MEDIA $action")     // play_pause | next | prev
     fun key(text: String) = send("KEY $text")              // literal text, spaces ok
     fun keySpecial(name: String) = send("KEYSP $name")     // enter | backspace | ...
@@ -108,6 +110,30 @@ class RemoteClient {
             sock.receive(reply)
             val parts = (decodeReply(reply) ?: "").split(" ")
             if (parts.getOrNull(0) == "VOL") parts.getOrNull(1)?.toIntOrNull() else null
+        } catch (e: Exception) {
+            null
+        } finally {
+            try {
+                socket?.soTimeout = 0
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
+     * Ask the laptop for its current display brightness (BGET -> "BRI n").
+     * @return 0..100, or null on timeout / no brightness backend. Runs on IO.
+     */
+    suspend fun queryBrightness(timeoutMs: Int = 400): Int? = withContext(Dispatchers.IO) {
+        val sock = socket ?: return@withContext null
+        try {
+            sendNow("BGET")
+            sock.soTimeout = timeoutMs
+            val buf = ByteArray(64)
+            val reply = DatagramPacket(buf, buf.size)
+            sock.receive(reply)
+            val parts = (decodeReply(reply) ?: "").split(" ")
+            if (parts.getOrNull(0) == "BRI") parts.getOrNull(1)?.toIntOrNull() else null
         } catch (e: Exception) {
             null
         } finally {

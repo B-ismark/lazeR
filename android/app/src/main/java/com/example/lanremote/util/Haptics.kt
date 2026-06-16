@@ -28,6 +28,9 @@ class Haptics(context: Context) {
     /** Very light tick per scroll notch. */
     fun scrollTick() = oneShot(6, strong = false)
 
+    /** Soft confirmation tick for generic button presses (media, keys, steppers). */
+    fun tap() = oneShot(10, strong = false)
+
     private fun oneShot(ms: Long, strong: Boolean) {
         val v = vibrator ?: return
         if (!canVibrate) return

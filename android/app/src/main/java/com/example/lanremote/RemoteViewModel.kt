@@ -18,8 +18,15 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlin.math.hypot
+import kotlin.math.min
 
 enum class ConnState { Disconnected, Connecting, Connected, Reconnecting }
+
+// Pointer acceleration: per-event speed at/above which the gain saturates, and the
+// max multiplier applied to a fast flick. Slow drags stay near 1× for precision.
+private const val ACCEL_REF_PX = 9f
+private const val ACCEL_MAX = 2.6f
 
 data class UiState(
     val name: String = "",
@@ -28,6 +35,8 @@ data class UiState(
     val token: String = "",
     val conn: ConnState = ConnState.Disconnected,
     val volume: Float = 50f,
+    val brightness: Float = 50f,
+    val brightnessAvailable: Boolean = false,
     val keyboardText: String = "",
     val error: String? = null,
     val savedDevices: List<Device> = emptyList(),
@@ -44,6 +53,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var healthJob: Job? = null
     private var reconnectJob: Job? = null
     private var lastUserVolumeMs: Long = 0
+    private var lastUserBrightnessMs: Long = 0
     private var current: Device? = null   // device we're connected to / reconnecting
 
     private val _state = MutableStateFlow(
@@ -69,6 +79,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun setSensitivity(v: Float) = updateSettings { it.copy(sensitivity = v) }
     fun setNaturalScroll(v: Boolean) = updateSettings { it.copy(naturalScroll = v) }
     fun setHaptics(v: Boolean) = updateSettings { it.copy(haptics = v) }
+    fun setAcceleration(v: Boolean) = updateSettings { it.copy(acceleration = v) }
 
     private inline fun updateSettings(block: (Settings) -> Settings) {
         val s = block(_state.value.settings)
@@ -155,6 +166,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         healthJob?.cancel()
         healthJob = viewModelScope.launch {
             var misses = 0
+            var brightnessOk = true   // stop polling brightness once a laptop reports none
             while (isActive) {
                 val v = client.queryVolume()
                 val alive = if (v != null) {
@@ -167,6 +179,20 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 if (alive) {
                     misses = 0
+                    // Keep the brightness slider in sync (two-way, like volume). A laptop
+                    // with no brightness backend never answers BGET; after one miss we
+                    // stop asking and the UI hides the control.
+                    if (brightnessOk) {
+                        val b = client.queryBrightness()
+                        if (b != null) {
+                            if (System.currentTimeMillis() - lastUserBrightnessMs > 1200) {
+                                update { it.copy(brightness = b.toFloat(), brightnessAvailable = true) }
+                            }
+                        } else {
+                            brightnessOk = false
+                            update { it.copy(brightnessAvailable = false) }
+                        }
+                    }
                 } else if (++misses >= 2) {
                     beginReconnect()
                     return@launch
@@ -213,7 +239,14 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     // --- pointer ---
     fun move(dx: Float, dy: Float) {
         if (dx == 0f && dy == 0f) return
-        val k = _state.value.settings.sensitivity
+        val s = _state.value.settings
+        // Acceleration: scale a slow drag ~1:1 for precision, but let a fast flick
+        // travel up to ACCEL_MAX× farther so you can cross the screen in one swipe.
+        val gain = if (s.acceleration) {
+            val speed = hypot(dx.toDouble(), dy.toDouble()).toFloat()
+            1f + min(speed / ACCEL_REF_PX, 1f) * (ACCEL_MAX - 1f)
+        } else 1f
+        val k = s.sensitivity * gain
         client.move((dx * k).toInt(), (dy * k).toInt())
     }
 
@@ -250,6 +283,23 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         lastUserVolumeMs = System.currentTimeMillis()
         update { it.copy(volume = v) }
         client.setVolume(v.toInt())
+    }
+
+    fun nudgeVolume(delta: Float) = setVolume((_state.value.volume + delta).coerceIn(0f, 100f))
+
+    // --- brightness ---
+    fun setBrightness(v: Float) {
+        lastUserBrightnessMs = System.currentTimeMillis()
+        update { it.copy(brightness = v) }
+        client.setBrightness(v.toInt())
+    }
+
+    fun nudgeBrightness(delta: Float) =
+        setBrightness((_state.value.brightness + delta).coerceIn(0f, 100f))
+
+    // --- clipboard ---
+    fun pasteText(text: String) {
+        if (text.isNotEmpty()) client.clipboardPaste(text)
     }
 
     // --- media ---

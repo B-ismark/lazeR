@@ -30,6 +30,9 @@ Every datagram is a single packet. No framing beyond the datagram boundary.
 | `<TOKEN> PING`                | Liveness probe (reconnect watchdog).                 | `PONG`             |
 | `<TOKEN> VOL <0-100>`         | Set system volume to absolute percent.               | none               |
 | `<TOKEN> VGET`                | Ask server for current system volume.                | `VOL <0-100>`      |
+| `<TOKEN> BRIGHT <0-100>`      | Set display brightness to absolute percent.          | none               |
+| `<TOKEN> BGET`                | Ask server for current display brightness.           | `BRI <0-100>`      |
+| `<TOKEN> CLIP <text>`         | Set laptop clipboard to `text`, then paste (Ctrl+V). | none               |
 | `<TOKEN> MEDIA <action>`      | `play_pause` \| `next` \| `prev`.                    | none               |
 | `<TOKEN> KEY <text>`          | Type the literal UTF-8 text (spaces preserved).      | none               |
 | `<TOKEN> KEYSP <name>`        | Press one special key (see below).                   | none               |
@@ -57,6 +60,8 @@ mid-gesture can't leave `Alt` stuck. Maps to the Windows three-finger touchpad s
 - `OK` — handshake accepted; sender is now the registered controller.
 - `VOL <0-100>` — current laptop volume, sent in answer to `VGET`. Lets the phone
   keep its slider in sync with the laptop's real volume (two-way).
+- `BRI <0-100>` — current laptop display brightness, sent in answer to `BGET`. Lets
+  the phone keep its brightness slider in sync (two-way, same shape as `VOL`).
 - `PONG` — answer to `PING`; lets the phone confirm the laptop is still alive and
   trigger an auto-reconnect when it goes silent.
 

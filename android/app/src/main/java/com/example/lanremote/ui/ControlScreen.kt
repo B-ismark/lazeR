@@ -33,8 +33,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.automirrored.outlined.Backspace
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.BrightnessHigh
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Headphones
@@ -42,6 +46,7 @@ import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.PauseCircle
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
@@ -106,15 +111,19 @@ class ControlActions(
     val onDragStart: () -> Unit,
     val onDragEnd: () -> Unit,
     val onVolume: (Float) -> Unit,
+    val onBrightness: (Float) -> Unit,
     val onMedia: (String) -> Unit,
     val onKeyboardInput: (String) -> Unit,
     val onSpecialKey: (String) -> Unit,
     val onCombo: (String) -> Unit,
     val onSystem: (String) -> Unit,
     val onPresentation: (String) -> Unit,
+    val onPaste: (String) -> Unit,
     val onSensitivity: (Float) -> Unit,
     val onNaturalScroll: (Boolean) -> Unit,
     val onHaptics: (Boolean) -> Unit,
+    val onAcceleration: (Boolean) -> Unit,
+    val onButtonTap: () -> Unit,        // light haptic for generic button presses
     val onDisconnect: () -> Unit,
 )
 
@@ -182,7 +191,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
                 .imePadding()
                 .padding(horizontal = 16.dp, vertical = 8.dp),
         ) {
-            ControlsPanel(state, a.onVolume, a.onMedia, a.onKeyboardInput, a.onSpecialKey)
+            ControlsPanel(state, a)
             Spacer(Modifier.height(12.dp))
             TrackpadCard(
                 modifier = Modifier.fillMaxWidth().weight(1f).heightIn(min = 220.dp),
@@ -207,25 +216,28 @@ fun ControlScreen(state: UiState, a: ControlActions) {
 // ---------------------------------------------------------------------------
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ControlsPanel(
-    state: UiState,
-    onVolume: (Float) -> Unit,
-    onMedia: (String) -> Unit,
-    onKeyboardInput: (String) -> Unit,
-    onSpecialKey: (String) -> Unit,
-) {
+private fun ControlsPanel(state: UiState, a: ControlActions) {
     var tab by rememberSaveable { mutableIntStateOf(0) } // 0 = Media, 1 = Keyboard
 
     Column {
-        SectionCard {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary)
-                Text("  Volume  ${state.volume.toInt()}%",
-                    style = MaterialTheme.typography.titleMedium)
-            }
-            Slider(value = state.volume, onValueChange = onVolume,
-                valueRange = 0f..100f, modifier = Modifier.fillMaxWidth())
+        LevelCard(
+            icon = Icons.AutoMirrored.Filled.VolumeUp,
+            label = "Volume",
+            value = state.volume,
+            onChange = a.onVolume,
+            onStep = { d -> a.onButtonTap(); a.onVolume((state.volume + d).coerceIn(0f, 100f)) },
+        )
+
+        // Only shown for laptops that report a brightness backend (BGET answered).
+        if (state.brightnessAvailable) {
+            Spacer(Modifier.height(12.dp))
+            LevelCard(
+                icon = Icons.Filled.BrightnessHigh,
+                label = "Brightness",
+                value = state.brightness,
+                onChange = a.onBrightness,
+                onStep = { d -> a.onButtonTap(); a.onBrightness((state.brightness + d).coerceIn(0f, 100f)) },
+            )
         }
 
         Spacer(Modifier.height(12.dp))
@@ -264,14 +276,45 @@ private fun ControlsPanel(
             transitionSpec = { fadeIn() togetherWith fadeOut() },
             label = "panel",
         ) { which ->
-            if (which == 0) MediaPanel(onMedia)
-            else KeyboardPanel(state, onKeyboardInput, onSpecialKey)
+            if (which == 0) MediaPanel(a)
+            else KeyboardPanel(state, a)
+        }
+    }
+}
+
+/** Volume / brightness card: icon + percent, with −/＋ nudge buttons flanking the slider. */
+@Composable
+private fun LevelCard(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    value: Float,
+    onChange: (Float) -> Unit,
+    onStep: (Float) -> Unit,
+) {
+    SectionCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+            Text("  $label  ${value.toInt()}%", style = MaterialTheme.typography.titleMedium)
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            FilledTonalIconButton(onClick = { onStep(-5f) }, modifier = Modifier.size(40.dp)) {
+                Icon(Icons.Filled.Remove, contentDescription = "$label down")
+            }
+            Slider(value = value, onValueChange = onChange, valueRange = 0f..100f,
+                modifier = Modifier.weight(1f).padding(horizontal = 8.dp))
+            FilledTonalIconButton(onClick = { onStep(5f) }, modifier = Modifier.size(40.dp)) {
+                Icon(Icons.Filled.Add, contentDescription = "$label up")
+            }
         }
     }
 }
 
 @Composable
-private fun MediaPanel(onMedia: (String) -> Unit) {
+private fun MediaPanel(a: ControlActions) {
+    fun fire(action: String) { a.onButtonTap(); a.onMedia(action) }
     SectionCard {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -279,15 +322,15 @@ private fun MediaPanel(onMedia: (String) -> Unit) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             FilledTonalIconButton(
-                onClick = { onMedia("prev") },
+                onClick = { fire("prev") },
                 modifier = Modifier.size(64.dp), shape = RoundedCornerShape(20.dp),
             ) { Icon(Icons.Filled.SkipPrevious, "Previous", modifier = Modifier.size(32.dp)) }
             FilledIconButton(
-                onClick = { onMedia("play_pause") },
+                onClick = { fire("play_pause") },
                 modifier = Modifier.size(92.dp), shape = RoundedCornerShape(32.dp),
             ) { Icon(Icons.Filled.PauseCircle, "Play / Pause", modifier = Modifier.size(46.dp)) }
             FilledTonalIconButton(
-                onClick = { onMedia("next") },
+                onClick = { fire("next") },
                 modifier = Modifier.size(64.dp), shape = RoundedCornerShape(20.dp),
             ) { Icon(Icons.Filled.SkipNext, "Next", modifier = Modifier.size(32.dp)) }
         }
@@ -296,27 +339,24 @@ private fun MediaPanel(onMedia: (String) -> Unit) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun KeyboardPanel(
-    state: UiState,
-    onKeyboardInput: (String) -> Unit,
-    onSpecialKey: (String) -> Unit,
-) {
+private fun KeyboardPanel(state: UiState, a: ControlActions) {
+    fun special(name: String) { a.onButtonTap(); a.onSpecialKey(name) }
     SectionCard {
         OutlinedTextField(
-            value = state.keyboardText, onValueChange = onKeyboardInput,
+            value = state.keyboardText, onValueChange = a.onKeyboardInput,
             label = { Text("Type on laptop") }, singleLine = true,
             keyboardOptions = KeyboardOptions(autoCorrectEnabled = false),
             modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(10.dp))
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilledTonalIconButton(onClick = { onSpecialKey("backspace") }) {
+            FilledTonalIconButton(onClick = { special("backspace") }) {
                 Icon(Icons.AutoMirrored.Outlined.Backspace, contentDescription = "Backspace")
             }
-            FilledTonalButton(onClick = { onSpecialKey("space") }) { Text("Space") }
-            FilledTonalButton(onClick = { onSpecialKey("tab") }) { Text("Tab") }
-            FilledTonalButton(onClick = { onSpecialKey("esc") }) { Text("Esc") }
-            FilledTonalButton(onClick = { onSpecialKey("enter") }) { Text("Enter") }
+            FilledTonalButton(onClick = { special("space") }) { Text("Space") }
+            FilledTonalButton(onClick = { special("tab") }) { Text("Tab") }
+            FilledTonalButton(onClick = { special("esc") }) { Text("Esc") }
+            FilledTonalButton(onClick = { special("enter") }) { Text("Enter") }
         }
     }
 }
@@ -551,24 +591,51 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun AdvancedSheet(a: ControlActions, onDismiss: () -> Unit) {
+    var paste by rememberSaveable { mutableStateOf("") }
+
+    @Composable
+    fun chip(label: String, action: () -> Unit) = ChipBtn(label) { a.onButtonTap(); action() }
+
     ModalBottomSheet(onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 28.dp)) {
+            SheetTitle("Paste text")
+            // Sends the text to the laptop clipboard and pastes it in one shot —
+            // far faster than per-character typing for URLs, snippets, passwords.
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = paste, onValueChange = { paste = it },
+                    label = { Text("Text to paste on laptop") },
+                    leadingIcon = { Icon(Icons.Filled.ContentPaste, contentDescription = null) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(autoCorrectEnabled = false),
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(8.dp))
+                FilledIconButton(
+                    onClick = {
+                        if (paste.isNotEmpty()) { a.onButtonTap(); a.onPaste(paste); paste = "" }
+                    },
+                    modifier = Modifier.size(52.dp),
+                ) { Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send paste") }
+            }
+
+            Spacer(Modifier.height(20.dp))
             SheetTitle("Shortcuts")
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ChipBtn("Copy") { a.onCombo("ctrl c") }
-                ChipBtn("Paste") { a.onCombo("ctrl v") }
-                ChipBtn("Cut") { a.onCombo("ctrl x") }
-                ChipBtn("Undo") { a.onCombo("ctrl z") }
-                ChipBtn("Redo") { a.onCombo("ctrl y") }
+                chip("Copy") { a.onCombo("ctrl c") }
+                chip("Paste") { a.onCombo("ctrl v") }
+                chip("Cut") { a.onCombo("ctrl x") }
+                chip("Undo") { a.onCombo("ctrl z") }
+                chip("Redo") { a.onCombo("ctrl y") }
             }
 
             Spacer(Modifier.height(20.dp))
             SheetTitle("System")
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ChipBtn("Lock") { a.onSystem("lock") }
-                ChipBtn("Sleep") { a.onSystem("sleep") }
-                ChipBtn("Mute") { a.onSystem("mute") }
+                chip("Lock") { a.onSystem("lock") }
+                chip("Sleep") { a.onSystem("sleep") }
+                chip("Mute") { a.onSystem("mute") }
             }
         }
     }
@@ -594,6 +661,8 @@ private fun SettingsSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
                 modifier = Modifier.fillMaxWidth(),
             )
             Spacer(Modifier.height(8.dp))
+            ToggleRow("Pointer acceleration", "Fast flicks move the cursor farther",
+                state.settings.acceleration, a.onAcceleration)
             ToggleRow("Natural scrolling", "Content follows your fingers",
                 state.settings.naturalScroll, a.onNaturalScroll)
             ToggleRow("Haptic feedback", "Vibrate on clicks and scroll",
