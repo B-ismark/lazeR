@@ -68,13 +68,21 @@ $exe = Join-Path $root "dist\LazeR.exe"
 if (-not (Test-Path $exe)) { Write-Host "exe build failed." -ForegroundColor Red; Resume-OneDrive; exit 1 }
 
 # --- build the hardened release APK -------------------------------------------
+# Redirect Gradle's build dir + cache outside the OneDrive-synced tree (an init
+# script, machine-agnostic via $env:TEMP): OneDrive auto-restarts and re-locks
+# build/ mid-compile even after we kill it, which fails the ART-profile/dex tasks.
 Write-Host "Building release APK ..." -ForegroundColor Cyan
 $env:JAVA_HOME = [Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
+$buildBase = (Join-Path $env:TEMP "lazeR-build") -replace '\\', '/'
+$initGradle = Join-Path $env:TEMP "lazeR-offsync-init.gradle"
+"allprojects { p -> p.layout.buildDirectory.set(new File('$buildBase/' + p.name)) }" |
+    Set-Content -Path $initGradle -Encoding utf8
+$gradleCache = Join-Path $env:TEMP "lazeR-gradle-cache"
 Push-Location "$root\android"
-& "$root\android\gradlew.bat" assembleRelease --no-daemon
+& "$root\android\gradlew.bat" assembleRelease --no-daemon --init-script $initGradle --project-cache-dir $gradleCache
 $apkCode = $LASTEXITCODE
 Pop-Location
-$apk = Join-Path $root "android\app\build\outputs\apk\release\app-release.apk"
+$apk = Join-Path $env:TEMP "lazeR-build\app\outputs\apk\release\app-release.apk"
 if ($apkCode -ne 0 -or -not (Test-Path $apk)) { Write-Host "APK build failed." -ForegroundColor Red; Resume-OneDrive; exit 1 }
 Copy-Item $apk (Join-Path $root "dist\LazeR.apk") -Force
 $apkOut = Join-Path $root "dist\LazeR.apk"

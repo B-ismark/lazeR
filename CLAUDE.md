@@ -35,10 +35,17 @@ authenticated (`gh auth login`). It re-runs `--clobber` if the tag already exist
 
 ## Environment gotchas (Windows)
 
-- **This repo lives under OneDrive.** OneDrive sync locks `build/` mid-compile and
-  fails Gradle/PyInstaller (`Access denied` / `Unable to delete`). Before a build:
-  stop OneDrive (`Stop-Process -Name OneDrive -Force`), delete the stale build dir,
-  build, then relaunch OneDrive (`C:\Program Files\Microsoft OneDrive\OneDrive.exe`).
+- **This repo lives under OneDrive**, which locks `build/` mid-compile and fails
+  Gradle/PyInstaller (`Access is denied` / `Unable to delete`). Killing OneDrive is
+  unreliable — it auto-restarts and re-locks. The real fix (already baked into the
+  scripts) is to put build output OUTSIDE the synced tree:
+  - `build_exe.ps1` sets PyInstaller `--workpath`/`--specpath` to `$env:TEMP`.
+  - `publish_release.ps1` builds the APK with a generated `--init-script` that
+    redirects `layout.buildDirectory` + a `--project-cache-dir`, both under `$env:TEMP`.
+  - Manual Gradle build off-sync:
+    `./gradlew assembleRelease --init-script <init.gradle> --project-cache-dir <tmp>`
+    where the init sets `allprojects { layout.buildDirectory.set(...) }` to a temp path.
+  The APK then lands under `%TEMP%\lazeR-build\app\outputs\apk\release\`, not `android/app/build/`.
 - **Python:** use the uv-managed venv at `server/.venv` (bare `python` is the broken
   MS Store stub). Create/refresh: `cd server && uv venv && uv pip install -r requirements.txt`.
 - **PowerShell 5.1 + native tools:** don't run build CLIs under

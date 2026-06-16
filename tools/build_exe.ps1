@@ -107,10 +107,14 @@ if (Test-Path (Join-Path $upxDir "upx.exe")) {
 } else {
     Write-Host "UPX not found (tools\upx\upx.exe) - skipping binary compression." -ForegroundColor DarkGray
 }
+# Keep PyInstaller's iterative work/spec dirs OUT of the source tree: when the repo
+# lives under OneDrive, sync locks those folders mid-build and the build dies with
+# "Access is denied". The final exe still lands in dist/ (a single write).
+$work = Join-Path $env:TEMP "lazeR-pyi-build"
 $pyiArgs += @(
     "--distpath", (Join-Path $root "dist"),
-    "--workpath", (Join-Path $root "build"),
-    "--specpath", (Join-Path $root "build"),
+    "--workpath", $work,
+    "--specpath", $work,
     $script
 )
 
