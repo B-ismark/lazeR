@@ -204,7 +204,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
     }
 
     if (showAdvanced) {
-        AdvancedSheet(a, onDismiss = { showAdvanced = false })
+        AdvancedSheet(state, a, onDismiss = { showAdvanced = false })
     }
     if (showSettings) {
         SettingsSheet(state, a, onDismiss = { showSettings = false })
@@ -228,17 +228,7 @@ private fun ControlsPanel(state: UiState, a: ControlActions) {
             onStep = { d -> a.onButtonTap(); a.onVolume((state.volume + d).coerceIn(0f, 100f)) },
         )
 
-        // Only shown for laptops that report a brightness backend (BGET answered).
-        if (state.brightnessAvailable) {
-            Spacer(Modifier.height(12.dp))
-            LevelCard(
-                icon = Icons.Filled.BrightnessHigh,
-                label = "Brightness",
-                value = state.brightness,
-                onChange = a.onBrightness,
-                onStep = { d -> a.onButtonTap(); a.onBrightness((state.brightness + d).coerceIn(0f, 100f)) },
-            )
-        }
+        // Brightness lives in the Advanced sheet (Tune icon) to keep this page short.
 
         Spacer(Modifier.height(12.dp))
 
@@ -590,7 +580,7 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
 // ---------------------------------------------------------------------------
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun AdvancedSheet(a: ControlActions, onDismiss: () -> Unit) {
+private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Unit) {
     var paste by rememberSaveable { mutableStateOf("") }
 
     @Composable
@@ -599,6 +589,20 @@ private fun AdvancedSheet(a: ControlActions, onDismiss: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 28.dp)) {
+            // Brightness (only when the laptop reports a backend) — kept here so the
+            // main control page stays compact.
+            if (state.brightnessAvailable) {
+                SheetTitle("Brightness")
+                LevelCard(
+                    icon = Icons.Filled.BrightnessHigh,
+                    label = "Brightness",
+                    value = state.brightness,
+                    onChange = a.onBrightness,
+                    onStep = { d -> a.onButtonTap(); a.onBrightness((state.brightness + d).coerceIn(0f, 100f)) },
+                )
+                Spacer(Modifier.height(20.dp))
+            }
+
             SheetTitle("Paste text")
             // Sends the text to the laptop clipboard and pastes it in one shot —
             // far faster than per-character typing for URLs, snippets, passwords.
