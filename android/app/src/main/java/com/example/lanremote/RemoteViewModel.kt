@@ -172,7 +172,6 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         healthJob?.cancel()
         healthJob = viewModelScope.launch {
             var misses = 0
-            var brightnessOk = true   // stop polling brightness once a laptop reports none
             var tick = 0
             while (isActive) {
                 val v = client.queryVolume()
@@ -188,16 +187,14 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     misses = 0
                     // Brightness changes rarely and the read is costly on the laptop —
                     // sync it every ~4th tick, not every tick. (Volume doubles as the
-                    // liveness probe, so it stays every tick.)
-                    if (brightnessOk && tick % 4 == 0) {
+                    // liveness probe, so it stays every tick.) NO latch: a single
+                    // dropped BGET reply must not permanently hide the control — any
+                    // successful read reveals it; a laptop with no backend simply never
+                    // answers, so it stays hidden (the harmless periodic probe aside).
+                    if (tick % 4 == 0) {
                         val b = client.queryBrightness()
-                        if (b != null) {
-                            if (System.currentTimeMillis() - lastUserBrightnessMs > 1200) {
-                                update { it.copy(brightness = b.toFloat(), brightnessAvailable = true) }
-                            }
-                        } else {
-                            brightnessOk = false
-                            update { it.copy(brightnessAvailable = false) }
+                        if (b != null && System.currentTimeMillis() - lastUserBrightnessMs > 1200) {
+                            update { it.copy(brightness = b.toFloat(), brightnessAvailable = true) }
                         }
                     }
                 } else if (++misses >= 2) {
