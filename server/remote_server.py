@@ -183,10 +183,13 @@ def make_brightness():
                 return 0
 
         def set_win(pct):
+            # Must PIPE the instance into Invoke-CimMethod — a CIM instance does not
+            # expose .WmiSetBrightness() as a callable (unlike legacy Get-WmiObject),
+            # so the dotted form silently no-ops and the screen never changes.
             try:
-                _ps("(Get-CimInstance -Namespace root/WMI "
-                    "-ClassName WmiMonitorBrightnessMethods)."
-                    f"WmiSetBrightness(1,{int(pct)})")
+                _ps("Get-CimInstance -Namespace root/WMI -ClassName "
+                    "WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName "
+                    f"WmiSetBrightness -Arguments @{{Timeout=1; Brightness={int(pct)}}}")
             except Exception:
                 pass
 
@@ -265,9 +268,13 @@ class BrightnessService:
         self.available = get_fn is not None
         self._lock = threading.Lock()
         self._val = 0
+        self._target = None                  # latest requested brightness, or None
+        self._wake = threading.Event()        # signals the setter there's work
         if self.available:
             self._val = self._safe_get()
             threading.Thread(target=self._poll, daemon=True).start()
+            if self._set is not None:
+                threading.Thread(target=self._setter_loop, daemon=True).start()
 
     def _safe_get(self):
         try:
@@ -276,31 +283,43 @@ class BrightnessService:
             return self._val
 
     def _poll(self):
-        # Only refresh while a phone is connected — no point spawning PowerShell
-        # every couple seconds when nothing is listening.
+        # Refresh the cache only while a phone is connected, and gently (5s) — each
+        # read spawns PowerShell (~0.5s); no need to churn it. Skip while a write is
+        # pending so we don't read a value the panel is mid-change to.
         while not _stop.is_set():
-            if _client_connected.is_set():
+            if _client_connected.is_set() and self._target is None:
                 v = self._safe_get()
                 with self._lock:
                     self._val = v
-            _stop.wait(2.0)
+            _stop.wait(5.0)
 
     def get_cached(self):
         with self._lock:
             return self._val
 
     def set_async(self, pct):
+        # Coalesce: store the latest target and wake one worker. A slider drag fires
+        # many BRIGHT packets — applying each would spawn dozens of ~0.5s PowerShell
+        # writes and starve the server. The worker only ever applies the newest value.
         pct = max(0, min(100, int(pct)))
         with self._lock:
-            self._val = pct                      # optimistic: reflect immediately
-        if self._set is not None:
-            threading.Thread(target=lambda: self._safe_set(pct), daemon=True).start()
+            self._val = pct                  # optimistic: reflect immediately for BGET
+            self._target = pct
+        self._wake.set()
 
-    def _safe_set(self, pct):
-        try:
-            self._set(pct)
-        except Exception:
-            pass
+    def _setter_loop(self):
+        while not _stop.is_set():
+            if not self._wake.wait(0.5):
+                continue
+            self._wake.clear()
+            with self._lock:
+                tgt = self._target
+                self._target = None
+            if tgt is not None:
+                try:
+                    self._set(tgt)
+                except Exception:
+                    pass
 
 
 brightness_svc = BrightnessService(get_brightness, set_brightness)
