@@ -182,16 +182,37 @@ def make_brightness():
             except Exception:
                 return 0
 
+        # A fresh `powershell -Command "..."` per write costs ~600ms of process
+        # startup, which made the brightness slider feel laggy. Keep ONE warm
+        # PowerShell reading commands from stdin and pipe each set into it — the
+        # WmiSetBrightness then runs in tens of ms. Writes are fire-and-forget so
+        # the caller never blocks. Must PIPE the instance into Invoke-CimMethod — a
+        # CIM instance doesn't expose .WmiSetBrightness() as a callable.
+        _setproc = {"p": None}
+        _setlock = threading.Lock()
+
+        def _ensure_setproc():
+            p = _setproc["p"]
+            if p is None or p.poll() is not None:
+                p = subprocess.Popen(["powershell", "-NoProfile", "-Command", "-"],
+                                     stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, text=True,
+                                     creationflags=_flags)
+                _setproc["p"] = p
+            return p
+
         def set_win(pct):
-            # Must PIPE the instance into Invoke-CimMethod — a CIM instance does not
-            # expose .WmiSetBrightness() as a callable (unlike legacy Get-WmiObject),
-            # so the dotted form silently no-ops and the screen never changes.
             try:
-                _ps("Get-CimInstance -Namespace root/WMI -ClassName "
-                    "WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName "
-                    f"WmiSetBrightness -Arguments @{{Timeout=1; Brightness={int(pct)}}}")
+                with _setlock:
+                    p = _ensure_setproc()
+                    p.stdin.write(
+                        "Get-CimInstance -Namespace root/WMI -ClassName "
+                        "WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName "
+                        f"WmiSetBrightness -Arguments @{{Timeout=1; Brightness={int(pct)}}}"
+                        " | Out-Null\n")
+                    p.stdin.flush()
             except Exception:
-                pass
+                _setproc["p"] = None     # force a respawn next time
 
         # Probe once: laptops expose it, most desktops don't.
         try:
