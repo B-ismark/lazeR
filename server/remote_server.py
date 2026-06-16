@@ -250,6 +250,62 @@ def make_brightness():
 get_brightness, set_brightness, BRIGHTNESS_BACKEND = make_brightness()
 
 
+class BrightnessService:
+    """Non-blocking brightness access for the UDP loop.
+
+    Reading brightness (e.g. Windows WMI via PowerShell) costs ~0.5–1s, and the
+    phone polls it ~every 1.5s. Doing that read inline would stall the single recv
+    loop, delaying MOVE/PING/VGET enough that the phone thinks the link died and
+    reconnects — the whole app flickers. So we serve BGET from a cached value kept
+    fresh by a background thread, and apply BRIGHT writes on a worker thread."""
+
+    def __init__(self, get_fn, set_fn):
+        self._get = get_fn
+        self._set = set_fn
+        self.available = get_fn is not None
+        self._lock = threading.Lock()
+        self._val = 0
+        if self.available:
+            self._val = self._safe_get()
+            threading.Thread(target=self._poll, daemon=True).start()
+
+    def _safe_get(self):
+        try:
+            return max(0, min(100, int(self._get())))
+        except Exception:
+            return self._val
+
+    def _poll(self):
+        # Only refresh while a phone is connected — no point spawning PowerShell
+        # every couple seconds when nothing is listening.
+        while not _stop.is_set():
+            if _client_connected.is_set():
+                v = self._safe_get()
+                with self._lock:
+                    self._val = v
+            _stop.wait(2.0)
+
+    def get_cached(self):
+        with self._lock:
+            return self._val
+
+    def set_async(self, pct):
+        pct = max(0, min(100, int(pct)))
+        with self._lock:
+            self._val = pct                      # optimistic: reflect immediately
+        if self._set is not None:
+            threading.Thread(target=lambda: self._safe_set(pct), daemon=True).start()
+
+    def _safe_set(self, pct):
+        try:
+            self._set(pct)
+        except Exception:
+            pass
+
+
+brightness_svc = BrightnessService(get_brightness, set_brightness)
+
+
 # ── clipboard ───────────────────────────────────────────────────────────────
 def set_clipboard(text):
     """Put text on the OS clipboard (no extra dependency). Returns True on success."""
@@ -763,13 +819,13 @@ def handle_packet(verb, rest, sock, addr):
                 pass
 
     elif verb == "BRIGHT":
-        if set_brightness is None:
+        if not brightness_svc.available:
             return
         try:
             pct = max(0, min(100, int(rest.split()[0])))
         except (IndexError, ValueError):
             return
-        set_brightness(pct)
+        brightness_svc.set_async(pct)   # offload the slow WMI write off the loop
 
     elif verb == "CLIP":
         do_clip(rest)
@@ -1302,8 +1358,8 @@ def serve_loop(wire, emit, net, hostname):
                 wire.reply(sock, addr, f"VOL {get_volume()}")
             continue
         if verb == "BGET":
-            if get_brightness is not None:
-                wire.reply(sock, addr, f"BRI {get_brightness()}")
+            if brightness_svc.available:
+                wire.reply(sock, addr, f"BRI {brightness_svc.get_cached()}")   # cached: never blocks the loop
             continue
 
         # Local input wins: while the user has taken over (or after a panic),
