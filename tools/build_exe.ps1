@@ -9,14 +9,22 @@
 
   Then ship dist\LazeR.exe with LazeR.apk and START_HERE.md. Double-click to run.
 #>
-$ErrorActionPreference = "Stop"
+# NOT 'Stop': the build shells out to uv/pip/PyInstaller, which all log progress to
+# stderr. Under 'Stop', PowerShell 5.1 turns that normal stderr into a terminating
+# NativeCommandError and aborts the build. We use 'Continue' and gate every native
+# step on $LASTEXITCODE (and a final exe-exists check) instead.
+$ErrorActionPreference = "Continue"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $here
 Set-Location $root
 
 function Find-Python {
+    # Prefer the project's local virtualenv (incl. uv-created .venv) so the build
+    # reuses the deps already installed there; fall back to a global interpreter.
+    $venv = Join-Path $root "server\.venv\Scripts\python.exe"
+    if (Test-Path $venv) { return $venv }
     foreach ($c in @("python", "py")) {
-        try { $v = & $c --version 2>$null; if ($?) { return $c } } catch {}
+        try { & $c --version *>$null; if ($LASTEXITCODE -eq 0) { return $c } } catch {}
     }
     return $null
 }
@@ -24,14 +32,32 @@ function Find-Python {
 $py = Find-Python
 if (-not $py) {
     Write-Host "Python needed to BUILD the exe (end users won't need it)." -ForegroundColor Yellow
-    Write-Host "  winget install -e --id Python.Python.3.12"
+    Write-Host "  winget install -e --id Python.Python.3.12   (or: uv venv in server\)"
     exit 1
 }
 Write-Host "Building with $(& $py --version)" -ForegroundColor Cyan
 
-# Build-time deps: the app's runtime deps + PyInstaller.
-& $py -m pip install --quiet --disable-pip-version-check pyinstaller pynput cryptography pycaw comtypes zeroconf qrcode pillow pystray
-if (-not $?) { Write-Host "pip install failed." -ForegroundColor Red; exit 1 }
+# Build-time deps: the app's runtime deps + PyInstaller. uv-created venvs ship
+# without pip, so fall back to `uv pip` (targeting this interpreter) when pip is
+# absent. The install is idempotent — already-present packages are skipped.
+$pkgs = @("pyinstaller", "pynput", "cryptography", "pycaw", "comtypes",
+          "zeroconf", "qrcode", "pillow", "pystray")
+# uv-created venvs ship without pip, so fall back to `uv pip` (targeting this
+# interpreter) when pip is absent. find_spec is silent + exits 0/1, so it's a clean
+# probe; every install is gated on $LASTEXITCODE (stderr flows to the console).
+& $py -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('pip') else 1)" *>$null
+$hasPip = ($LASTEXITCODE -eq 0)
+if ($hasPip) {
+    & $py -m pip install --quiet --disable-pip-version-check @pkgs
+    $ok = ($LASTEXITCODE -eq 0)
+} elseif (Get-Command uv -ErrorAction SilentlyContinue) {
+    & uv pip install --python $py @pkgs
+    $ok = ($LASTEXITCODE -eq 0)
+} else {
+    Write-Host "No pip in the interpreter and uv not found — can't install build deps." -ForegroundColor Red
+    exit 1
+}
+if (-not $ok) { Write-Host "dependency install failed." -ForegroundColor Red; exit 1 }
 
 $script = Join-Path $root "server\remote_server.py"
 $icon   = Join-Path $root "server\LazeR.ico"
@@ -88,8 +114,10 @@ $pyiArgs += @(
     $script
 )
 
+# PyInstaller logs progress to stderr; with 'Continue' that just prints, and we
+# judge success by the exit code (and the exe-exists check below).
 & $py -m PyInstaller @pyiArgs
-if (-not $?) { Write-Host "PyInstaller build failed." -ForegroundColor Red; exit 1 }
+if ($LASTEXITCODE -ne 0) { Write-Host "PyInstaller build failed." -ForegroundColor Red; exit 1 }
 
 $exe = Join-Path $root "dist\LazeR.exe"
 if (Test-Path $exe) {

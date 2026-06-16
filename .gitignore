@@ -1,6 +1,7 @@
 # --- Secrets / machine-local (never commit) ---
-server/.lazer_key
-server/.lazer_token
+# Match anywhere: the frozen exe writes these next to itself (e.g. dist/) too.
+.lazer_key
+.lazer_token
 android/local.properties
 
 # --- Python ---
