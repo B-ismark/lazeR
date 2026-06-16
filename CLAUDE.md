@@ -14,9 +14,15 @@ A "major release" = a meaningful user-facing milestone (new headline feature set
 protocol change phones must adopt, or an explicit version bump the user asks for).
 When in doubt, ask the user before publishing — don't release on every change.
 
-To publish a major release: build both artifacts (below), then attach them to a
-GitHub Release (tagged, e.g. `v1.1`). `gh release upload <tag> ... --clobber` to
-refresh assets on an existing release.
+To publish a major release, use the helper (builds both artifacts, handles the
+OneDrive build-lock, creates or refreshes the release):
+
+```
+powershell -ExecutionPolicy Bypass -File tools\publish_release.ps1 -Tag v1.2.0 -Title "LazeR v1.2 — <headline>"
+```
+
+It prompts for confirmation (major-only policy) unless `-Yes`, and needs `gh`
+authenticated (`gh auth login`). It re-runs `--clobber` if the tag already exists.
 
 ## Build artifacts
 
