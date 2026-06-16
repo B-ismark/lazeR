@@ -23,10 +23,11 @@ import kotlin.math.min
 
 enum class ConnState { Disconnected, Connecting, Connected, Reconnecting }
 
-// Pointer acceleration: per-event speed at/above which the gain saturates, and the
+// Pointer acceleration: smoothed speed at/above which the gain saturates, and the
 // max multiplier applied to a fast flick. Slow drags stay near 1× for precision.
-private const val ACCEL_REF_PX = 9f
-private const val ACCEL_MAX = 2.6f
+private const val ACCEL_REF_PX = 12f
+private const val ACCEL_MAX = 2.2f
+private const val MOVE_GAP_RESET_MS = 120L   // idle gap ⇒ treat the next move as a fresh gesture
 
 data class UiState(
     val name: String = "",
@@ -237,17 +238,42 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // --- pointer ---
+    // Per-gesture smoothing + sub-pixel carry so high report-rate screens (e.g.
+    // 120 Hz) don't make the cursor jitter: raw per-event speed swings frame to
+    // frame, and truncating the scaled delta each event drops fractional movement.
+    private var accX = 0f
+    private var accY = 0f
+    private var emaSpeed = 0f
+    private var lastMoveMs = 0L
+
     fun move(dx: Float, dy: Float) {
         if (dx == 0f && dy == 0f) return
         val s = _state.value.settings
-        // Acceleration: scale a slow drag ~1:1 for precision, but let a fast flick
-        // travel up to ACCEL_MAX× farther so you can cross the screen in one swipe.
-        val gain = if (s.acceleration) {
-            val speed = hypot(dx.toDouble(), dy.toDouble()).toFloat()
-            1f + min(speed / ACCEL_REF_PX, 1f) * (ACCEL_MAX - 1f)
-        } else 1f
-        val k = s.sensitivity * gain
-        client.move((dx * k).toInt(), (dy * k).toInt())
+        // A fresh gesture after an idle gap: clear stale speed + remainder so the
+        // first move isn't flung by the previous flick's momentum.
+        val now = System.currentTimeMillis()
+        if (now - lastMoveMs > MOVE_GAP_RESET_MS) { emaSpeed = 0f; accX = 0f; accY = 0f }
+        lastMoveMs = now
+
+        var mx = dx * s.sensitivity
+        var my = dy * s.sensitivity
+        if (s.acceleration) {
+            // EMA-smooth the per-event speed so the gain ramps instead of jittering;
+            // slow drags stay ~1:1 for precision, fast flicks reach ACCEL_MAX.
+            val inst = hypot(dx.toDouble(), dy.toDouble()).toFloat()
+            emaSpeed = emaSpeed * 0.6f + inst * 0.4f
+            val gain = 1f + min(emaSpeed / ACCEL_REF_PX, 1f) * (ACCEL_MAX - 1f)
+            mx *= gain; my *= gain
+        }
+        // Carry the sub-pixel remainder instead of truncating each event.
+        accX += mx; accY += my
+        val ix = accX.toInt()
+        val iy = accY.toInt()
+        if (ix != 0 || iy != 0) {
+            client.move(ix, iy)
+            accX -= ix
+            accY -= iy
+        }
     }
 
     fun scroll(dx: Int, dy: Int) {
