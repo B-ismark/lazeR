@@ -55,7 +55,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var reconnectJob: Job? = null
     private var lastUserVolumeMs: Long = 0
     private var lastUserBrightnessMs: Long = 0
+    private var lastInteractionMs: Long = 0   // drives adaptive health-poll backoff
     private var current: Device? = null   // device we're connected to / reconnecting
+
+    private fun touch() { lastInteractionMs = System.currentTimeMillis() }
 
     private val _state = MutableStateFlow(
         UiState(savedDevices = store.load(), settings = settingsStore.load())
@@ -151,6 +154,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             if (ok) {
                 if (save) update { it.copy(savedDevices = store.upsert(dev)) }
                 settingsStore.lastDeviceId = dev.id
+                discovery.stop()   // no need to keep scanning Wi-Fi while controlling
+                touch()
                 update { it.copy(conn = ConnState.Connected) }
                 startHealthLoop()
             } else {
@@ -168,6 +173,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         healthJob = viewModelScope.launch {
             var misses = 0
             var brightnessOk = true   // stop polling brightness once a laptop reports none
+            var tick = 0
             while (isActive) {
                 val v = client.queryVolume()
                 val alive = if (v != null) {
@@ -180,10 +186,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 if (alive) {
                     misses = 0
-                    // Keep the brightness slider in sync (two-way, like volume). A laptop
-                    // with no brightness backend never answers BGET; after one miss we
-                    // stop asking and the UI hides the control.
-                    if (brightnessOk) {
+                    // Brightness changes rarely and the read is costly on the laptop —
+                    // sync it every ~4th tick, not every tick. (Volume doubles as the
+                    // liveness probe, so it stays every tick.)
+                    if (brightnessOk && tick % 4 == 0) {
                         val b = client.queryBrightness()
                         if (b != null) {
                             if (System.currentTimeMillis() - lastUserBrightnessMs > 1200) {
@@ -198,7 +204,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     beginReconnect()
                     return@launch
                 }
-                delay(1500)
+                tick++
+                // Adaptive backoff: poll briskly (1.5s) while you're actively using the
+                // trackpad/sliders for responsive volume sync + fast disconnect notice;
+                // ease off to 4s when idle to spare the radio + battery. Worst-case
+                // disconnect detection when idle ≈ 8–12s, still fine.
+                val active = System.currentTimeMillis() - lastInteractionMs < 5000
+                delay(if (active) 1500L else 4000L)
             }
         }
     }
@@ -235,6 +247,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         current = null
         client.disconnect()
         update { it.copy(conn = ConnState.Disconnected, keyboardText = "") }
+        discovery.start { hosts -> update { it.copy(discovered = hosts) } }   // scan again for the connection screen
     }
 
     // --- pointer ---
@@ -254,6 +267,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val now = System.currentTimeMillis()
         if (now - lastMoveMs > MOVE_GAP_RESET_MS) { emaSpeed = 0f; accX = 0f; accY = 0f }
         lastMoveMs = now
+        lastInteractionMs = now
 
         var mx = dx * s.sensitivity
         var my = dy * s.sensitivity
@@ -278,12 +292,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
     fun scroll(dx: Int, dy: Int) {
         if (dx == 0 && dy == 0) return
+        touch()
         client.scroll(dx, dy)   // direction decided in the UI (per-surface)
     }
 
-    fun click() = client.click()
-    fun rightClick() = client.rightClick()
-    fun middleClick() = client.middleClick()
+    fun click() { touch(); client.click() }
+    fun rightClick() { touch(); client.rightClick() }
+    fun middleClick() { touch(); client.middleClick() }
     fun dragStart() = client.mouseDown()
     fun dragEnd() = client.mouseUp()
     fun combo(spec: String) = client.combo(spec)
@@ -307,6 +322,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     // --- volume ---
     fun setVolume(v: Float) {
         lastUserVolumeMs = System.currentTimeMillis()
+        touch()
         update { it.copy(volume = v) }
         client.setVolume(v.toInt())
     }
@@ -316,6 +332,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     // --- brightness ---
     fun setBrightness(v: Float) {
         lastUserBrightnessMs = System.currentTimeMillis()
+        touch()
         update { it.copy(brightness = v) }
         client.setBrightness(v.toInt())
     }
@@ -329,7 +346,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // --- media ---
-    fun media(action: String) = client.media(action)
+    fun media(action: String) { touch(); client.media(action) }
 
     // --- keyboard ---
     fun onKeyboardInput(new: String) {

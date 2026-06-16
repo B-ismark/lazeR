@@ -30,7 +30,7 @@ PORT = 50505
 SINGLETON_PORT = 50506  # loopback-only: a 2nd launch uses it to surface the running window
 TOKEN_LEN = 6
 RESUME_GAP_S = 8        # recv-loop tick gap larger than this ⇒ the laptop slept; recover net
-CLIENT_IDLE_S = 8       # no packet from the pinned phone for this long ⇒ it left (it pings ~1.5s)
+CLIENT_IDLE_S = 12      # no packet from the pinned phone this long ⇒ it left (phone polls 1.5–4s when idle)
 SERVICE_TYPE = "_lazer._udp.local."
 # Resource vs. writable paths differ when frozen into a PyInstaller onefile exe:
 # bundled data lives in the temp _MEIPASS extraction dir (read-only), while the
@@ -304,15 +304,17 @@ class BrightnessService:
             return self._val
 
     def _poll(self):
-        # Refresh the cache only while a phone is connected, and gently (5s) — each
-        # read spawns PowerShell (~0.5s); no need to churn it. Skip while a write is
-        # pending so we don't read a value the panel is mid-change to.
+        # Refresh the cache only while a phone is connected, and lazily (20s) — each
+        # read spawns PowerShell (~0.5s) and brightness rarely changes from under us
+        # mid-session, so frequent polling is wasted CPU. Skip while a write is
+        # pending so we don't read a value the panel is mid-change to. Our own writes
+        # already update the cache, so the phone's slider stays in sync regardless.
         while not _stop.is_set():
             if _client_connected.is_set() and self._target is None:
                 v = self._safe_get()
                 with self._lock:
                     self._val = v
-            _stop.wait(5.0)
+            _stop.wait(20.0)
 
     def get_cached(self):
         with self._lock:
@@ -904,7 +906,7 @@ def open_socket():
     laptop slept can stop receiving once the NIC cycles, so we rebind to recover."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.settimeout(0.5)
+    sock.settimeout(1.0)   # idle wake-ups: 1/s is plenty for the resume/idle/rate checks
     sock.bind((HOST, PORT))
     return sock
 
