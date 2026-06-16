@@ -1,8 +1,9 @@
 # LAN Remote
 
 Phone-as-trackpad over Wi-Fi. Android (Kotlin + Jetpack Compose, Material You)
-client + Python laptop server. Mouse move/click, system volume, media keys.
-All traffic is UDP on the local network, gated by a per-session token.
+client + Python laptop server. Mouse move/click/scroll, system volume, display
+brightness, media keys, keyboard typing, clipboard paste, app-switch and browser
+gestures. All traffic is UDP on the local network, gated by a per-session token.
 
 ```
 android/   Jetpack Compose client
@@ -16,11 +17,16 @@ PROTOCOL.md  wire format shared by both
 - Phone enters that IP + token, sends a `HELLO` handshake.
 - Server pins that phone's IP:port as the sole controller. Every packet must carry
   the token **and** come from the pinned source, or it is silently dropped.
-- Trackpad drags → `MOVE dx dy` (lossy UDP, low latency). Tap → `CLICK`.
-  Slider → `VOL 0-100`. Buttons → `MEDIA play_pause|next|prev`.
+- Trackpad drags → `MOVE dx dy` (lossy UDP, low latency, with optional pointer
+  acceleration). Tap → `CLICK`. Volume slider → `VOL 0-100`; brightness slider →
+  `BRIGHT 0-100` (both two-way synced). Media buttons → `MEDIA play_pause|next|prev`.
+- Keyboard panel types text (`KEY`); the Advanced sheet pastes a whole string to the
+  laptop clipboard in one shot (`CLIP`) and fires shortcuts (`COMBO ctrl c`, …).
 - Two fingers vertical → scroll. Two fingers horizontal swipe → browser back/forward
   (`COMBO alt left` / `alt right`), like a Windows touchpad. Three fingers left/right →
   cycle apps (`ASW next` / `prev`, Alt held the whole gesture).
+- Haptic feedback on taps/keys, and gentle battery use — the phone polls briskly
+  while you're interacting and backs off when idle.
 
 See [PROTOCOL.md](PROTOCOL.md) for the packet format.
 
