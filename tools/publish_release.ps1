@@ -89,7 +89,12 @@ if ($LASTEXITCODE -eq 0) {
 } else {
     Write-Host "Creating release $Tag." -ForegroundColor Cyan
     if ($Notes) {
-        & gh release create $Tag $exe $apkOut --repo $repo --title $Title --notes $Notes
+        # Pass notes via a temp file, never inline: gh/PowerShell treat backticks in
+        # --notes as globs and choke ("no matches found for ...").
+        $nf = Join-Path $env:TEMP "lazer_release_notes.txt"
+        $Notes | Set-Content -Path $nf -Encoding utf8
+        & gh release create $Tag $exe $apkOut --repo $repo --title $Title --notes-file $nf
+        Remove-Item $nf -ErrorAction SilentlyContinue
     } else {
         & gh release create $Tag $exe $apkOut --repo $repo --title $Title --generate-notes
     }
