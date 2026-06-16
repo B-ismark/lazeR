@@ -984,6 +984,135 @@ def set_startup(enabled):
         return False
 
 
+# ── Windows Firewall: auto-allow inbound UDP so phones can reach us ───────────
+# The phone's packets are inbound UDP on PORT. Windows Defender Firewall drops
+# them unless an allow rule exists — and loopback bypasses the firewall, so the
+# server looks healthy locally while every phone times out. We add the rule for
+# the user (one UAC click) instead of making them run netsh by hand. Third-party
+# firewalls and VPN LAN-blocking are out of our reach; we detect + warn for those.
+FW_RULE_NAME = "LazeR UDP 50505"
+_FW_NETSH_ARGS = (
+    f'advfirewall firewall add rule name="{FW_RULE_NAME}" dir=in action=allow '
+    f'protocol=UDP localport={PORT} profile=private,domain'
+)
+
+
+def _no_window_flags():
+    import subprocess
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def is_admin():
+    if not sys.platform.startswith("win"):
+        return os.geteuid() == 0 if hasattr(os, "geteuid") else False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def firewall_rule_exists():
+    """True if our inbound allow rule is present. Read-only — needs no admin."""
+    if not sys.platform.startswith("win"):
+        return True   # we only manage Windows Firewall; assume OK elsewhere
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={FW_RULE_NAME}"],
+            capture_output=True, text=True, timeout=6,
+            creationflags=_no_window_flags())
+        return r.returncode == 0 and "No rules match" not in r.stdout
+    except Exception:
+        return False
+
+
+def _firewall_add_direct():
+    """Add the rule in-process (succeeds only if already elevated)."""
+    import subprocess
+    try:
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={FW_RULE_NAME}", "dir=in", "action=allow",
+             "protocol=UDP", f"localport={PORT}", "profile=private,domain"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=_no_window_flags())
+    except Exception:
+        pass
+    return firewall_rule_exists()
+
+
+def _run_elevated_and_wait(exe, params, timeout_ms=30000):
+    """Launch `exe params` elevated via UAC ('runas'); wait for it to finish.
+    Returns False if the user declined the prompt or it couldn't launch."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SHELLEXECUTEINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong),
+            ("hwnd", wintypes.HWND), ("lpVerb", wintypes.LPCWSTR),
+            ("lpFile", wintypes.LPCWSTR), ("lpParameters", wintypes.LPCWSTR),
+            ("lpDirectory", wintypes.LPCWSTR), ("nShow", ctypes.c_int),
+            ("hInstApp", wintypes.HINSTANCE), ("lpIDList", ctypes.c_void_p),
+            ("lpClass", wintypes.LPCWSTR), ("hkeyClass", wintypes.HKEY),
+            ("dwHotKey", wintypes.DWORD), ("hIcon", wintypes.HANDLE),
+            ("hProcess", wintypes.HANDLE),
+        ]
+
+    SEE_MASK_NOCLOSEPROCESS = 0x00000040
+    SW_HIDE = 0
+    sei = SHELLEXECUTEINFO()
+    sei.cbSize = ctypes.sizeof(sei)
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS
+    sei.lpVerb = "runas"
+    sei.lpFile = exe
+    sei.lpParameters = params
+    sei.nShow = SW_HIDE
+    try:
+        if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)):
+            return False          # ERROR_CANCELLED (1223) ⇒ user said No
+        if sei.hProcess:
+            ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, timeout_ms)
+            ctypes.windll.kernel32.CloseHandle(sei.hProcess)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_firewall_rule(allow_elevate=False):
+    """Make sure the inbound rule exists. Returns True if present afterward.
+    [allow_elevate] lets us pop a single UAC prompt when we aren't already admin."""
+    if not sys.platform.startswith("win"):
+        return True
+    if firewall_rule_exists():
+        return True
+    if is_admin():
+        return _firewall_add_direct()
+    if allow_elevate:
+        _run_elevated_and_wait("netsh", _FW_NETSH_ARGS)
+        return firewall_rule_exists()
+    return False
+
+
+def detect_vpn():
+    """Best-effort: name of an active VPN-ish interface, or None. A VPN that
+    full-tunnels or blocks LAN can stop phones reaching us even past the firewall;
+    we can't override that, but we can tell the user where to look."""
+    try:
+        import psutil
+        stats = psutil.net_if_stats()
+    except Exception:
+        return None
+    needles = ("vpn", "forti", "wireguard", "openvpn", "tap-", "tun",
+               "zscaler", "globalprotect", "anyconnect", "cisco", "nordlynx",
+               "expressvpn", "pangp", "wintun")
+    for name, st in stats.items():
+        if getattr(st, "isup", False) and any(n in name.lower() for n in needles):
+            return name
+    return None
+
+
 def show_qr(uri):
     try:
         import qrcode
@@ -1255,6 +1384,7 @@ class LazeRWindow:
         self._build_header(outer)
         self._build_hero(outer)
         self._build_pause_banner(outer)
+        self._build_firewall_banner(outer)
 
         # swap area: QR card (not connected) <-> connected panel
         self._swap = tk.Frame(outer, bg=_C["bg"])
@@ -1274,6 +1404,7 @@ class LazeRWindow:
         self._setup_tray()
         self._log("Server started", "ok")
         self._poll()
+        self._check_firewall()   # surface the Allow banner if inbound is blocked
         self._center()
 
     # ── system tray ───────────────────────────────────────────────────────────
@@ -1437,6 +1568,97 @@ class LazeRWindow:
         resume_remote()
         self._clear_paused()
         self._log("Remote resumed by user", "ok")
+
+    # ── firewall banner: shown when inbound UDP is blocked (Windows) ────────────
+    def _build_firewall_banner(self, parent):
+        tk = self._tk
+        self._fw_ok = None
+        self._fw_wrap = tk.Frame(parent, bg=_C["bg"])   # packed/unpacked dynamically
+        border = tk.Frame(self._fw_wrap, bg=_C["warn"])
+        border.pack(fill="x", pady=(12, 0))
+        pad = tk.Frame(border, bg=_C["card"])
+        pad.pack(fill="both", expand=True, padx=2, pady=2)
+        inner = tk.Frame(pad, bg=_C["card"], padx=14, pady=12)
+        inner.pack(fill="x")
+        tk.Label(inner, text="Phones can't reach this laptop", bg=_C["card"],
+                 fg=_C["warn"], font=self.f_hero).pack(anchor="w")
+        self._fw_sub = tk.Label(inner, text="", bg=_C["card"], fg=_C["dim"],
+                                font=self.f_sm, justify="left")
+        self._fw_sub.pack(anchor="w", pady=(2, 8))
+        btns = tk.Frame(inner, bg=_C["card"])
+        btns.pack(anchor="w")
+        self._fw_btn = tk.Label(btns, text="Allow through firewall", bg=_C["accent"],
+                                fg=_C["bg"], font=self.f_sm, cursor="hand2",
+                                padx=14, pady=6)
+        self._fw_btn.pack(side="left")
+        self._fw_btn.bind("<Button-1>", lambda e: self._fix_firewall())
+        dismiss = tk.Label(btns, text="Dismiss", bg=_C["card2"], fg=_C["fg"],
+                           font=self.f_sm, cursor="hand2", padx=14, pady=6)
+        dismiss.pack(side="left", padx=(8, 0))
+        dismiss.bind("<Button-1>", lambda e: self._clear_firewall_banner())
+
+    def _check_firewall(self):
+        """Probe the rule off the UI thread, then show the banner if it's missing."""
+        if not sys.platform.startswith("win"):
+            return
+
+        def work():
+            ok = firewall_rule_exists()
+            vpn = detect_vpn()
+            self._root.after(0, lambda: self._on_firewall_status(ok, vpn))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_firewall_status(self, ok, vpn):
+        self._fw_ok = ok
+        self._update_fw_pill()
+        if ok:
+            self._clear_firewall_banner()
+            return
+        sub = (f"Windows Firewall is dropping inbound traffic on UDP {PORT}, so phones "
+               "time out. One click adds the allow rule (asks for admin once).")
+        if vpn:
+            sub += (f"\nNote: VPN “{vpn}” is active — if it blocks local network "
+                    "traffic, also enable “allow local LAN” in the VPN.")
+        self._fw_sub.config(text=sub)
+        self._fw_wrap.pack(fill="x", before=self._swap)
+        self._resize()
+
+    def _clear_firewall_banner(self):
+        try:
+            self._fw_wrap.pack_forget()
+        except Exception:
+            pass
+        self._resize()
+
+    def _fix_firewall(self):
+        self._fw_btn.config(text="Requesting admin…")
+
+        def work():
+            ok = ensure_firewall_rule(allow_elevate=True)
+            self._root.after(0, lambda: self._after_fix_firewall(ok))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _after_fix_firewall(self, ok):
+        self._fw_btn.config(text="Allow through firewall")
+        self._fw_ok = ok
+        self._update_fw_pill()
+        if ok:
+            self._clear_firewall_banner()
+            self._log(f"Firewall allowed — inbound UDP {PORT} open for phones", "ok")
+        else:
+            self._log("Firewall rule not added — admin prompt declined?", "warn")
+
+    def _update_fw_pill(self):
+        pill = getattr(self, "_fw_pill", None)
+        if pill is None:
+            return
+        dot, txt = pill
+        if self._fw_ok is None:
+            dot.config(fg=_C["faint"]); txt.config(text="checking…")
+        elif self._fw_ok:
+            dot.config(fg=_C["ok"]); txt.config(text="inbound allowed")
+        else:
+            dot.config(fg=_C["warn"]); txt.config(text="blocked — click Allow above")
 
     # ── friendly connect card: just the QR + pairing code ────────────────────
     def _build_connect_card(self, parent, uri, token):
@@ -1645,6 +1867,8 @@ class LazeRWindow:
         self._pill(pad, "Encryption",
                    "AES-256-GCM (QR scan)" if _HAVE_CRYPTO
                    else "unavailable — pip install cryptography", _HAVE_CRYPTO)
+        if sys.platform.startswith("win"):
+            self._fw_pill = self._mutable_pill(pad, "Firewall", "checking…")
 
         self._build_security_controls(pad)
 
@@ -1734,6 +1958,19 @@ class LazeRWindow:
                  font=self.f_sm).pack(side="left", padx=(7, 0))
         tk.Label(f, text=detail, bg=_C["card"], fg=_C["faint"],
                  font=self.f_sm).pack(side="left", padx=(7, 0))
+
+    def _mutable_pill(self, parent, name, detail):
+        """Like _pill but returns (dot, detail) labels so status can change later."""
+        tk = self._tk
+        f = tk.Frame(parent, bg=_C["card"])
+        f.pack(fill="x", pady=3)
+        dot = tk.Label(f, text="●", bg=_C["card"], fg=_C["faint"], font=self.f_sm)
+        dot.pack(side="left")
+        tk.Label(f, text=name, bg=_C["card"], fg=_C["fg"],
+                 font=self.f_sm).pack(side="left", padx=(7, 0))
+        val = tk.Label(f, text=detail, bg=_C["card"], fg=_C["faint"], font=self.f_sm)
+        val.pack(side="left", padx=(7, 0))
+        return dot, val
 
     # ── activity feed ─────────────────────────────────────────────────────────
     def _build_activity(self, parent):
@@ -1894,6 +2131,19 @@ def run_terminal(token, key, ip, require_secure):
     print()
     print("  ...or auto-discover, or enter IP + token manually. Ctrl+C to quit.\n")
 
+    # Inbound UDP must be allowed or phones silently time out (loopback bypasses
+    # the firewall, so the server looks fine here). If we're admin this adds the
+    # rule outright; otherwise point at the one-shot self-elevating flag.
+    if sys.platform.startswith("win") and not ensure_firewall_rule():
+        print(f"  [firewall] Inbound UDP {PORT} appears blocked — phones may not connect.")
+        print("             Fix once (accepts a UAC prompt):")
+        print("               python remote_server.py --setup-firewall")
+        vpn = detect_vpn()
+        if vpn:
+            print(f"             VPN '{vpn}' is active — if it blocks LAN, also enable "
+                  "'allow local network' in the VPN.")
+        print()
+
     def emit(kind, *a):
         if kind == "connected":
             print(f"[handshake] paired: {a[0]}  ({'secure' if a[1] else 'PLAINTEXT'})")
@@ -1971,7 +2221,20 @@ def main():
     ap.add_argument("--no-gui", action="store_true", help="terminal/headless mode")
     ap.add_argument("--secure-only", action="store_true",
                     help="reject plaintext (v1) clients — require the encrypted QR wire")
+    ap.add_argument("--setup-firewall", action="store_true",
+                    help="add the Windows Firewall inbound rule (self-elevates) and exit")
     args = ap.parse_args()
+
+    if args.setup_firewall:
+        if not sys.platform.startswith("win"):
+            print("[firewall] --setup-firewall is Windows-only; on macOS/Linux allow "
+                  f"inbound UDP {PORT} in your firewall.")
+            return
+        if ensure_firewall_rule(allow_elevate=True):
+            print(f"[firewall] inbound rule '{FW_RULE_NAME}' is in place — phones can reach UDP {PORT}.")
+        else:
+            print("[firewall] could not add the rule (UAC declined?). Re-run and accept the prompt.")
+        return
 
     token = load_or_create_token()
     key = load_or_create_key()

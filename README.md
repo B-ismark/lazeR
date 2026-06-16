@@ -51,7 +51,23 @@ Platform notes:
 - **Linux** — volume uses `amixer` or `pactl` (install `alsa-utils` or `pulseaudio-utils`).
   On Wayland, `pynput` mouse control may need an X11 session.
 
-Open UDP `50505` in the OS firewall if prompted.
+**Firewall.** Phones reach the server over **inbound UDP `50505`**, which Windows
+Defender Firewall blocks by default (the server still looks healthy locally because
+loopback bypasses the firewall — only the phone times out). On Windows the GUI
+detects this and shows **Allow through firewall**; one click adds the rule after a
+single UAC prompt. Headless or to pre-seed it:
+
+```bash
+python remote_server.py --setup-firewall   # self-elevates, adds the rule, exits
+```
+
+On macOS/Linux, allow inbound UDP `50505` in your firewall if prompted.
+
+**VPN.** A split-tunnel VPN is fine. A VPN that **full-tunnels or blocks LAN
+traffic** will stop the phone reaching the laptop even with the firewall open — no
+app can override that. Enable **"allow local network"** in the VPN client, or
+disconnect it on the LAN you're controlling from. The server flags an active VPN
+in the activity log to make this obvious.
 
 ---
 
@@ -93,5 +109,7 @@ no special device permissions.
   until you resume. So even a successful intruder can't fight your own hand.
 - The pairing **token + key are persistent** (`server/.lazer_token`, `.lazer_key`)
   and reused across launches; **Regenerate** in the UI rotates both and kicks phones.
-- Open/public Wi-Fi: the setup firewall rule is **Private-profile only**. Treat
-  plaintext mode as untrusted there; prefer QR + Require encryption.
+- Open/public Wi-Fi: the firewall rule LazeR adds is scoped to the **Private and
+  Domain** profiles only, so it won't open the port on a network Windows has
+  classified Public. Treat plaintext mode as untrusted there; prefer QR + Require
+  encryption.
