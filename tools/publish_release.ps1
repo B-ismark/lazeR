@@ -75,8 +75,10 @@ Write-Host "Building release APK ..." -ForegroundColor Cyan
 $env:JAVA_HOME = [Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
 $buildBase = (Join-Path $env:TEMP "lazeR-build") -replace '\\', '/'
 $initGradle = Join-Path $env:TEMP "lazeR-offsync-init.gradle"
+# ASCII, NOT utf8: PowerShell 5.1's -Encoding utf8 writes a BOM, and Gradle refuses
+# to compile an init script that starts with one ("Could not compile init script").
 "allprojects { p -> p.layout.buildDirectory.set(new File('$buildBase/' + p.name)) }" |
-    Set-Content -Path $initGradle -Encoding utf8
+    Set-Content -Path $initGradle -Encoding ascii
 $gradleCache = Join-Path $env:TEMP "lazeR-gradle-cache"
 Push-Location "$root\android"
 & "$root\android\gradlew.bat" assembleRelease --no-daemon --init-script $initGradle --project-cache-dir $gradleCache
