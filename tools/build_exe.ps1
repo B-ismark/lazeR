@@ -39,7 +39,7 @@ Write-Host "Building with $(& $py --version)" -ForegroundColor Cyan
 
 # Build-time deps: the app's runtime deps + PyInstaller. uv-created venvs ship
 # without pip, so fall back to `uv pip` (targeting this interpreter) when pip is
-# absent. The install is idempotent — already-present packages are skipped.
+# absent. The install is idempotent - already-present packages are skipped.
 $pkgs = @("pyinstaller", "pynput", "cryptography", "pycaw", "comtypes",
           "zeroconf", "qrcode", "pillow", "pystray")
 # uv-created venvs ship without pip, so fall back to `uv pip` (targeting this
@@ -54,7 +54,7 @@ if ($hasPip) {
     & uv pip install --python $py @pkgs
     $ok = ($LASTEXITCODE -eq 0)
 } else {
-    Write-Host "No pip in the interpreter and uv not found — can't install build deps." -ForegroundColor Red
+    Write-Host "No pip in the interpreter and uv not found - can't install build deps." -ForegroundColor Red
     exit 1
 }
 if (-not $ok) { Write-Host "dependency install failed." -ForegroundColor Red; exit 1 }
