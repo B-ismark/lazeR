@@ -60,6 +60,10 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
                     if (state.settings.haptics) haptics.scrollTick()
                     vm.scroll(dx, dy)
                 },
+                onZoom = { steps ->
+                    if (state.settings.haptics) haptics.scrollTick()
+                    vm.zoom(steps)
+                },
                 onClick = {
                     if (state.settings.haptics) haptics.leftClick()
                     vm.click()

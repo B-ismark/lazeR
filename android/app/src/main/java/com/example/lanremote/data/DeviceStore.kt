@@ -64,10 +64,15 @@ class DeviceStore(context: Context) {
         prefs.edit().putString(KEY, arr.toString()).apply()
     }
 
-    /** Insert or replace by (ip, port); returns the new list. */
+    /** Insert or replace, keyed by the stable [Device.id] (falling back to ip:port
+     *  for legacy records saved before ids were stable). Matching by id — not the
+     *  live address — lets a saved laptop's IP be refreshed in place when DHCP moves
+     *  it, instead of leaving a stale duplicate. Returns the new list. */
     fun upsert(device: Device): List<Device> {
         val list = load().toMutableList()
-        val idx = list.indexOfFirst { it.ip == device.ip && it.port == device.port }
+        val idx = list.indexOfFirst {
+            it.id == device.id || (it.ip == device.ip && it.port == device.port)
+        }
         if (idx >= 0) list[idx] = device else list.add(device)
         save(list)
         return list

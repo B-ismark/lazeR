@@ -150,10 +150,15 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         reconnectJob?.cancel()
         update { it.copy(conn = ConnState.Connecting, error = null) }
         viewModelScope.launch {
-            val ok = client.connect(ip, port, token, key)
-            if (ok) {
-                if (save) update { it.copy(savedDevices = store.upsert(dev)) }
-                settingsStore.lastDeviceId = dev.id
+            val connected = connectResolving(dev, 2000)
+            if (connected != null) {
+                current = connected
+                // Persist when explicitly saving, OR when the stored address was
+                // stale and we reached the laptop at a new IP via mDNS — so next
+                // tap dials the right place instead of failing again.
+                val moved = connected.ip != dev.ip || connected.port != dev.port
+                if (save || moved) update { it.copy(savedDevices = store.upsert(connected)) }
+                settingsStore.lastDeviceId = connected.id
                 discovery.stop()   // no need to keep scanning Wi-Fi while controlling
                 touch()
                 update { it.copy(conn = ConnState.Connected) }
@@ -165,6 +170,24 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+    }
+
+    /**
+     * Connect to [dev]'s stored address; if that fails, try every laptop currently
+     * visible via mDNS (its IP may have moved on a DHCP lease / reboot). The wrong
+     * host simply fails the authenticated handshake, so trying them is safe.
+     * @return the device that answered (its id preserved, ip/port refreshed), or null.
+     */
+    private suspend fun connectResolving(dev: Device, timeoutMs: Long): Device? {
+        if (client.connect(dev.ip, dev.port, dev.token, dev.key, timeoutMs)) return dev
+        val candidates = _state.value.discovered
+            .filterNot { it.ip == dev.ip && it.port == dev.port }
+        for (h in candidates) {
+            if (client.connect(h.ip, h.port, dev.token, dev.key, timeoutMs)) {
+                return dev.copy(ip = h.ip, port = h.port)
+            }
+        }
+        return null
     }
 
     /** Watchdog: poll volume (doubles as liveness); on repeated misses, reconnect. */
@@ -185,16 +208,25 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 if (alive) {
                     misses = 0
-                    // Brightness changes rarely and the read is costly on the laptop —
-                    // sync it every ~4th tick, not every tick. (Volume doubles as the
-                    // liveness probe, so it stays every tick.) NO latch: a single
-                    // dropped BGET reply must not permanently hide the control — any
-                    // successful read reveals it; a laptop with no backend simply never
-                    // answers, so it stays hidden (the harmless periodic probe aside).
-                    if (tick % 4 == 0) {
+                    // Brightness changes rarely and the read is costly on the laptop, so
+                    // once the control is showing we sync it every ~4th tick. But UNTIL
+                    // it's showing (fresh launch / after process death resets the flag)
+                    // probe EVERY tick: BGET is lossy and a single dropped reply must not
+                    // leave the slider hidden for many seconds. A laptop with no backend
+                    // never answers, so it stays hidden. NO latch off — any reply reveals
+                    // it. The availability flag is independent of the value-sync guard
+                    // below (a recent user drag must not suppress *showing* the control).
+                    val probe = !_state.value.brightnessAvailable || tick % 4 == 0
+                    if (probe) {
                         val b = client.queryBrightness()
-                        if (b != null && System.currentTimeMillis() - lastUserBrightnessMs > 1200) {
-                            update { it.copy(brightness = b.toFloat(), brightnessAvailable = true) }
+                        if (b != null) {
+                            val syncVal = System.currentTimeMillis() - lastUserBrightnessMs > 1200
+                            update {
+                                it.copy(
+                                    brightnessAvailable = true,
+                                    brightness = if (syncVal) b.toFloat() else it.brightness,
+                                )
+                            }
                         }
                     }
                 } else if (++misses >= 2) {
@@ -212,15 +244,25 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Keep retrying the current device until it answers or the user backs out. */
+    /** Keep retrying the current device until it answers or the user backs out.
+     *  mDNS runs during reconnect so a laptop that came back on a new IP can still
+     *  be found and re-pinned (the saved address is refreshed on success). */
     private fun beginReconnect() {
         healthJob?.cancel()
         val dev = current ?: return disconnect()
         update { it.copy(conn = ConnState.Reconnecting) }
         reconnectJob?.cancel()
+        discovery.start { hosts -> update { it.copy(discovered = hosts) } }
         reconnectJob = viewModelScope.launch {
             while (isActive) {
-                if (client.connect(dev.ip, dev.port, dev.token, dev.key, timeoutMs = 1200)) {
+                val c = connectResolving(dev, 1200)
+                if (c != null) {
+                    current = c
+                    if (c.ip != dev.ip || c.port != dev.port) {
+                        update { it.copy(savedDevices = store.upsert(c)) }
+                        settingsStore.lastDeviceId = c.id
+                    }
+                    discovery.stop()
                     update { it.copy(conn = ConnState.Connected, error = null) }
                     startHealthLoop()
                     return@launch
@@ -291,6 +333,12 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         if (dx == 0 && dy == 0) return
         touch()
         client.scroll(dx, dy)   // direction decided in the UI (per-surface)
+    }
+
+    fun zoom(steps: Int) {
+        if (steps == 0) return
+        touch()
+        client.zoom(steps)   // two-finger pinch → ctrl+wheel on the laptop
     }
 
     fun click() { touch(); client.click() }

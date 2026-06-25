@@ -80,6 +80,7 @@ class RemoteClient {
 
     fun move(dx: Int, dy: Int) = send("MOVE $dx $dy")
     fun scroll(dx: Int, dy: Int) = send("SCROLL $dx $dy")
+    fun zoom(steps: Int) = send("ZOOM $steps")             // ctrl+wheel pinch zoom (+ in, − out)
     fun click() = send("CLICK")
     fun rightClick() = send("RCLICK")
     fun middleClick() = send("MCLICK")

@@ -93,15 +93,18 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.lanremote.UiState
 import kotlin.math.abs
+import kotlin.math.hypot
 
 private const val SCROLL_STEP_PX = 16f   // smaller = finer scroll + more haptic detents
 private const val SWIPE_APP_PX = 120f    // three-finger horizontal travel per app switch — short hop, fits small screens
 private const val SWIPE_NAV_PX = 150f    // two-finger horizontal travel per browser back/forward — deliberate, not jittery scroll
+private const val ZOOM_STEP_PX = 36f     // two-finger spread change per ctrl+wheel zoom notch
 
 /** All the actions the control screen can fire. Bundled to keep the signature sane. */
 class ControlActions(
     val onMove: (Float, Float) -> Unit,
     val onScroll: (Int, Int) -> Unit,   // dx, dy steps
+    val onZoom: (Int) -> Unit,          // two-finger pinch: +1 = zoom in (spread), -1 = zoom out (pinch)
     val onClick: () -> Unit,
     val onRightClick: () -> Unit,
     val onMiddleClick: () -> Unit,
@@ -396,6 +399,7 @@ private fun HoldDragButton(
 private fun Modifier.trackpadInput(
     onMove: (Float, Float) -> Unit,
     onScroll: (Int, Int) -> Unit,
+    onZoom: (Int) -> Unit,
     onClick: () -> Unit,
     onRightClick: () -> Unit,
     onSwitchStep: (Boolean) -> Unit,
@@ -407,6 +411,7 @@ private fun Modifier.trackpadInput(
         val acc = floatArrayOf(0f, 0f)  // x, y
         var swipeAcc = 0f               // three-finger horizontal travel since last notch
         var navAcc = 0f                 // two-finger horizontal travel since last back/forward
+        var zoomAcc = 0f                // two-finger spread change since last zoom notch
         var switching = false           // Alt-Tab session open on the laptop
         awaitPointerEventScope {
             while (true) {
@@ -428,24 +433,41 @@ private fun Modifier.trackpadInput(
                             while (swipeAcc >= SWIPE_APP_PX) { onSwitchStep(true); switching = true; swipeAcc -= SWIPE_APP_PX }
                             while (swipeAcc <= -SWIPE_APP_PX) { onSwitchStep(false); switching = true; swipeAcc += SWIPE_APP_PX }
                         }
-                        acc[0] = 0f; acc[1] = 0f; navAcc = 0f
+                        acc[0] = 0f; acc[1] = 0f; navAcc = 0f; zoomAcc = 0f
                         pressed.forEach { it.consume() }
                     }
                     pressed.size == 2 -> {
-                        // m = -1 makes content follow the fingers (natural); +1 = reverse.
-                        val m = if (naturalScroll()) -1 else 1
                         val two = pressed.take(2)
+                        // Pinch test first: change in the gap between the two fingers. If
+                        // the spread is changing faster than the pair is translating, it's
+                        // a zoom (ctrl+wheel) — suppress scroll/nav so the two don't fight.
+                        val a0 = two[0]; val a1 = two[1]
+                        val curGap = hypot((a0.position.x - a1.position.x).toDouble(),
+                            (a0.position.y - a1.position.y).toDouble()).toFloat()
+                        val prevGap = hypot((a0.previousPosition.x - a1.previousPosition.x).toDouble(),
+                            (a0.previousPosition.y - a1.previousPosition.y).toDouble()).toFloat()
+                        val dGap = curGap - prevGap
                         val dx = two.sumOf { (it.position.x - it.previousPosition.x).toDouble() }.toFloat() / 2f
                         val dy = two.sumOf { (it.position.y - it.previousPosition.y).toDouble() }.toFloat() / 2f
-                        // Vertical → scroll. Horizontal → browser back/forward (like a
-                        // Windows touchpad two-finger swipe). Per-event axis check keeps a
-                        // vertical scroll from drifting into an accidental nav.
-                        acc[1] += dy
-                        while (acc[1] <= -SCROLL_STEP_PX) { onScroll(0, m); acc[1] += SCROLL_STEP_PX }
-                        while (acc[1] >= SCROLL_STEP_PX) { onScroll(0, -m); acc[1] -= SCROLL_STEP_PX }
-                        if (abs(dx) > abs(dy)) navAcc += dx
-                        while (navAcc >= SWIPE_NAV_PX) { onBrowserNav(true); navAcc -= SWIPE_NAV_PX }   // swipe right → forward
-                        while (navAcc <= -SWIPE_NAV_PX) { onBrowserNav(false); navAcc += SWIPE_NAV_PX }  // swipe left → back
+                        if (abs(dGap) > abs(dx) && abs(dGap) > abs(dy)) {
+                            zoomAcc += dGap
+                            while (zoomAcc >= ZOOM_STEP_PX) { onZoom(1); zoomAcc -= ZOOM_STEP_PX }    // spread → zoom in
+                            while (zoomAcc <= -ZOOM_STEP_PX) { onZoom(-1); zoomAcc += ZOOM_STEP_PX }  // pinch → zoom out
+                            acc[1] = 0f; navAcc = 0f
+                        } else {
+                            zoomAcc = 0f
+                            // m = -1 makes content follow the fingers (natural); +1 = reverse.
+                            val m = if (naturalScroll()) -1 else 1
+                            // Vertical → scroll. Horizontal → browser back/forward (like a
+                            // Windows touchpad two-finger swipe). Per-event axis check keeps a
+                            // vertical scroll from drifting into an accidental nav.
+                            acc[1] += dy
+                            while (acc[1] <= -SCROLL_STEP_PX) { onScroll(0, m); acc[1] += SCROLL_STEP_PX }
+                            while (acc[1] >= SCROLL_STEP_PX) { onScroll(0, -m); acc[1] -= SCROLL_STEP_PX }
+                            if (abs(dx) > abs(dy)) navAcc += dx
+                            while (navAcc >= SWIPE_NAV_PX) { onBrowserNav(true); navAcc -= SWIPE_NAV_PX }   // swipe right → forward
+                            while (navAcc <= -SWIPE_NAV_PX) { onBrowserNav(false); navAcc += SWIPE_NAV_PX }  // swipe left → back
+                        }
                         pressed.forEach { it.consume() }
                     }
                     pressed.size == 1 -> {
@@ -455,7 +477,7 @@ private fun Modifier.trackpadInput(
                         if (dx != 0f || dy != 0f) { onMove(dx, dy); ch.consume() }
                     }
                     else -> {
-                        acc[0] = 0f; acc[1] = 0f; swipeAcc = 0f; navAcc = 0f
+                        acc[0] = 0f; acc[1] = 0f; swipeAcc = 0f; navAcc = 0f; zoomAcc = 0f
                         if (switching) { onSwitchEnd(); switching = false }
                     }
                 }
@@ -480,12 +502,12 @@ private fun TrackpadCard(modifier: Modifier, a: ControlActions, natural: Boolean
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxHeight()
-                    .trackpadInput(a.onMove, a.onScroll, a.onClick, a.onRightClick,
+                    .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
                         a.onSwitchStep, a.onSwitchEnd, a.onBrowserNav, { natural }),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    "Drag to move · Two fingers scroll, swipe ⇄ for back/forward · Three fingers switch apps\nTap = click · Hold = right-click",
+                    "Drag to move · Two fingers scroll, pinch to zoom, swipe ⇄ for back/forward · Three fingers switch apps\nTap = click · Hold = right-click",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
                     textAlign = TextAlign.Center,
@@ -548,11 +570,11 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
                 .fillMaxWidth()
                 .weight(1f)
                 .background(MaterialTheme.colorScheme.surfaceContainerHighest)
-                .trackpadInput(a.onMove, a.onScroll, a.onClick, a.onRightClick,
+                .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
                     a.onSwitchStep, a.onSwitchEnd, a.onBrowserNav, { state.settings.naturalScroll }),
         ) {
             Text(
-                "Drag to move · Two fingers scroll, swipe ⇄ for back/forward · Three fingers switch apps\nTap = click · Hold = right-click",
+                "Drag to move · Two fingers scroll, pinch to zoom, swipe ⇄ for back/forward · Three fingers switch apps\nTap = click · Hold = right-click",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
                 textAlign = TextAlign.Center,
