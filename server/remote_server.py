@@ -1033,74 +1033,78 @@ def start_mdns(ip, hostname):
         return None, None
 
 
-# ── Windows "start with Windows" (Startup folder shortcut) ────────────────────
+# ── Windows "start with Windows" (HKCU Run key) ───────────────────────────────
+# The canonical per-user autostart location. Task Manager → Startup apps and
+# Settings → Apps → Startup both list Run-key entries by name, and writing it
+# needs no admin, no PowerShell/COM subprocess (which silently failed from the
+# windowed exe before) — just winreg. We migrate off any old Startup-folder
+# shortcut on first touch.
 SCRIPT_PATH = os.path.abspath(__file__)
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_RUN_VALUE = "LazeR"
 
 
 def startup_lnk_path():
-    """Path of the LazeR shortcut in the per-user Startup folder (Windows)."""
+    """Path of the legacy LazeR shortcut in the per-user Startup folder."""
     appdata = os.environ.get("APPDATA", "")
     return os.path.join(appdata, "Microsoft", "Windows", "Start Menu",
                         "Programs", "Startup", "LazeR.lnk")
 
 
-def startup_enabled():
-    return sys.platform.startswith("win") and os.path.exists(startup_lnk_path())
-
-
-def _startup_target():
-    """(target, args, workdir) to launch LazeR — handles frozen .exe and .py."""
+def _startup_command():
+    """Command string to register under Run — handles frozen .exe and .py."""
     if getattr(sys, "frozen", False):              # PyInstaller bundle
-        exe = sys.executable
-        return exe, "", os.path.dirname(exe)
+        return f'"{sys.executable}"'
     # Source run: prefer pythonw so no console window pops at login.
     pyw = sys.executable
     if pyw.lower().endswith("python.exe"):
         cand = pyw[:-len("python.exe")] + "pythonw.exe"
         if os.path.exists(cand):
             pyw = cand
-    return pyw, f'"{SCRIPT_PATH}"', os.path.dirname(SCRIPT_PATH)
+    return f'"{pyw}" "{SCRIPT_PATH}"'
+
+
+def startup_enabled():
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            winreg.QueryValueEx(k, _RUN_VALUE)
+        return True
+    except OSError:
+        return False
+
+
+def _remove_legacy_lnk():
+    try:
+        lnk = startup_lnk_path()
+        if os.path.exists(lnk):
+            os.remove(lnk)
+    except OSError:
+        pass
 
 
 def set_startup(enabled):
-    """Create/remove the Startup shortcut. Returns True on success (Windows only)."""
+    """Add/remove the HKCU Run entry. Returns True on success (Windows only)."""
     if not sys.platform.startswith("win"):
         return False
-    lnk = startup_lnk_path()
-    if not enabled:
-        try:
-            if os.path.exists(lnk):
-                os.remove(lnk)
-            return True
-        except OSError:
-            return False
-    target, args, workdir = _startup_target()
-    icon = ICON_FILE if os.path.exists(ICON_FILE) else target
-    # Build the .lnk via WScript.Shell through PowerShell — no pywin32 needed.
-    ps = (
-        "$w=New-Object -ComObject WScript.Shell;"
-        f"$s=$w.CreateShortcut('{lnk}');"
-        f"$s.TargetPath='{target}';"
-        f"$s.Arguments='{args}';"
-        f"$s.WorkingDirectory='{workdir}';"
-        f"$s.IconLocation='{icon}';"
-        "$s.Description='LazeR - LAN remote control server';"
-        "$s.Save()"
-    )
     try:
-        import subprocess
-        # Capture output so a PowerShell/COM failure surfaces a reason instead of
-        # silently returning False (the windowed exe has no console to print to).
-        r = subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
-                            "-Command", ps], capture_output=True, text=True,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        if r.returncode != 0:
-            set_startup.last_error = (r.stderr or r.stdout or "").strip() or \
-                f"powershell exited {r.returncode}"
-            return False
-        ok = os.path.exists(lnk)
+        import winreg
+        _remove_legacy_lnk()   # migrate away from the old Startup-folder shortcut
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as k:
+            if enabled:
+                winreg.SetValueEx(k, _RUN_VALUE, 0, winreg.REG_SZ, _startup_command())
+            else:
+                try:
+                    winreg.DeleteValue(k, _RUN_VALUE)
+                except FileNotFoundError:
+                    pass
+        # Confirm the write took, so a failure can't masquerade as success.
+        ok = startup_enabled() if enabled else not startup_enabled()
         if not ok:
-            set_startup.last_error = "shortcut was not created"
+            set_startup.last_error = "registry write did not persist"
         return ok
     except Exception as e:
         set_startup.last_error = str(e)
@@ -2398,10 +2402,9 @@ def main():
             return
         want = args.enable_startup
         if set_startup(want):
-            where = startup_lnk_path()
             print(f"[startup] launch-at-login {'enabled' if want else 'disabled'}."
-                  + (f"\n[startup] shortcut: {where}\n[startup] it now appears in "
-                     "Task Manager → Startup apps." if want else ""))
+                  + ("\n[startup] registered under HKCU\\...\\Run as 'LazeR' — it now "
+                     "appears in Task Manager → Startup apps." if want else ""))
         else:
             reason = getattr(set_startup, "last_error", "") or "unknown error"
             print(f"[startup] could not change launch-at-login: {reason}")

@@ -77,8 +77,9 @@ python remote_server.py --enable-startup    # register; appears in Task Manager 
 python remote_server.py --disable-startup    # remove it
 ```
 
-This drops a shortcut in the per-user Startup folder, so LazeR launches at login
-and shows up under **Task Manager → Startup apps** (where you can also toggle it).
+This registers a per-user entry under `HKCU\…\Run` (named `LazeR`), so LazeR
+launches at login and shows up under **Task Manager → Startup apps** and
+**Settings → Apps → Startup** (where you can also toggle it).
 
 **VPN.** A split-tunnel VPN is fine. A VPN that **full-tunnels or blocks LAN
 traffic** will stop the phone reaching the laptop even with the firewall open — no
