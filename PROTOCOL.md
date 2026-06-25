@@ -22,6 +22,7 @@ Every datagram is a single packet. No framing beyond the datagram boundary.
 | `<TOKEN> HELLO`               | Handshake. Registers sender IP:port as the client.   | `OK`               |
 | `<TOKEN> MOVE <dx> <dy>`      | Relative cursor move, signed ints (px).              | none (lossy)       |
 | `<TOKEN> SCROLL <dx> <dy>`    | Scroll wheel, signed ints (steps). +dy = up.         | none (lossy)       |
+| `<TOKEN> ZOOM <steps>`        | Ctrl+wheel zoom (pinch). +steps = in, − = out.       | none (lossy)       |
 | `<TOKEN> CLICK`               | Left mouse click.                                    | none               |
 | `<TOKEN> RCLICK`              | Right mouse click.                                   | none               |
 | `<TOKEN> MCLICK`              | Middle mouse click.                                  | none               |

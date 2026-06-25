@@ -48,7 +48,7 @@ ICON_FILE = os.path.join(_BUNDLE_DIR, "LazeR.ico")
 # Verbs that actually drive the machine. While the user has taken over locally
 # (or after a panic), these are dropped; PING/VGET/HELLO/BYE still flow.
 CONTROL_VERBS = {
-    "MOVE", "SCROLL", "CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP",
+    "MOVE", "SCROLL", "ZOOM", "CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP",
     "COMBO", "ASW", "SYS", "PRES", "VOL", "MEDIA", "KEY", "KEYSP",
     "BRIGHT", "CLIP",
 }
@@ -815,6 +815,17 @@ def handle_packet(verb, rest, sock, addr):
             return
         mouse.scroll(dx, dy)
 
+    elif verb == "ZOOM":          # pinch → ctrl+wheel (zoom in/out in most apps)
+        try:
+            steps = int(rest.split()[0])
+        except (IndexError, ValueError):
+            return
+        keyboard.press(Key.ctrl)
+        try:
+            mouse.scroll(0, steps)
+        finally:
+            keyboard.release(Key.ctrl)
+
     elif verb == "CLICK":
         mouse.click(Button.left, 1)
 
@@ -1078,12 +1089,25 @@ def set_startup(enabled):
     )
     try:
         import subprocess
-        subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
-                        "-Command", ps], check=True,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return os.path.exists(lnk)
-    except Exception:
+        # Capture output so a PowerShell/COM failure surfaces a reason instead of
+        # silently returning False (the windowed exe has no console to print to).
+        r = subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+                            "-Command", ps], capture_output=True, text=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode != 0:
+            set_startup.last_error = (r.stderr or r.stdout or "").strip() or \
+                f"powershell exited {r.returncode}"
+            return False
+        ok = os.path.exists(lnk)
+        if not ok:
+            set_startup.last_error = "shortcut was not created"
+        return ok
+    except Exception as e:
+        set_startup.last_error = str(e)
         return False
+
+
+set_startup.last_error = ""
 
 
 # ── Windows Firewall: auto-allow inbound UDP so phones can reach us ───────────
@@ -1246,6 +1270,7 @@ _ACTION_LABELS = {
     "MCLICK": lambda r: ("Middle click", "act"),
     "MDOWN":  lambda r: ("Drag start", "act"),
     "MUP":    lambda r: ("Drag end", "act"),
+    "ZOOM":   lambda r: (f"Zoom {'in' if r.strip().lstrip('-').isdigit() and int(r) > 0 else 'out'}", "act"),
     "MEDIA":  lambda r: (f"Media · {r.strip()}", "act"),
     "KEY":    lambda r: (f'Type · “{r[:24]}”', "act") if r else None,
     "KEYSP":  lambda r: (f"Key · {r.strip()}", "act"),
@@ -1532,9 +1557,30 @@ class LazeRWindow:
         self._root.after(0, self._restore)
 
     def _restore(self):
-        self._root.deiconify()
-        self._root.lift()
-        self._root.focus_force()
+        # Bring the window forward — from the tray (withdrawn), minimized, or just
+        # buried. A background process (we're poked over loopback by a 2nd launch)
+        # can't steal the foreground with lift()/focus_force() alone under Windows'
+        # foreground lock; briefly forcing -topmost then dropping it is the standard
+        # way to actually raise to front.
+        r = self._root
+        try:
+            r.deiconify()
+            r.state("normal")   # un-minimize if iconified
+        except Exception:
+            pass
+        try:
+            r.attributes("-topmost", True)
+            r.lift()
+            r.focus_force()
+            r.after(300, self._drop_topmost)
+        except Exception:
+            pass
+
+    def _drop_topmost(self):
+        try:
+            self._root.attributes("-topmost", False)
+        except Exception:
+            pass
 
     def _tray_quit(self, icon=None, item=None):
         self._root.after(0, self._real_quit)
@@ -2048,7 +2094,8 @@ class LazeRWindow:
             self._log("Start with Windows: "
                       + ("on" if startup_enabled() else "off"), "info")
         else:
-            self._log("Couldn't change startup setting", "info")
+            reason = getattr(set_startup, "last_error", "") or "unknown error"
+            self._log(f"Couldn't change startup setting: {reason}", "info")
 
     def _pill(self, parent, name, detail, ok):
         tk = self._tk
@@ -2084,13 +2131,16 @@ class LazeRWindow:
 
         wrap = tk.Frame(pad, bg=_C["card"])
         wrap.pack(fill="both", expand=True, pady=(8, 0))
+        sb = tk.Scrollbar(wrap, orient="vertical")
+        sb.pack(side="right", fill="y")
         self._log_txt = tk.Text(
             wrap, bg=_C["card"], fg=_C["dim"], font=self.f_log,
-            height=8, width=74, state="disabled", relief="flat", bd=0,
+            height=6, width=74, state="disabled", relief="flat", bd=0,
             cursor="arrow", highlightthickness=0, padx=0, pady=0,
-            spacing1=1, spacing3=1,
+            spacing1=1, spacing3=1, yscrollcommand=sb.set,
         )
-        self._log_txt.pack(fill="both", expand=True)
+        self._log_txt.pack(side="left", fill="both", expand=True)
+        sb.config(command=self._log_txt.yview)
         self._log_txt.tag_config("ts", foreground=_C["faint"])
         self._log_txt.tag_config("ok", foreground=_C["ok"])
         self._log_txt.tag_config("act", foreground=_C["fg"])
@@ -2114,7 +2164,18 @@ class LazeRWindow:
         self._root.update_idletasks()
         w, h = self._root.winfo_width(), self._root.winfo_height()
         sw, sh = self._root.winfo_screenwidth(), self._root.winfo_screenheight()
-        self._root.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+        # Never let the window grow past the screen (the details panel can make it
+        # very tall). Cap the height — the activity log scrolls to absorb the rest —
+        # and clamp the position so the whole window, especially the bottom controls,
+        # stays on screen above the taskbar.
+        avail = sh - 80
+        if h > avail:
+            h = avail
+            self._root.geometry(f"{w}x{h}")
+            self._root.update_idletasks()
+        x = max(0, (sw - w) // 2)
+        y = max(0, min((sh - h) // 3, sh - h - 48))
+        self._root.geometry(f"+{x}+{y}")
 
     def _copy(self, text):
         self._root.clipboard_clear()
@@ -2325,7 +2386,26 @@ def main():
                     help="reject plaintext (v1) clients — require the encrypted QR wire")
     ap.add_argument("--setup-firewall", action="store_true",
                     help="add the Windows Firewall inbound rule (self-elevates) and exit")
+    ap.add_argument("--enable-startup", action="store_true",
+                    help="register LazeR to launch at Windows login (Startup folder) and exit")
+    ap.add_argument("--disable-startup", action="store_true",
+                    help="remove the launch-at-login registration and exit")
     args = ap.parse_args()
+
+    if args.enable_startup or args.disable_startup:
+        if not sys.platform.startswith("win"):
+            print("[startup] launch-at-login is Windows-only.")
+            return
+        want = args.enable_startup
+        if set_startup(want):
+            where = startup_lnk_path()
+            print(f"[startup] launch-at-login {'enabled' if want else 'disabled'}."
+                  + (f"\n[startup] shortcut: {where}\n[startup] it now appears in "
+                     "Task Manager → Startup apps." if want else ""))
+        else:
+            reason = getattr(set_startup, "last_error", "") or "unknown error"
+            print(f"[startup] could not change launch-at-login: {reason}")
+        return
 
     if args.setup_firewall:
         if not sys.platform.startswith("win"):

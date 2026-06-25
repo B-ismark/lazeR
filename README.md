@@ -69,6 +69,17 @@ python remote_server.py --setup-firewall   # self-elevates, adds the rule, exits
 
 On macOS/Linux, allow inbound UDP `50505` in your firewall if prompted.
 
+**Start with Windows.** LazeR does not auto-launch out of the box. Turn on the
+**Start with Windows** toggle in the desktop GUI, or from the command line:
+
+```bash
+python remote_server.py --enable-startup    # register; appears in Task Manager → Startup apps
+python remote_server.py --disable-startup    # remove it
+```
+
+This drops a shortcut in the per-user Startup folder, so LazeR launches at login
+and shows up under **Task Manager → Startup apps** (where you can also toggle it).
+
 **VPN.** A split-tunnel VPN is fine. A VPN that **full-tunnels or blocks LAN
 traffic** will stop the phone reaching the laptop even with the firewall open — no
 app can override that. Enable **"allow local network"** in the VPN client, or
