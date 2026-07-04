@@ -694,28 +694,41 @@ private fun ScrollStrip(onScroll: (Int, Int) -> Unit) {
 // ---------------------------------------------------------------------------
 @Composable
 private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> Unit) {
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface)) {
-        // Full-bleed trackpad — no scroll strip here; two-finger drag scrolls.
-        Box(
+    // Frame tone matches the compact card so the recessed pad reads the same way.
+    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerHighest)) {
+        // Same tactile pad + real scrollbar as the compact view, now full-bleed. (Two-finger
+        // drag still scrolls too — the strip is just an explicit alternative.)
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
-                .background(MaterialTheme.colorScheme.surfaceContainerHighest)
-                .hexDots(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.18f))
-                .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
-                    a.onSwitchStep, a.onSwitchEnd, a.onBrowserNav, { state.settings.naturalScroll }),
+                .statusBarsPadding()
+                .padding(12.dp),
         ) {
-            FilledTonalIconButton(
-                onClick = onExit,
-                modifier = Modifier.align(Alignment.TopEnd).statusBarsPadding().padding(16.dp),
-            ) { Icon(Icons.Filled.FullscreenExit, contentDescription = "Exit fullscreen") }
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .clip(RoundedCornerShape(24.dp))
+                    .background(MaterialTheme.colorScheme.surface)
+                    .hexDots(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.22f))
+                    .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
+                        a.onSwitchStep, a.onSwitchEnd, a.onBrowserNav, { state.settings.naturalScroll }),
+            ) {
+                FilledTonalIconButton(
+                    onClick = onExit,
+                    modifier = Modifier.align(Alignment.TopEnd).padding(12.dp),
+                ) { Icon(Icons.Filled.FullscreenExit, contentDescription = "Exit fullscreen") }
+            }
+            Spacer(Modifier.width(14.dp))
+            ScrollStrip(a.onScroll)
         }
         // Click bar pinned at the bottom, clear of the gesture nav area.
         Box(
             Modifier
                 .navigationBarsPadding()
                 .padding(horizontal = 12.dp)
-                .padding(top = 8.dp, bottom = 20.dp),
+                .padding(top = 4.dp, bottom = 20.dp),
         ) {
             ClickBar(a)
         }
