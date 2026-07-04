@@ -63,6 +63,13 @@ Phone and laptop on the **same Wi-Fi**. Open **LazeR**, then either:
 Saved laptops show on the start screen — tap one to reconnect instantly (the server's
 token is persistent, so it keeps working across restarts).
 
+**Away from home (off-LAN)?** You can also control a saved PC from mobile data or a
+different Wi-Fi. It needs a small always-on **coordinator** you host once (a free cloud
+VM works) — setup is in `rendezvous/deploy.md`. Then start the laptop with
+`--rendezvous <host:port>` and scan the QR on the phone. Pair by **QR** (not manual
+code) — remote access is encryption-only. Note: over a distant relay the cursor feels
+laggy; it's best for clicks, typing, and slides.
+
 - **Trackpad** (bottom): drag = move, tap = left-click, **hold = right-click**.
 - **Two fingers**: vertical = scroll · **horizontal swipe = browser back / forward**
   (like a Windows touchpad). **Three fingers** left/right = switch apps.

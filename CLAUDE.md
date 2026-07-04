@@ -1,8 +1,19 @@
 # LazeR — agent guide
 
-Phone-as-trackpad over LAN. Android (Kotlin/Compose) client + Python server. UDP
-on `50505`, gated by a per-session token; secure wire is AES-256-GCM (QR pairing).
+Phone-as-trackpad. Android (Kotlin/Compose) client + Python server. UDP on `50505`,
+gated by a per-session token; secure wire is AES-256-GCM (QR pairing) with a
+challenge-response handshake (`HELLO`→`CHAL`→`AUTH`, replay-proof). Works on the LAN
+directly and **off-LAN** through a self-hosted rendezvous coordinator (`rendezvous/`,
+stdlib-only) that hole-punches or relays — it's untrusted and never sees the key.
 See [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md) for the full picture.
+
+## Off-LAN / rendezvous
+
+`rendezvous/rendezvous_server.py` is the public coordinator (deploy notes in
+`rendezvous/deploy.md`; a live one runs on an Oracle Always-Free VM). Enable on the PC
+with `--rendezvous <host:port>` (persisted in `.lazer_rdv`, gitignored) — which
+**forces secure-only**. The QR then carries `&r=`. It's stdlib-only (no venv); redeploy
+by scp'ing the file to the VM and `systemctl restart rendezvous`.
 
 ## Releases — IMPORTANT POLICY
 
