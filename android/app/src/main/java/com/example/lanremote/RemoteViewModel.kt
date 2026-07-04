@@ -49,6 +49,12 @@ data class UiState(
     val savedDevices: List<Device> = emptyList(),
     val discovered: List<DiscoveredHost> = emptyList(),
     val settings: Settings = Settings(),
+    // True when we're linked over the rendezvous (relay/hole-punch) even though the
+    // phone is on the SAME Wi-Fi subnet as the laptop — i.e. the fast direct LAN path
+    // was blocked (usually the laptop's firewall / a Public network profile) and we
+    // silently fell back to the slower off-LAN path. Surfaced as a warning so this
+    // degraded-but-connected state stops masking itself.
+    val relayWhileLocal: Boolean = false,
 )
 
 class RemoteViewModel(app: Application) : AndroidViewModel(app) {
@@ -156,7 +162,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             ip = ip, port = port, token = token, key = key, rendezvous = rendezvous)
         current = dev
         reconnectJob?.cancel()
-        update { it.copy(conn = ConnState.Connecting, error = null) }
+        update { it.copy(conn = ConnState.Connecting, error = null, relayWhileLocal = false) }
         viewModelScope.launch {
             val connected = connectResolving(dev, 2000)
             if (connected != null) {
@@ -169,7 +175,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 settingsStore.lastDeviceId = connected.id
                 discovery.stop()   // no need to keep scanning Wi-Fi while controlling
                 touch()
-                update { it.copy(conn = ConnState.Connected) }
+                update { it.copy(conn = ConnState.Connected,
+                    relayWhileLocal = relayWhileLocal(connected)) }
                 startHealthLoop()
             } else {
                 update {
@@ -204,6 +211,30 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             if (client.connectRemote(rdv.first, rdv.second, dev.token, dev.key)) return dev
         }
         return null
+    }
+
+    /** True when we ended up on the off-LAN path (relay or hole-punch) even though the
+     *  phone shares [dev]'s Wi-Fi subnet — the tell-tale of a blocked direct LAN link
+     *  (laptop firewall / Public network profile) that quietly fell back to the slow
+     *  path. Off-LAN by choice (phone truly elsewhere) shares no subnet, so it won't
+     *  trip. IPv4 /24 heuristic — good enough for home LANs, and we only ever warn. */
+    private fun relayWhileLocal(dev: Device): Boolean =
+        client.isRemote && phoneSharesSubnet(dev.ip)
+
+    private fun phoneSharesSubnet(target: String): Boolean {
+        val t = target.split(".").mapNotNull { it.toIntOrNull() }
+        if (t.size != 4) return false                    // not a plain IPv4 target
+        return try {
+            java.net.NetworkInterface.getNetworkInterfaces().asSequence()
+                .filter { it.isUp && !it.isLoopback }
+                .flatMap { it.inetAddresses.asSequence() }
+                .filterIsInstance<java.net.Inet4Address>()
+                .filter { it.isSiteLocalAddress }        // private LAN address on this phone
+                .mapNotNull { it.hostAddress?.split(".")?.mapNotNull { o -> o.toIntOrNull() } }
+                .any { it.size == 4 && it[0] == t[0] && it[1] == t[1] && it[2] == t[2] }
+        } catch (e: Exception) {
+            false
+        }
     }
 
     /** Watchdog: poll volume (doubles as liveness); on repeated misses, reconnect. */
@@ -288,7 +319,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                         settingsStore.lastDeviceId = c.id
                     }
                     discovery.stop()
-                    update { it.copy(conn = ConnState.Connected, error = null) }
+                    update { it.copy(conn = ConnState.Connected, error = null,
+                        relayWhileLocal = relayWhileLocal(c)) }
                     startHealthLoop()
                     return@launch
                 }
@@ -310,7 +342,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         settingsStore.lastDeviceId = null   // intentional leave: don't auto-reconnect next launch
         current = null
         client.disconnect()
-        update { it.copy(conn = ConnState.Disconnected, keyboardText = "") }
+        update { it.copy(conn = ConnState.Disconnected, keyboardText = "", relayWhileLocal = false) }
         discovery.start { hosts -> update { it.copy(discovered = hosts) } }   // scan again for the connection screen
     }
 
