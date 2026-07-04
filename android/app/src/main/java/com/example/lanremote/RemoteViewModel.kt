@@ -11,6 +11,7 @@ import com.example.lanremote.data.Discovery
 import com.example.lanremote.data.Settings
 import com.example.lanremote.data.SettingsStore
 import com.example.lanremote.net.RemoteClient
+import com.example.lanremote.net.Rendezvous
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -28,6 +29,11 @@ enum class ConnState { Disconnected, Connecting, Connected, Reconnecting }
 private const val ACCEL_REF_PX = 12f
 private const val ACCEL_MAX = 2.2f
 private const val MOVE_GAP_RESET_MS = 120L   // idle gap ⇒ treat the next move as a fresh gesture
+// Speed-adaptive delta smoothing (one-euro style): near-still input is low-pass
+// filtered to kill capacitive jitter; fast flicks pass straight through so the cursor
+// never lags. Blend ramps from SMOOTH_FLOOR (slow) to 1.0 (fast).
+private const val SMOOTH_FLOOR = 0.45f       // min blend at rest — lower = smoother, more lag
+private const val SMOOTH_REF_PX = 7f         // per-event speed at which smoothing fully disengages
 
 data class UiState(
     val name: String = "",
@@ -107,7 +113,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun connectSaved(device: Device) {
         update { it.copy(name = device.name, ip = device.ip,
             port = device.port.toString(), token = device.token) }
-        connect(device.name, device.ip, device.port, device.token, device.key, save = false)
+        connect(device.name, device.ip, device.port, device.token, device.key,
+            save = false, rendezvous = device.rendezvous)
     }
 
     fun useDiscovered(host: DiscoveredHost) {
@@ -118,7 +125,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Parse a scanned `lazer://ip:port/?token=..&name=..` URI and connect. */
+    /** Parse a scanned `lazer://ip:port/?token=..&name=..&k=..&r=..` URI and connect. */
     fun applyScannedUri(raw: String) {
         val uri = try { Uri.parse(raw.trim()) } catch (e: Exception) { null }
         if (uri == null || uri.scheme != "lazer" || uri.host.isNullOrBlank()) {
@@ -130,22 +137,23 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val token = uri.getQueryParameter("token")?.uppercase().orEmpty()
         val name = uri.getQueryParameter("name") ?: ip
         val key = uri.getQueryParameter("k").orEmpty()   // 256-bit secret ⇒ encrypted wire
+        val rdv = uri.getQueryParameter("r").orEmpty()   // rendezvous host:port ⇒ off-LAN access
         if (token.isBlank()) {
             update { it.copy(error = "QR code has no token") }
             return
         }
         update { it.copy(name = name, ip = ip, port = port.toString(), token = token) }
-        connect(name, ip, port, token, key, save = true)
+        connect(name, ip, port, token, key, save = true, rendezvous = rdv)
     }
 
     private fun connect(name: String, ip: String, port: Int, token: String,
-                        key: String, save: Boolean) {
+                        key: String, save: Boolean, rendezvous: String = "") {
         if (ip.isBlank() || token.isBlank()) {
             update { it.copy(error = "Need an IP and token") }
             return
         }
         val dev = Device(id = "$ip:$port", name = name.ifBlank { ip },
-            ip = ip, port = port, token = token, key = key)
+            ip = ip, port = port, token = token, key = key, rendezvous = rendezvous)
         current = dev
         reconnectJob?.cancel()
         update { it.copy(conn = ConnState.Connecting, error = null) }
@@ -175,7 +183,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * Connect to [dev]'s stored address; if that fails, try every laptop currently
      * visible via mDNS (its IP may have moved on a DHCP lease / reboot). The wrong
-     * host simply fails the authenticated handshake, so trying them is safe.
+     * host simply fails the authenticated handshake, so trying them is safe. Finally,
+     * if the laptop is off-LAN and we have a key + rendezvous, punch/relay to it.
      * @return the device that answered (its id preserved, ip/port refreshed), or null.
      */
     private suspend fun connectResolving(dev: Device, timeoutMs: Long): Device? {
@@ -187,6 +196,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 return dev.copy(ip = h.ip, port = h.port)
             }
         }
+        // Off-LAN: reach the laptop through the rendezvous coordinator. Keep the
+        // saved LAN ip/port untouched (returning `dev`) so the next attempt still
+        // tries the fast local path first.
+        val rdv = Rendezvous.parse(dev.rendezvous)
+        if (rdv != null && dev.key.isNotBlank()) {
+            if (client.connectRemote(rdv.first, rdv.second, dev.token, dev.key)) return dev
+        }
         return null
     }
 
@@ -197,14 +213,23 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             var misses = 0
             var tick = 0
             while (isActive) {
-                val v = client.queryVolume()
+                // Remote paths (hole-punched or relayed through the rendezvous) carry
+                // far higher RTT than the LAN, and the relay can briefly drop a reply.
+                // Widen the liveness timeouts and tolerate more consecutive misses so
+                // ordinary off-LAN latency isn't mistaken for a dead link and thrashed
+                // into a reconnect loop. LAN keeps its snappy, tight thresholds.
+                val remote = client.isRemote
+                val volTimeout = if (remote) 1200 else 400
+                val pingTimeout = if (remote) 1800 else 500
+                val maxMisses = if (remote) 4 else 2
+                val v = client.queryVolume(volTimeout)
                 val alive = if (v != null) {
                     if (System.currentTimeMillis() - lastUserVolumeMs > 1200) {
                         update { it.copy(volume = v.toFloat()) }
                     }
                     true
                 } else {
-                    client.ping()   // confirm before declaring it dead
+                    client.ping(pingTimeout)   // confirm before declaring it dead
                 }
                 if (alive) {
                     misses = 0
@@ -229,7 +254,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                             }
                         }
                     }
-                } else if (++misses >= 2) {
+                } else if (++misses >= maxMisses) {
                     beginReconnect()
                     return@launch
                 }
@@ -297,6 +322,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var accY = 0f
     private var emaSpeed = 0f
     private var lastMoveMs = 0L
+    private var smX = 0f          // smoothed dx
+    private var smY = 0f          // smoothed dy
+    private var smInit = true     // seed the filter on the first move of a gesture
 
     fun move(dx: Float, dy: Float) {
         if (dx == 0f && dy == 0f) return
@@ -304,16 +332,29 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // A fresh gesture after an idle gap: clear stale speed + remainder so the
         // first move isn't flung by the previous flick's momentum.
         val now = System.currentTimeMillis()
-        if (now - lastMoveMs > MOVE_GAP_RESET_MS) { emaSpeed = 0f; accX = 0f; accY = 0f }
+        if (now - lastMoveMs > MOVE_GAP_RESET_MS) { emaSpeed = 0f; accX = 0f; accY = 0f; smInit = true }
         lastMoveMs = now
         lastInteractionMs = now
 
-        var mx = dx * s.sensitivity
-        var my = dy * s.sensitivity
+        // Adaptive low-pass on the raw delta: heavy at low speed (removes jitter), off
+        // at speed (no lag). Seeded on the gesture's first move to avoid an undershoot.
+        val speed = hypot(dx.toDouble(), dy.toDouble()).toFloat()
+        if (smInit) {
+            smX = dx; smY = dy; smInit = false
+        } else {
+            val a = SMOOTH_FLOOR + (1f - SMOOTH_FLOOR) * min(speed / SMOOTH_REF_PX, 1f)
+            smX += a * (dx - smX)
+            smY += a * (dy - smY)
+        }
+        val fx = smX
+        val fy = smY
+
+        var mx = fx * s.sensitivity
+        var my = fy * s.sensitivity
         if (s.acceleration) {
             // EMA-smooth the per-event speed so the gain ramps instead of jittering;
             // slow drags stay ~1:1 for precision, fast flicks reach ACCEL_MAX.
-            val inst = hypot(dx.toDouble(), dy.toDouble()).toFloat()
+            val inst = hypot(fx.toDouble(), fy.toDouble()).toFloat()
             emaSpeed = emaSpeed * 0.6f + inst * 0.4f
             val gain = 1f + min(emaSpeed / ACCEL_REF_PX, 1f) * (ACCEL_MAX - 1f)
             mx *= gain; my *= gain
@@ -323,6 +364,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val ix = accX.toInt()
         val iy = accY.toInt()
         if (ix != 0 || iy != 0) {
+            // Send each event's delta immediately. Small, frequent deltas keep the
+            // cursor smooth even under relay jitter; batching them into fewer larger
+            // sends made the motion *jumpier* (each arriving hop is bigger), so we
+            // don't coalesce — not on LAN (low latency) nor on the relay.
             client.move(ix, iy)
             accX -= ix
             accY -= iy

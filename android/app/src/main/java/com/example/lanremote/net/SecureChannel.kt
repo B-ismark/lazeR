@@ -25,6 +25,14 @@ class SecureChannel(key: ByteArray) {
     private val sid = ByteArray(4).also { SecureRandom().nextBytes(it) }
     private val sendCtr = AtomicLong(0L)
 
+    // Inbound replay guard (mirrors the server): pin the server's sid on the first
+    // authenticated reply, then require the same sid and a strictly-greater counter.
+    // Without this a captured genuine OK/PONG/VOL could be replayed to spoof liveness
+    // or a handshake (C-F3). Guarded by [recvLock] — open() runs on several threads.
+    private val recvLock = Any()
+    private var srvSid: ByteArray? = null
+    private var recvCtr = -1L
+
     /** Build a v2 datagram for [body] (e.g. "MOVE 3 -4"). */
     fun seal(body: String): ByteArray {
         val ctr = sendCtr.incrementAndGet()
@@ -52,7 +60,23 @@ class SecureChannel(key: ByteArray) {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.DECRYPT_MODE, keySpec, GCMParameterSpec(128, nonce))
             cipher.updateAAD(header)
-            String(cipher.doFinal(ct), Charsets.UTF_8)
+            val text = String(cipher.doFinal(ct), Charsets.UTF_8)  // valid tag ⇒ authentic
+            // Freshness: reject a replayed/reordered reply (same session, counter not
+            // advancing) or one from a different server session.
+            val rsid = header.copyOfRange(2, 6)
+            var ctr = 0L
+            for (i in 6 until 14) ctr = (ctr shl 8) or (header[i].toLong() and 0xFF)
+            synchronized(recvLock) {
+                val pinned = srvSid
+                if (pinned == null) {
+                    srvSid = rsid; recvCtr = ctr
+                } else if (!rsid.contentEquals(pinned) || ctr <= recvCtr) {
+                    return null
+                } else {
+                    recvCtr = ctr
+                }
+            }
+            text
         } catch (e: Exception) {
             null
         }
