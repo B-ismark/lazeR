@@ -8,7 +8,6 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.animation.core.animate
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.offset
 import androidx.compose.material.icons.filled.FastForward
@@ -16,7 +15,6 @@ import androidx.compose.material.icons.filled.FastRewind
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
@@ -40,16 +38,19 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardReturn
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.automirrored.outlined.Backspace
@@ -68,28 +69,32 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.ButtonGroup
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.HorizontalFloatingToolbar
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonShapes
+import androidx.compose.material3.MaterialShapes
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.material3.SegmentedButtonDefaults
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.material3.toShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -199,7 +204,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
                         Icon(Icons.Filled.Fullscreen, contentDescription = "Expand trackpad")
                     }
                 },
-                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
+                colors = TopAppBarDefaults.topAppBarColors(
                     containerColor = MaterialTheme.colorScheme.surface,
                 ),
             )
@@ -233,40 +238,35 @@ fun ControlScreen(state: UiState, a: ControlActions) {
 }
 
 // ---------------------------------------------------------------------------
-// Controls: volume + segmented Media/Keyboard (basic, always visible).
+// Controls: volume + a connected Media/Keyboard toggle group (always visible).
 // ---------------------------------------------------------------------------
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun ControlsPanel(state: UiState, a: ControlActions) {
     var tab by rememberSaveable { mutableIntStateOf(0) } // 0 = Media, 1 = Keyboard
 
     Column {
-        // Volume moved into the Media panel below; brightness lives in the Advanced
-        // sheet (Tune icon). This page opens straight into the Media/Keyboard tabs.
-        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-            SegmentedButton(
-                selected = tab == 0, onClick = { tab = 0 },
-                shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
-                icon = {},
-                label = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Filled.Headphones, contentDescription = null,
-                            modifier = Modifier.size(18.dp))
-                        Text("  Media")
-                    }
-                },
+        // Expressive connected button group replaces the segmented row: the selected
+        // half swells, the other compresses — the M3 Expressive toggle feel.
+        ButtonGroup(
+            overflowIndicator = { },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            toggleableItem(
+                checked = tab == 0,
+                label = "Media",
+                onCheckedChange = { tab = 0 },
+                icon = { Icon(Icons.Filled.Headphones, contentDescription = null,
+                    modifier = Modifier.size(18.dp)) },
+                weight = 1f,
             )
-            SegmentedButton(
-                selected = tab == 1, onClick = { tab = 1 },
-                shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
-                icon = {},
-                label = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Filled.Keyboard, contentDescription = null,
-                            modifier = Modifier.size(18.dp))
-                        Text("  Keyboard")
-                    }
-                },
+            toggleableItem(
+                checked = tab == 1,
+                label = "Keyboard",
+                onCheckedChange = { tab = 1 },
+                icon = { Icon(Icons.Filled.Keyboard, contentDescription = null,
+                    modifier = Modifier.size(18.dp)) },
+                weight = 1f,
             )
         }
 
@@ -284,6 +284,7 @@ private fun ControlsPanel(state: UiState, a: ControlActions) {
 }
 
 /** Volume / brightness card: icon + percent, with −/＋ nudge buttons flanking the slider. */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun LevelCard(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
@@ -294,7 +295,19 @@ private fun LevelCard(
 ) {
     SectionCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+            // Expressive MaterialShapes flourish: the level icon sits in a 9-sided
+            // "cookie" tonal badge instead of a bare glyph.
+            Box(
+                modifier = Modifier
+                    .size(36.dp)
+                    .clip(MaterialShapes.Cookie9Sided.toShape())
+                    .background(MaterialTheme.colorScheme.primaryContainer),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(icon, contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.size(20.dp))
+            }
             Text("  $label  ${value.toInt()}%", style = MaterialTheme.typography.titleMedium)
         }
         Row(
@@ -334,7 +347,8 @@ private fun MediaPanel(state: UiState, a: ControlActions) {
             ) {
                 // Rewind / fast-forward send Left / Right arrow — the focused app decides
                 // the step (YouTube ~5s, Netflix/VLC/Disney+ ~10s). Generic chevrons, no
-                // seconds label that would be wrong half the time.
+                // seconds label that would be wrong half the time. Each button morphs its
+                // corner (rounded → circle) on press — the M3 Expressive icon-button feel.
                 PressIconButton(onClick = { seek("left") }, size = 44.dp, shape = RoundedCornerShape(16.dp)) {
                     Icon(Icons.Filled.FastRewind, "Rewind", modifier = Modifier.size(24.dp))
                 }
@@ -355,30 +369,36 @@ private fun MediaPanel(state: UiState, a: ControlActions) {
     }
 }
 
-/** Icon button that scales down while pressed — a physical "push" for tactile feedback. */
+/**
+ * Expressive icon button. The M3 Expressive spec gives icon buttons a *shape morph*:
+ * the container animates from its resting [shape] to [pressedShape] while held (here a
+ * round-cornered square that pops to a circle), driven by the theme's motion scheme.
+ * That replaces the old hand-rolled scale-down animation.
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun PressIconButton(
     onClick: () -> Unit,
     size: Dp,
     shape: Shape,
     filled: Boolean = false,
+    pressedShape: Shape = CircleShape,
     content: @Composable () -> Unit,
 ) {
-    val src = remember { MutableInteractionSource() }
-    val pressed by src.collectIsPressedAsState()
-    val scale by animateFloatAsState(if (pressed) 0.90f else 1f, label = "press")
-    val mod = Modifier.size(size).scale(scale)
+    val shapes = IconButtonShapes(shape = shape, pressedShape = pressedShape)
+    val mod = Modifier.size(size)
     if (filled) {
-        FilledIconButton(onClick = onClick, modifier = mod, shape = shape, interactionSource = src) { content() }
+        FilledIconButton(onClick = onClick, shapes = shapes, modifier = mod) { content() }
     } else {
-        FilledTonalIconButton(onClick = onClick, modifier = mod, shape = shape, interactionSource = src) { content() }
+        FilledTonalIconButton(onClick = onClick, shapes = shapes, modifier = mod) { content() }
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun KeyboardPanel(state: UiState, a: ControlActions) {
     fun special(name: String) { a.onButtonTap(); a.onSpecialKey(name) }
+    fun combo(c: String) { a.onButtonTap(); a.onCombo(c) }
     SectionCard {
         OutlinedTextField(
             value = state.keyboardText, onValueChange = a.onKeyboardInput,
@@ -387,35 +407,72 @@ private fun KeyboardPanel(state: UiState, a: ControlActions) {
             modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(10.dp))
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilledTonalIconButton(onClick = { special("backspace") }) {
-                Icon(Icons.AutoMirrored.Outlined.Backspace, contentDescription = "Backspace")
+        // One row, equal-width keys (weight) so all six fit on a single line regardless of
+        // screen width. Backspace and New line are icon keys to stay compact; the centre
+        // four are text. Tight content padding lets the labels breathe in the narrow cells.
+        val keyPad = PaddingValues(horizontal = 4.dp)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            FilledTonalButton(onClick = { special("backspace") }, shapes = ButtonDefaults.shapes(),
+                contentPadding = keyPad, modifier = Modifier.weight(1f)) {
+                Icon(Icons.AutoMirrored.Outlined.Backspace, contentDescription = "Backspace",
+                    modifier = Modifier.size(20.dp))
             }
-            FilledTonalButton(onClick = { special("space") }) { Text("Space") }
-            FilledTonalButton(onClick = { special("tab") }) { Text("Tab") }
-            FilledTonalButton(onClick = { special("esc") }) { Text("Esc") }
-            FilledTonalButton(onClick = { special("enter") }) { Text("Enter") }
+            FilledTonalButton(onClick = { special("space") }, shapes = ButtonDefaults.shapes(),
+                contentPadding = keyPad, modifier = Modifier.weight(1f)) {
+                Text("Space", maxLines = 1)
+            }
+            FilledTonalButton(onClick = { special("tab") }, shapes = ButtonDefaults.shapes(),
+                contentPadding = keyPad, modifier = Modifier.weight(1f)) {
+                Text("Tab", maxLines = 1)
+            }
+            FilledTonalButton(onClick = { special("esc") }, shapes = ButtonDefaults.shapes(),
+                contentPadding = keyPad, modifier = Modifier.weight(1f)) {
+                Text("Esc", maxLines = 1)
+            }
+            FilledTonalButton(onClick = { special("enter") }, shapes = ButtonDefaults.shapes(),
+                contentPadding = keyPad, modifier = Modifier.weight(1f)) {
+                Text("Enter", maxLines = 1)
+            }
+            // Shift+Enter: soft newline without submitting — near-universal (chat apps,
+            // editors), unlike Alt+Enter which varies by app. Shown as the return glyph.
+            FilledTonalButton(onClick = { combo("shift enter") }, shapes = ButtonDefaults.shapes(),
+                contentPadding = keyPad, modifier = Modifier.weight(1f)) {
+                Icon(Icons.AutoMirrored.Filled.KeyboardReturn,
+                    contentDescription = "New line (Shift+Enter)", modifier = Modifier.size(20.dp))
+            }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Click bar: explicit Left / Middle / Right + hold-to-drag.
+// Click bar: a connected Left / Middle / Right button group + hold-to-drag.
 // ---------------------------------------------------------------------------
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun ClickBar(a: ControlActions) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        FilledTonalButton(onClick = a.onClick, modifier = Modifier.weight(1f)) { Text("Left") }
-        FilledTonalButton(onClick = a.onMiddleClick, modifier = Modifier.weight(1f)) { Text("Middle") }
-        FilledTonalButton(onClick = a.onRightClick, modifier = Modifier.weight(1f)) { Text("Right") }
+        // Connected group: whichever button you press swells and its neighbours give way
+        // — the signature M3 Expressive button-group interaction.
+        ButtonGroup(
+            overflowIndicator = { },
+            modifier = Modifier.weight(3f),
+        ) {
+            clickableItem(onClick = a.onClick, label = "Left", weight = 1f)
+            clickableItem(onClick = a.onMiddleClick, label = "Middle", weight = 1f)
+            clickableItem(onClick = a.onRightClick, label = "Right", weight = 1f)
+        }
         HoldDragButton(a.onDragStart, a.onDragEnd, modifier = Modifier.weight(1.2f))
     }
 }
 
 /** While held, the left button stays pressed — drag on the trackpad to move/select. */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun HoldDragButton(
     onDragStart: () -> Unit,
@@ -692,6 +749,7 @@ private fun ScrollStrip(onScroll: (Int, Int) -> Unit) {
 // ---------------------------------------------------------------------------
 // Fullscreen trackpad
 // ---------------------------------------------------------------------------
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> Unit) {
     // Frame tone matches the compact card so the recessed pad reads the same way.
@@ -714,23 +772,26 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
                     .hexDots(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.22f))
                     .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
                         a.onSwitchStep, a.onSwitchEnd, a.onBrowserNav, { state.settings.naturalScroll }),
-            ) {
-                FilledTonalIconButton(
-                    onClick = onExit,
-                    modifier = Modifier.align(Alignment.TopEnd).padding(12.dp),
-                ) { Icon(Icons.Filled.FullscreenExit, contentDescription = "Exit fullscreen") }
-            }
+            )
             Spacer(Modifier.width(14.dp))
             ScrollStrip(a.onScroll)
         }
-        // Click bar pinned at the bottom, clear of the gesture nav area.
-        Box(
-            Modifier
+        // Expressive floating toolbar, pinned bottom-centre in the dead space below the
+        // pad (clear of the gesture-nav area) — click actions + exit float together.
+        HorizontalFloatingToolbar(
+            expanded = true,
+            modifier = Modifier
+                .align(Alignment.CenterHorizontally)
                 .navigationBarsPadding()
-                .padding(horizontal = 12.dp)
-                .padding(top = 4.dp, bottom = 20.dp),
+                .padding(bottom = 16.dp),
         ) {
-            ClickBar(a)
+            FilledTonalButton(onClick = a.onClick, shapes = ButtonDefaults.shapes()) { Text("Left") }
+            FilledTonalButton(onClick = a.onMiddleClick, shapes = ButtonDefaults.shapes()) { Text("Mid") }
+            FilledTonalButton(onClick = a.onRightClick, shapes = ButtonDefaults.shapes()) { Text("Right") }
+            HoldDragButton(a.onDragStart, a.onDragEnd)
+            IconButton(onClick = onExit) {
+                Icon(Icons.Filled.FullscreenExit, contentDescription = "Exit fullscreen")
+            }
         }
     }
 }
@@ -738,7 +799,8 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
 // ---------------------------------------------------------------------------
 // Advanced sheet: shortcuts, system, presentation.
 // ---------------------------------------------------------------------------
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class,
+    ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Unit) {
     var paste by rememberSaveable { mutableStateOf("") }
@@ -776,11 +838,13 @@ private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
                     modifier = Modifier.weight(1f),
                 )
                 Spacer(Modifier.width(8.dp))
-                FilledIconButton(
+                PressIconButton(
                     onClick = {
                         if (paste.isNotEmpty()) { a.onButtonTap(); a.onPaste(paste); paste = "" }
                     },
-                    modifier = Modifier.size(52.dp),
+                    size = 52.dp,
+                    shape = RoundedCornerShape(18.dp),
+                    filled = true,
                 ) { Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send paste") }
             }
 
@@ -857,9 +921,10 @@ private fun SheetTitle(text: String) {
         modifier = Modifier.padding(bottom = 10.dp))
 }
 
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun ChipBtn(label: String, onClick: () -> Unit) {
-    FilledTonalButton(onClick = onClick) { Text(label) }
+    FilledTonalButton(onClick = onClick, shapes = ButtonDefaults.shapes()) { Text(label) }
 }
 
 @Composable

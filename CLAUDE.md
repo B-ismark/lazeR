@@ -43,6 +43,21 @@ authenticated (`gh auth login`). It re-runs `--clobber` if the tag already exist
 - **Android APK:** from `android/`, `./gradlew assembleRelease` (hardened, R8,
   signed with the local `~/.android/debug.keystore` "sideload" config) →
   `app/build/outputs/apk/release/`. `assembleDebug` for a quick debuggable build.
+  Needs Android **platform-35** + **build-tools 35.0.0** (`sdkmanager
+  "platforms;android-35" "build-tools;35.0.0"`).
+
+### M3 Expressive version lock (don't break this)
+
+The UI is **Material 3 Expressive**, whose APIs live ONLY in the `material3`
+**1.5.0-alpha** line (they were pulled from 1.4.0 stable). `app/build.gradle.kts` pins
+**`material3:1.5.0-alpha12`** explicitly (overriding the Compose BOM) — the newest alpha
+still on Compose 1.8/1.9, which keeps **compileSdk 35 / AGP 8.7.3 / Gradle 8.9**. alpha16
+jumps to Compose 1.11 (compileSdk 36), alpha20+ to 1.12 (compileSdk 37 + AGP 9). **Do not
+bump material3 past alpha12** without doing that whole toolchain chain (+ new platform).
+Toolchain also moved: AGP 8.5.2→8.7.3, Kotlin 2.0.20→2.1.0, compileSdk 34→35 (targetSdk
+stays 34). Release lint is disabled (`lint { checkReleaseBuilds = false }`) — AGP 8.7.3's
+lint crashes (`IncompatibleClassChangeError`) on the alpha libs. Full detail:
+[android/EXPRESSIVE_MIGRATION.md](android/EXPRESSIVE_MIGRATION.md).
 
 ## Environment gotchas (Windows)
 

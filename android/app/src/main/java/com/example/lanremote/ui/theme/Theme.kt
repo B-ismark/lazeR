@@ -2,7 +2,9 @@ package com.example.lanremote.ui.theme
 
 import android.os.Build
 import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.MaterialExpressiveTheme
+import androidx.compose.material3.MotionScheme
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
@@ -24,6 +26,13 @@ private val FallbackLight = lightColorScheme(
     tertiary = Color(0xFF77536D),
 )
 
+/**
+ * M3 Expressive theme. [MaterialExpressiveTheme] swaps in the expressive motion +
+ * shape tokens (springier defaults, the shape morph buttons/icon buttons use on
+ * press) on top of our dynamic/fallback color scheme. [MotionScheme.expressive]
+ * makes the built-in animations (sheets, indicators, shape morphs) bouncier.
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun LanRemoteTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
@@ -38,8 +47,9 @@ fun LanRemoteTheme(
         else -> FallbackLight
     }
 
-    MaterialTheme(
+    MaterialExpressiveTheme(
         colorScheme = colorScheme,
+        motionScheme = MotionScheme.expressive(),
         typography = Typography(),
         content = content,
     )

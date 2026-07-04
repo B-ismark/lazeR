@@ -28,12 +28,14 @@ import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedButton
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -56,6 +58,7 @@ import com.example.lanremote.UiState
 import com.example.lanremote.data.Device
 import com.example.lanremote.data.DiscoveredHost
 
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 fun ConnectionScreen(
     state: UiState,
@@ -174,12 +177,14 @@ fun ConnectionScreen(
                 Button(
                     onClick = onScanQr,
                     enabled = !connecting,
+                    shapes = ButtonDefaults.shapes(),
                     modifier = Modifier.fillMaxWidth().height(56.dp),
-                    shape = RoundedCornerShape(18.dp),
                 ) {
                     if (connecting) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        LoadingIndicator(
+                            modifier = Modifier.size(24.dp),
+                            color = MaterialTheme.colorScheme.onPrimary,
+                        )
                         Text("  Connecting…", style = MaterialTheme.typography.titleMedium)
                     } else {
                         Icon(Icons.Filled.QrCodeScanner, contentDescription = null,
@@ -192,6 +197,7 @@ fun ConnectionScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun ManualCard(
     state: UiState,
@@ -257,8 +263,7 @@ private fun ManualCard(
                 shape = RoundedCornerShape(16.dp),
             ) {
                 if (connecting) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    LoadingIndicator(modifier = Modifier.size(20.dp))
                     Text("  Connecting…")
                 } else {
                     Text("Connect & save")

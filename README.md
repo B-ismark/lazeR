@@ -1,7 +1,7 @@
 # LazeR
 
-Phone-as-trackpad. Android (Kotlin + Jetpack Compose, Material You) client + Python
-laptop server. Mouse move/click/scroll, system volume, display brightness, media
+Phone-as-trackpad. Android (Kotlin + Jetpack Compose, **Material 3 Expressive**) client
++ Python laptop server. Mouse move/click/scroll, system volume, display brightness, media
 keys, keyboard typing, clipboard paste, app-switch and browser gestures.
 
 On the **same Wi-Fi** it's direct UDP on `50505`. **Off-LAN** (mobile data or another
@@ -112,7 +112,11 @@ In the app:
 3. Drag the trackpad to move the cursor; tap it to left-click. Use the slider for
    volume and the buttons for media. Top-right **✕** disconnects.
 
-`minSdk 24`, `targetSdk 34`. Only `INTERNET` permission — no volume-button hooks,
+`minSdk 24`, `targetSdk 34`, `compileSdk 35`. UI is Material 3 Expressive (springy
+motion, shape-morph buttons, connected button groups, morphing loading indicators) —
+see [android/EXPRESSIVE_MIGRATION.md](android/EXPRESSIVE_MIGRATION.md) for version
+constraints (material3 is pinned to a 1.5.0-alpha; don't bump it blindly).
+Only `INTERNET` permission — no volume-button hooks,
 no special device permissions.
 
 ---

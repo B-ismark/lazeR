@@ -9,7 +9,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -133,6 +134,7 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
     }
 }
 
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun ReconnectingScreen(name: String, onCancel: () -> Unit) {
     Column(
@@ -140,7 +142,8 @@ private fun ReconnectingScreen(name: String, onCancel: () -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        CircularProgressIndicator(modifier = Modifier.size(48.dp))
+        // Expressive morphing loading indicator (the shape-shifting polygon).
+        LoadingIndicator(modifier = Modifier.size(48.dp))
         Text(
             "Reconnecting to $name…",
             style = MaterialTheme.typography.titleMedium,
