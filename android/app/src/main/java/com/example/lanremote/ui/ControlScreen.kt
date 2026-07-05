@@ -81,7 +81,6 @@ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
-import androidx.compose.material3.HorizontalFloatingToolbar
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonShapes
@@ -122,8 +121,14 @@ private const val SCROLL_STEP_PX = 16f   // smaller = finer scroll + more haptic
 private const val SWIPE_APP_PX = 120f    // three-finger horizontal travel per app switch — short hop, fits small screens
 private const val SWIPE_NAV_PX = 150f    // two-finger horizontal travel per browser back/forward — deliberate, not jittery scroll
 private const val ZOOM_STEP_PX = 22f     // two-finger spread change per ctrl+wheel zoom notch (finer = smoother zoom)
-private const val PINCH_LATCH_PX = 8f    // gap change that commits the 2-finger gesture to zoom
-private const val SCROLL_LATCH_PX = 6f   // translation that commits the 2-finger gesture to scroll/nav
+// The 2-finger gesture latches once ACCUMULATED evidence crosses a threshold — not per
+// frame, which mis-fired zoom on a back-swipe (one wobbly first frame was enough). We
+// sum net spread (gap change) vs net centroid travel over the opening frames, then pick
+// the bigger. ZOOM_BIAS makes spread win only when it clearly dominates, so an ordinary
+// horizontal swipe (fingers drift together, gap ~steady) reliably lands on back/forward.
+private const val PINCH_LATCH_PX = 14f   // accumulated |gap change| that can commit to zoom
+private const val SCROLL_LATCH_PX = 10f  // accumulated centroid travel that can commit to scroll/nav
+private const val ZOOM_BIAS = 1.4f       // spread must beat travel by this factor to latch zoom
 
 /** All the actions the control screen can fire. Bundled to keep the signature sane. */
 class ControlActions(
@@ -498,10 +503,15 @@ private fun KeyboardPanel(state: UiState, a: ControlActions) {
 // ---------------------------------------------------------------------------
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun ClickBar(a: ControlActions) {
+private fun ClickBar(
+    a: ControlActions,
+    modifier: Modifier = Modifier,
+    trailing: (@Composable () -> Unit)? = null,
+) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
         // Connected group: whichever button you press swells and its neighbours give way
         // — the signature M3 Expressive button-group interaction.
@@ -514,6 +524,9 @@ private fun ClickBar(a: ControlActions) {
             clickableItem(onClick = a.onRightClick, label = "Right", weight = 1f)
         }
         HoldDragButton(a.onDragStart, a.onDragEnd, modifier = Modifier.weight(1.2f))
+        // Optional trailing affordance (e.g. the fullscreen-exit button) sits after the
+        // hold-drag button without stealing width from the connected group.
+        trailing?.invoke()
     }
 }
 
@@ -574,6 +587,9 @@ private fun Modifier.trackpadInput(
     var moved = false               // fired a move/scroll/zoom/nav/switch ⇒ not a tap
     var twoHold = 0                 // consecutive 2-finger frames (flicker guard)
     var pinchMode = 0               // 0 undecided · 1 zoom · -1 scroll/nav — latched until <2 fingers
+    var latchGap = 0f               // accumulated net gap change while undecided
+    var latchPanX = 0f              // accumulated net centroid x-travel while undecided
+    var latchPanY = 0f              // accumulated net centroid y-travel while undecided
     awaitPointerEventScope {
         while (true) {
             val event = awaitPointerEvent()
@@ -583,6 +599,7 @@ private fun Modifier.trackpadInput(
                 active = true
                 downMs = event.changes.first().uptimeMillis
                 maxFingers = 0; travel = 0f; moved = false; twoHold = 0; pinchMode = 0
+                latchGap = 0f; latchPanX = 0f; latchPanY = 0f
                 acc[0] = 0f; acc[1] = 0f; swipeAcc = 0f; navAcc = 0f; zoomAcc = 0f
             }
             if (n > maxFingers) maxFingers = n
@@ -622,9 +639,17 @@ private fun Modifier.trackpadInput(
                         travel += abs(dx) + abs(dy)
                         // Latch into zoom OR scroll once one clearly dominates, then stay there
                         // until the fingers lift — no per-frame flip-flop (that was the judder).
+                        // Decide on ACCUMULATED evidence, not a single frame: sum net spread vs
+                        // net travel over the opening frames so one wobbly first frame (uneven
+                        // finger landing, slight rotation) can't mis-latch a back-swipe to zoom.
                         if (pinchMode == 0) {
-                            if (abs(dGap) > PINCH_LATCH_PX && abs(dGap) >= maxOf(abs(dx), abs(dy))) pinchMode = 1
-                            else if (abs(dx) > SCROLL_LATCH_PX || abs(dy) > SCROLL_LATCH_PX) pinchMode = -1
+                            latchGap += dGap
+                            latchPanX += dx
+                            latchPanY += dy
+                            val spread = abs(latchGap)
+                            val pan = hypot(latchPanX.toDouble(), latchPanY.toDouble()).toFloat()
+                            if (spread >= PINCH_LATCH_PX && spread > pan * ZOOM_BIAS) pinchMode = 1
+                            else if (pan >= SCROLL_LATCH_PX) pinchMode = -1
                         }
                         if (pinchMode == 1) {
                             moved = true
@@ -670,6 +695,7 @@ private fun Modifier.trackpadInput(
                     }
                     acc[0] = 0f; acc[1] = 0f; swipeAcc = 0f; navAcc = 0f; zoomAcc = 0f
                     twoHold = 0; pinchMode = 0
+                    latchGap = 0f; latchPanX = 0f; latchPanY = 0f
                 }
             }
         }
@@ -822,23 +848,21 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
             Spacer(Modifier.width(14.dp))
             ScrollStrip(a.onScroll)
         }
-        // Expressive floating toolbar, pinned bottom-centre in the dead space below the
-        // pad (clear of the gesture-nav area) — click actions + exit float together.
-        HorizontalFloatingToolbar(
-            expanded = true,
+        // Same click bar as the home page — the connected Left/Middle/Right group +
+        // hold-drag — reused in the dead space below the pad instead of a bespoke
+        // floating toolbar, so both views feel identical. Exit rides along as the
+        // trailing affordance. Sits clear of the gesture-nav area.
+        ClickBar(
+            a = a,
             modifier = Modifier
-                .align(Alignment.CenterHorizontally)
                 .navigationBarsPadding()
-                .padding(bottom = 16.dp),
-        ) {
-            FilledTonalButton(onClick = a.onClick, shapes = ButtonDefaults.shapes()) { Text("Left") }
-            FilledTonalButton(onClick = a.onMiddleClick, shapes = ButtonDefaults.shapes()) { Text("Mid") }
-            FilledTonalButton(onClick = a.onRightClick, shapes = ButtonDefaults.shapes()) { Text("Right") }
-            HoldDragButton(a.onDragStart, a.onDragEnd)
-            IconButton(onClick = onExit) {
-                Icon(Icons.Filled.FullscreenExit, contentDescription = "Exit fullscreen")
-            }
-        }
+                .padding(horizontal = 12.dp, vertical = 12.dp),
+            trailing = {
+                FilledTonalIconButton(onClick = onExit) {
+                    Icon(Icons.Filled.FullscreenExit, contentDescription = "Exit fullscreen")
+                }
+            },
+        )
     }
 }
 
@@ -857,10 +881,10 @@ private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
     ModalBottomSheet(onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 28.dp)) {
-            // Brightness (only when the laptop reports a backend) — kept here so the
-            // main control page stays compact.
+            // Display — brightness, only when the laptop reports a backend. Grouped up top
+            // as a level control (mirrors Volume's card on the main page).
             if (state.brightnessAvailable) {
-                SheetTitle("Brightness")
+                SheetTitle("Display")
                 LevelCard(
                     icon = Icons.Filled.BrightnessHigh,
                     label = "Brightness",
@@ -871,7 +895,9 @@ private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
                 Spacer(Modifier.height(20.dp))
             }
 
-            SheetTitle("Paste text")
+            // Clipboard — the paste-to-laptop field alongside the copy/cut/paste combos,
+            // since they're all clipboard actions.
+            SheetTitle("Clipboard")
             // Sends the text to the laptop clipboard and pastes it in one shot —
             // far faster than per-character typing for URLs, snippets, passwords.
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -893,13 +919,17 @@ private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
                     filled = true,
                 ) { Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send paste") }
             }
-
-            Spacer(Modifier.height(20.dp))
-            SheetTitle("Shortcuts")
+            Spacer(Modifier.height(10.dp))
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 chip("Copy") { a.onCombo("ctrl c") }
-                chip("Paste") { a.onCombo("ctrl v") }
                 chip("Cut") { a.onCombo("ctrl x") }
+                chip("Paste") { a.onCombo("ctrl v") }
+            }
+
+            // Editing — history actions, separated from clipboard so each group is one idea.
+            Spacer(Modifier.height(20.dp))
+            SheetTitle("Editing")
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 chip("Undo") { a.onCombo("ctrl z") }
                 chip("Redo") { a.onCombo("ctrl y") }
             }
@@ -924,8 +954,8 @@ private fun SettingsSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
     ModalBottomSheet(onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 28.dp)) {
-            SheetTitle("Settings")
-
+            // Pointer — everything that shapes cursor motion.
+            SheetTitle("Pointer")
             Text("Cursor speed  ${"%.1f".format(state.settings.sensitivity)}×",
                 style = MaterialTheme.typography.bodyMedium)
             Slider(
@@ -937,8 +967,14 @@ private fun SettingsSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
             Spacer(Modifier.height(8.dp))
             ToggleRow("Pointer acceleration", "Fast flicks move the cursor farther",
                 state.settings.acceleration, a.onAcceleration)
+
+            Spacer(Modifier.height(16.dp))
+            SheetTitle("Scrolling")
             ToggleRow("Natural scrolling", "Content follows your fingers",
                 state.settings.naturalScroll, a.onNaturalScroll)
+
+            Spacer(Modifier.height(16.dp))
+            SheetTitle("Feedback")
             ToggleRow("Haptic feedback", "Vibrate on clicks and scroll",
                 state.settings.haptics, a.onHaptics)
         }

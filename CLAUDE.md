@@ -59,6 +59,17 @@ stays 34). Release lint is disabled (`lint { checkReleaseBuilds = false }`) — 
 lint crashes (`IncompatibleClassChangeError`) on the alpha libs. Full detail:
 [android/EXPRESSIVE_MIGRATION.md](android/EXPRESSIVE_MIGRATION.md).
 
+### Cursor lag / low-latency WifiLock (don't remove WAKE_LOCK)
+
+The client holds a **low-latency WifiLock** (`WIFI_MODE_FULL_LOW_LATENCY`, falling back to
+`FULL_HIGH_PERF` below API 29) for the whole session (`RemoteViewModel`: acquire on connect,
+release on disconnect / `onCleared`). Without it the phone radio drops into WiFi power-save
+between beacons, making the cursor feel **sluggish / trailing** on some routers even on a
+flawless 5 GHz link — the tell is a **bimodal LAN ping (≈4 ms ↔ 100–170 ms, 0 % loss)** with
+great RSSI/rate. Acquiring a WifiLock **requires `android.permission.WAKE_LOCK`** (NOT
+`CHANGE_WIFI_STATE`, the common wrong guess); without it `acquire()` throws a swallowed
+`SecurityException` and the lock silently never engages. **Keep WAKE_LOCK.**
+
 ## Environment gotchas (Windows)
 
 - **This repo lives under OneDrive**, which locks `build/` mid-compile and fails

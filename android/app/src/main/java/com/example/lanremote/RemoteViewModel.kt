@@ -1,7 +1,10 @@
 package com.example.lanremote
 
 import android.app.Application
+import android.content.Context
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.lanremote.data.Device
@@ -69,6 +72,34 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var lastUserBrightnessMs: Long = 0
     private var lastInteractionMs: Long = 0   // drives adaptive health-poll backoff
     private var current: Device? = null   // device we're connected to / reconnecting
+
+    // Held for the duration of a live session. Trackpad packets are tiny, frequent UDP
+    // datagrams; when the phone's Wi-Fi radio drops into power-save between beacons (how
+    // aggressively is negotiated per-AP, so identical setups feel different router to
+    // router) those packets get batched and the cursor micro-stutters. A low-latency
+    // Wi-Fi lock asks the radio to stay awake in a low-latency mode for as long as it's
+    // held — the same knob real-time games use — flattening that variance across networks.
+    // No permission beyond ACCESS_WIFI_STATE (already granted). Released on disconnect.
+    private val wifiLock: WifiManager.WifiLock? by lazy {
+        val wm = getApplication<Application>().applicationContext
+            .getSystemService(Context.WIFI_SERVICE) as? WifiManager
+        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+        else
+            @Suppress("DEPRECATION") WifiManager.WIFI_MODE_FULL_HIGH_PERF
+        wm?.createWifiLock(mode, "LazeR:session")?.apply { setReferenceCounted(false) }
+    }
+
+    /** Hold (or drop) the low-latency Wi-Fi lock for the session. Idempotent + best-effort. */
+    private fun holdWifi(on: Boolean) {
+        try {
+            val lock = wifiLock ?: return
+            if (on) { if (!lock.isHeld) lock.acquire() }
+            else if (lock.isHeld) lock.release()
+        } catch (_: Exception) {
+            // radio state is best-effort — never let it break the session
+        }
+    }
 
     private fun touch() { lastInteractionMs = System.currentTimeMillis() }
 
@@ -174,6 +205,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 if (save || moved) update { it.copy(savedDevices = store.upsert(connected)) }
                 settingsStore.lastDeviceId = connected.id
                 discovery.stop()   // no need to keep scanning Wi-Fi while controlling
+                holdWifi(true)     // pin the radio low-latency for the session
                 touch()
                 update { it.copy(conn = ConnState.Connected,
                     relayWhileLocal = relayWhileLocal(connected)) }
@@ -319,6 +351,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                         settingsStore.lastDeviceId = c.id
                     }
                     discovery.stop()
+                    holdWifi(true)
                     update { it.copy(conn = ConnState.Connected, error = null,
                         relayWhileLocal = relayWhileLocal(c)) }
                     startHealthLoop()
@@ -342,6 +375,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         settingsStore.lastDeviceId = null   // intentional leave: don't auto-reconnect next launch
         current = null
         client.disconnect()
+        holdWifi(false)                     // let the radio power-save again
         update { it.copy(conn = ConnState.Disconnected, keyboardText = "", relayWhileLocal = false) }
         discovery.start { hosts -> update { it.copy(discovered = hosts) } }   // scan again for the connection screen
     }
@@ -497,6 +531,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         reconnectJob?.cancel()
         discovery.stop()
         client.disconnect()
+        holdWifi(false)   // safety net: never leak the Wi-Fi lock if the VM dies mid-session
         super.onCleared()
     }
 
