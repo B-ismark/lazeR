@@ -284,7 +284,14 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 val remote = client.isRemote
                 val volTimeout = if (remote) 1200 else 400
                 val pingTimeout = if (remote) 1800 else 500
-                val maxMisses = if (remote) 4 else 2
+                // Ride out brief transients (a Wi-Fi airtime blip or a momentary
+                // server-loop stall) on the SAME socket instead of thrashing a healthy
+                // session into a reconnect. A reconnect is expensive — new socket, new
+                // port, a visible "stopped then came back" glitch — so only declare the
+                // link dead after several consecutive misses. Paired with the fast
+                // re-probe below, dead detection is still ~2.5s while a 1–2s blip is
+                // absorbed with no drop at all.
+                val maxMisses = if (remote) 6 else 5
                 val v = client.queryVolume(volTimeout)
                 val alive = if (v != null) {
                     if (System.currentTimeMillis() - lastUserVolumeMs > 1200) {
@@ -325,9 +332,12 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 // Adaptive backoff: poll briskly (1.5s) while you're actively using the
                 // trackpad/sliders for responsive volume sync + fast disconnect notice;
                 // ease off to 4s when idle to spare the radio + battery. Worst-case
-                // disconnect detection when idle ≈ 8–12s, still fine.
+                // disconnect detection when idle ≈ 8–12s, still fine. But once a miss is
+                // seen, re-probe FAST (0.5s) so a transient is confirmed-recovered (misses
+                // back to 0) or confirmed-dead within ~2.5s — recovery feels instant, not
+                // "came back after a while".
                 val active = System.currentTimeMillis() - lastInteractionMs < 5000
-                delay(if (active) 1500L else 4000L)
+                delay(if (misses > 0) 500L else if (active) 1500L else 4000L)
             }
         }
     }
