@@ -12,9 +12,9 @@ a box with a **public IPv4** and one open **UDP** port (default `50510`).
 
 | Option | Cost | Notes |
 |---|---|---|
-| **Oracle Cloud Always Free (ARM VM)** | **$0 forever** | Public IPv4, 10 TB/mo egress — enough for relay. Best value; signup is the only friction. |
-| Hetzner CX22 | ~€3.8/mo | Fast, no fuss. |
-| Vultr / DigitalOcean / Linode | ~$5/mo | Same idea. |
+| **Hetzner CX22** | ~€3.8/mo | Fast, no fuss. Recommended — predictable flat cost, no card games. |
+| Vultr / DigitalOcean / Linode | ~$5/mo | Same idea; pay-as-you-go, easy to tear down. |
+| Oracle Cloud Always Free (ARM VM) | "$0" | Public IPv4 + 10 TB/mo egress *is* enough for the relay, and compute genuinely bills $0 — **but** Oracle runs repeated card-verification authorizations on signup cards. On a foreign card those can each trigger a fixed cross-border fee from your bank (seen: 4× GHS12.99 with €0 Oracle usage). "Free" compute, not free to your bank. Only pick this with a card that has no foreign-transaction fee. |
 
 > Serverless (Lambda, Cloud Run, Functions) **won't work** — they can't hold the
 > long-lived UDP mappings hole-punching and relay depend on. Use a small always-on VM.
