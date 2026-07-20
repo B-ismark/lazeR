@@ -204,12 +204,16 @@ def make_brightness():
                                   text=True, timeout=4, creationflags=_flags)
 
         def get_win():
+            # None means "no integrated panel right now" (empty stdout → IndexError,
+            # or PowerShell/WMI error) — distinct from a real 0%. The service uses
+            # that to flip availability, so a laptop booted docked shows the slider
+            # once the panel reappears instead of hiding it for the whole session.
             try:
                 out = _ps("(Get-CimInstance -Namespace root/WMI "
                           "-ClassName WmiMonitorBrightness).CurrentBrightness")
                 return int(out.stdout.strip().splitlines()[0])
             except Exception:
-                return 0
+                return None
 
         # A fresh `powershell -Command "..."` per write costs ~600ms of process
         # startup, which made the brightness slider feel laggy. Keep ONE warm
@@ -243,15 +247,34 @@ def make_brightness():
             except Exception:
                 _setproc["p"] = None     # force a respawn next time
 
-        # Probe once: laptops expose it, most desktops don't.
-        try:
-            chk = _ps("(Get-CimInstance -Namespace root/WMI "
-                      "-ClassName WmiMonitorBrightness).CurrentBrightness")
-            if chk.stdout.strip():
-                return get_win, set_win, "wmi"
-        except Exception:
-            pass
-        return None, None, None
+        # Is this a machine that HAS an integrated panel at all? Decided from the
+        # chassis type (Win32_SystemEnclosure) — a stable, power-INDEPENDENT signal,
+        # unlike a brightness read which fails whenever the panel is merely off
+        # (locked / asleep). We need this because the availability probe deliberately
+        # doesn't gate on WmiMonitorBrightness anymore: without a chassis hint, a
+        # laptop that launches the server while locked/screen-off looks identical to a
+        # desktop, and the no-panel give-up would wrongly stop probing it. Laptop
+        # chassis → panel known present → the service never gives up (keeps probing so
+        # unlock reveals the slider). Desktop / unknown → give-up allowed.
+        def _is_laptop():
+            try:
+                out = _ps("(Get-CimInstance -ClassName Win32_SystemEnclosure)"
+                          ".ChassisTypes -join ','")
+                types = {int(x) for x in out.stdout.strip().split(",") if x.strip().isdigit()}
+                # 8 Portable · 9 Laptop · 10 Notebook · 11 Hand Held · 12 Docking
+                # Station · 14 Sub Notebook · 30 Tablet · 31 Convertible · 32 Detachable
+                return bool(types & {8, 9, 10, 11, 12, 14, 30, 31, 32})
+            except Exception:
+                return False   # unknown → treat as desktop (give-up allowed)
+
+        # Return the read/write pair unconditionally — availability is decided at
+        # RUNTIME by BrightnessService, not by a one-shot probe here. WmiMonitorBrightness
+        # can be absent at launch (booted docked / lid-closed / external-only, or a WMI
+        # service race at cold boot) yet appear minutes later; a probe-and-latch here
+        # would hide the slider for the entire session in those cases (the recurring
+        # "brightness slider keeps disappearing" bug). get_win returns None while the
+        # class is absent, so the service simply reports unavailable until it shows up.
+        return get_win, set_win, "wmi", _is_laptop()
 
     if plat == "darwin":
         import shutil, subprocess
@@ -261,15 +284,17 @@ def make_brightness():
                     out = subprocess.check_output(["brightness", "-l"]).decode()
                     import re
                     m = re.search(r"brightness\s+([0-9.]+)", out)
-                    return int(round(float(m.group(1)) * 100)) if m else 0
+                    return int(round(float(m.group(1)) * 100)) if m else None
                 except Exception:
-                    return 0
+                    return None
 
             def set_mac(pct):
                 subprocess.run(["brightness", str(max(0, min(100, int(pct))) / 100.0)],
                                check=False)
-            return get_mac, set_mac, "brightness"
-        return None, None, None
+            # `which brightness` matched → treat the panel as known present (no
+            # WMI-style flakiness here), so the give-up never fires on macOS.
+            return get_mac, set_mac, "brightness", True
+        return None, None, None, False
 
     # Linux: sysfs backlight (read always; write needs a udev rule or root).
     import glob
@@ -283,9 +308,9 @@ def make_brightness():
                     cur = int(f.read().strip())
                 with open(f"{bl}/max_brightness") as f:
                     mx = int(f.read().strip())
-                return int(round(cur / mx * 100)) if mx else 0
+                return int(round(cur / mx * 100)) if mx else None
             except Exception:
-                return 0
+                return None
 
         def set_linux(pct):
             try:
@@ -295,12 +320,13 @@ def make_brightness():
                     f.write(str(int(round(max(0, min(100, pct)) / 100 * mx))))
             except Exception:
                 pass
-        return get_linux, set_linux, "sysfs"
+        # /sys/class/backlight/* exists → panel is definitively present; never give up.
+        return get_linux, set_linux, "sysfs", True
 
-    return None, None, None
+    return None, None, None, False
 
 
-get_brightness, set_brightness, BRIGHTNESS_BACKEND = make_brightness()
+get_brightness, set_brightness, BRIGHTNESS_BACKEND, BRIGHTNESS_PANEL_KNOWN = make_brightness()
 
 
 class BrightnessService:
@@ -310,40 +336,89 @@ class BrightnessService:
     phone polls it ~every 1.5s. Doing that read inline would stall the single recv
     loop, delaying MOVE/PING/VGET enough that the phone thinks the link died and
     reconnects — the whole app flickers. So we serve BGET from a cached value kept
-    fresh by a background thread, and apply BRIGHT writes on a worker thread."""
+    fresh by a background thread, and apply BRIGHT writes on a worker thread.
 
-    def __init__(self, get_fn, set_fn):
+    `available` is RUNTIME state, not a launch-time latch: the panel can be absent
+    at boot (docked / lid-closed / WMI race) and appear later, or vanish on undock.
+    It flips true on any successful read and false when reads stop working, so the
+    phone's slider follows the actual hardware instead of being decided once."""
+
+    def __init__(self, get_fn, set_fn, panel_known=False):
         self._get = get_fn
         self._set = set_fn
-        self.available = get_fn is not None
+        self._has_backend = get_fn is not None   # platform *might* expose a panel
+        # True when we KNOW a panel exists (laptop chassis / sysfs backlight / macOS
+        # brightness CLI) independently of whether it's currently powered. Disables
+        # the no-panel give-up so a server launched while the laptop is locked keeps
+        # probing and reveals the slider on unlock.
+        self._panel_known = panel_known
+        self.available = False                    # decided at runtime by reads
         self._lock = threading.Lock()
         self._val = 0
         self._target = None                  # latest requested brightness, or None
         self._wake = threading.Event()        # signals the setter there's work
-        if self.available:
-            self._val = self._safe_get()
+        if self._has_backend:
+            v = self._read()
+            if v is not None:
+                self._val = v
+                self.available = True
+            # Start the poller even when the first read failed — that's the whole
+            # point: it keeps looking so a panel that shows up later reveals the slider.
             threading.Thread(target=self._poll, daemon=True).start()
             if self._set is not None:
                 threading.Thread(target=self._setter_loop, daemon=True).start()
 
-    def _safe_get(self):
+    def _read(self):
+        # Returns 0..100 on a real read, or None when there's no panel right now.
         try:
-            return max(0, min(100, int(self._get())))
+            v = self._get()
         except Exception:
-            return self._val
+            return None
+        return None if v is None else max(0, min(100, int(v)))
+
+    # A machine that hasn't shown a panel within this window of connected probing
+    # is treated as a true no-panel desktop: stop probing so we don't spawn a
+    # PowerShell read forever for a slider that will never appear. Only applies when
+    # a panel is NOT known present (see _panel_known) AND none has been seen yet —
+    # once a panel has been seen, undock / redock must keep working, so a lost panel
+    # is re-probed indefinitely.
+    _NO_PANEL_GIVEUP_S = 5 * 60
 
     def _poll(self):
-        # Refresh the cache only while a phone is connected, and lazily (20s) — each
-        # read spawns PowerShell (~0.5s) and brightness rarely changes from under us
-        # mid-session, so frequent polling is wasted CPU. Skip while a write is
-        # pending so we don't read a value the panel is mid-change to. Our own writes
-        # already update the cache, so the phone's slider stays in sync regardless.
+        # Refresh the cache + availability while a phone is connected. Skip while a
+        # write is pending so we don't read a value the panel is mid-change to; our
+        # own writes already update the cache. Cadence is adaptive: poll briskly (4s)
+        # while UNAVAILABLE so a boot race / undock is detected quickly and the slider
+        # appears within seconds, then ease to 20s. Once available, 20s: brightness
+        # rarely changes from under us and each read spawns PowerShell.
+        misses = 0
+        ever = self.available          # has a panel EVER been seen this session
+        probing_since = time.monotonic()   # when connected probing (while never-seen) began
         while not _stop.is_set():
             if _client_connected.is_set() and self._target is None:
-                v = self._safe_get()
-                with self._lock:
-                    self._val = v
-            _stop.wait(20.0)
+                v = self._read()
+                if v is not None:
+                    with self._lock:
+                        self._val = v
+                    self.available = True
+                    misses = 0
+                    ever = True
+                else:
+                    self.available = False
+                    misses += 1
+                    # Real desktop (panel not known present, none ever seen) and the
+                    # give-up window has elapsed → stop the poller so no thread is left
+                    # spinning PowerShell. A known-panel machine (laptop) never gives up.
+                    if (not ever and not self._panel_known
+                            and time.monotonic() - probing_since > self._NO_PANEL_GIVEUP_S):
+                        return
+            else:
+                # Not actively probing (no phone paired): don't count idle time
+                # against the give-up window — the clock only runs while we're
+                # genuinely trying and failing to find a panel.
+                probing_since = time.monotonic()
+            fast = not self.available and misses < 8   # ~32s of brisk re-probing
+            _stop.wait(4.0 if fast else 20.0)
 
     def get_cached(self):
         with self._lock:
@@ -374,7 +449,7 @@ class BrightnessService:
                     pass
 
 
-brightness_svc = BrightnessService(get_brightness, set_brightness)
+brightness_svc = BrightnessService(get_brightness, set_brightness, BRIGHTNESS_PANEL_KNOWN)
 
 
 # ── clipboard ───────────────────────────────────────────────────────────────
