@@ -32,6 +32,13 @@ enum class ConnState { Disconnected, Connecting, Connected, Reconnecting }
 private const val ACCEL_REF_PX = 12f
 private const val ACCEL_MAX = 2.2f
 private const val MOVE_GAP_RESET_MS = 120L   // idle gap ⇒ treat the next move as a fresh gesture
+// How long beginReconnect keeps auto-retrying before it gives up and shows an
+// actionable error instead of an endless spinner. Generous enough to ride out a
+// laptop sleep/resume or a full reboot hands-free, but bounded so a permanently
+// failing handshake (e.g. the laptop was re-paired and now has a different key —
+// which can NEVER succeed with the stored key) doesn't strand the user on the
+// "Reconnecting" screen forever.
+private const val RECONNECT_GIVEUP_MS = 90_000L
 // Speed-adaptive delta smoothing (one-euro style): near-still input is low-pass
 // filtered to kill capacitive jitter; fast flicks pass straight through so the cursor
 // never lags. Blend ramps from SMOOTH_FLOOR (slow) to 1.0 (fast).
@@ -342,9 +349,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Keep retrying the current device until it answers or the user backs out.
-     *  mDNS runs during reconnect so a laptop that came back on a new IP can still
-     *  be found and re-pinned (the saved address is refreshed on success). */
+    /** Keep retrying the current device until it answers, the user backs out, or the
+     *  give-up window elapses. mDNS runs during reconnect so a laptop that came back on
+     *  a new IP can still be found and re-pinned (the saved address is refreshed on
+     *  success). After RECONNECT_GIVEUP_MS of continuous failure we stop and drop to
+     *  Disconnected with an actionable message rather than spinning forever — the old
+     *  loop had no exit, so a re-paired laptop (new key, handshake can never complete)
+     *  or a laptop that stays unreachable left the app stuck on "Reconnecting". */
     private fun beginReconnect() {
         healthJob?.cancel()
         val dev = current ?: return disconnect()
@@ -352,6 +363,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         reconnectJob?.cancel()
         discovery.start { hosts -> update { it.copy(discovered = hosts) } }
         reconnectJob = viewModelScope.launch {
+            val startMs = System.currentTimeMillis()
             while (isActive) {
                 val c = connectResolving(dev, 1200)
                 if (c != null) {
@@ -365,6 +377,18 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     update { it.copy(conn = ConnState.Connected, error = null,
                         relayWhileLocal = relayWhileLocal(c)) }
                     startHealthLoop()
+                    return@launch
+                }
+                if (System.currentTimeMillis() - startMs > RECONNECT_GIVEUP_MS) {
+                    // Give up the auto-retry. Keep `current` and lastDeviceId intact so
+                    // a tap (or next launch) can retry without re-adding the device, but
+                    // release the radio lock and tell the user what to try next.
+                    holdWifi(false)
+                    update {
+                        it.copy(conn = ConnState.Disconnected, relayWhileLocal = false,
+                            error = "Couldn't reconnect to ${dev.name}. It may be off or " +
+                                "asleep — if you re-paired it, scan the new QR to re-pair.")
+                    }
                     return@launch
                 }
                 delay(2000)
