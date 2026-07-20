@@ -1674,12 +1674,30 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
                 sock.close()
             except OSError:
                 pass
-            try:
-                sock = open_socket()
-            except OSError:
-                time.sleep(1.0)
-                last_tick = time.time()
-                continue
+            # Retry the rebind until it succeeds. On wake the OS may not have released
+            # the old port yet, or the NIC may still be coming up, so a single
+            # open_socket() can raise OSError. The old code bailed here with
+            # `last_tick = time.time(); continue`, which DISARMED the resume-gap check
+            # (now - last_tick > RESUME_GAP_S could never fire again) and left `sock`
+            # pointing at the already-closed socket — so the recv loop spun forever on
+            # a dead socket and the server went permanently deaf after sleep until a
+            # manual restart. Loop instead, so we always come out with a live socket.
+            sock = None
+            rebind_fail = 0
+            while not _stop.is_set():
+                try:
+                    sock = open_socket()
+                    break
+                except OSError:
+                    rebind_fail += 1
+                    if rebind_fail == 1:
+                        emit("log", "Waiting to rebind the socket after sleep…")
+                    time.sleep(1.0)
+            if sock is None:      # _stop was set while we were retrying — shutting down
+                break
+            # The retry may have taken several seconds; refresh `now` so the stale
+            # value doesn't spuriously re-trigger the resume path or idle-drop below.
+            now = time.time()
             # Keep the phone pinned across the rebind: its socket + secure session
             # survived our sleep, so its very next packet (same addr, advancing
             # counter) is still accepted and the laptop stays "connected" — no
