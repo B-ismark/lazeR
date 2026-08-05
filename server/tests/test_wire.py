@@ -25,10 +25,12 @@ import os
 import re
 import socket
 import sys
+import tempfile
 import threading
 import time
 import types
 import unittest
+from unittest import mock
 
 # ── bootstrap ────────────────────────────────────────────────────────────────
 # remote_server imports pynput at module scope and builds a MouseController /
@@ -423,10 +425,34 @@ class Dialects(unittest.TestCase):
     def test_rotate_secrets_clears_the_pinned_dialect(self):
         wire = rs.Wire(TOKEN, KEY, require_secure=True)
         handshake(wire, FakeSock(), magic=rs.MAGIC_V3)
-        rs.rotate_secrets(wire)
+        # rotate_secrets PERSISTS the new token+key, and TOKEN_FILE/KEY_FILE point at the
+        # real install (server/.lazer_*). Unpatched, merely RUNNING this suite rotated the
+        # developer's live credentials and silently un-paired every phone — which surfaces
+        # as "my phone won't connect any more, not even by scanning the QR", pointing
+        # nowhere near the tests. Redirect the writes to a throwaway dir.
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(rs, "TOKEN_FILE", os.path.join(tmp, ".lazer_token")), \
+                 mock.patch.object(rs, "KEY_FILE", os.path.join(tmp, ".lazer_key")):
+                rs.rotate_secrets(wire)
         self.assertIsNone(wire.cli_magic)
         self.assertIsNone(wire.cli_sid)
         self.assertFalse(wire.secure_client)
+
+    def test_rotate_secrets_writes_only_where_it_is_pointed(self):
+        """Guard the guard: prove the redirect above actually catches the writes, so a
+        future change can't quietly go back to clobbering a real pairing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            token_path = os.path.join(tmp, ".lazer_token")
+            key_path = os.path.join(tmp, ".lazer_key")
+            wire = rs.Wire(TOKEN, KEY, require_secure=True)
+            with mock.patch.object(rs, "TOKEN_FILE", token_path), \
+                 mock.patch.object(rs, "KEY_FILE", key_path):
+                rs.rotate_secrets(wire)
+            self.assertTrue(os.path.exists(token_path), "no token written to the temp dir")
+            self.assertTrue(os.path.exists(key_path), "no key written to the temp dir")
+            # and the rotation must actually have changed the live values
+            self.assertNotEqual(wire.token, TOKEN)
+            self.assertNotEqual(wire.key, KEY)
 
 
 # ── handshake: freshness via challenge-response ──────────────────────────────
