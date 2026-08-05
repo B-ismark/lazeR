@@ -2828,17 +2828,23 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
     print("  ...or auto-discover, or enter IP + token manually. Ctrl+C to quit.\n")
 
     # Update check: notify-only, and the one outbound internet request LazeR makes.
-    # Done inline here rather than on a thread — terminal mode has no UI to keep
-    # responsive, and printing from a background thread would interleave with the
-    # activity log below. Bounded by UPDATE_TIMEOUT_S.
+    #
+    # On a daemon thread, NOT inline: serve_loop below is what binds the UDP socket,
+    # so doing this first would leave phones unable to connect for as long as the
+    # request takes — up to UPDATE_TIMEOUT_S against a slow or black-holed network.
+    # Nothing about a version check is worth delaying the actual service, so it runs
+    # alongside and prints whenever it lands. That can interleave with the first
+    # activity lines, which is a fair trade for not stalling the server.
     if update_check:
-        tag, newer = check_for_update()
-        if newer:
-            print(f"  [update] {tag} is available (running v{APP_VERSION}):")
-            print(f"           {RELEASES_PAGE}\n")
-        elif tag is None:
-            print("  [update] couldn't check for updates (offline?). "
-                  "--no-update-check silences this.\n")
+        def _update_notice():
+            tag, newer = check_for_update()
+            if newer:
+                print(f"\n  [update] {tag} is available (running v{APP_VERSION}):")
+                print(f"           {RELEASES_PAGE}\n")
+            elif tag is None:
+                print("\n  [update] couldn't check for updates (offline?). "
+                      "--no-update-check silences this.\n")
+        threading.Thread(target=_update_notice, daemon=True).start()
 
     # Inbound UDP must be allowed or phones silently time out (loopback bypasses
     # the firewall, so the server looks fine here). If we're admin this adds the
