@@ -158,8 +158,12 @@ networks always relay.
 - **The rendezvous coordinator is untrusted.** It never sees the key and can't decrypt
   or replay control — worst case it learns a public IP, refuses/redirects a connection
   (DoS), or acts as a 1:1 relay (rate-capped). Remote access forces secure-only.
-- **Manual code = plaintext v1**, for trusted LANs only. `--secure-only` (or the
-  **Require encryption** toggle) rejects it.
+- **Encryption is required by default.** Plaintext (v1) pairing by typed code is
+  refused unless you opt in with `--allow-plaintext`, or turn **Require encryption**
+  off in the GUI. QR pairing always gives the phone a key, so the safe wire is what
+  you get without having to know to ask for it. If a phone tries the typed code
+  while encryption is required, the activity log says so rather than leaving you
+  with an unexplained timeout.
 - Acceptance is bound to one source IP:port + session; a high rate of rejected
   packets raises a brute-force/flood warning.
 - **Local input wins.** Physical mouse/keyboard on the laptop (detected via
@@ -169,5 +173,5 @@ networks always relay.
   and reused across launches; **Regenerate** in the UI rotates both and kicks phones.
 - Open/public Wi-Fi: the firewall rule LazeR adds is scoped to the **Private and
   Domain** profiles only, so it won't open the port on a network Windows has
-  classified Public. Treat plaintext mode as untrusted there; prefer QR + Require
-  encryption.
+  classified Public. Treat plaintext mode as untrusted there; prefer QR pairing,
+  which is the default.

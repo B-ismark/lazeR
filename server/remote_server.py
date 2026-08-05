@@ -69,6 +69,13 @@ RDV_PUNCH_POLL_S = 0.03
 # relayed ciphertext. The challenge is single-use and expires quickly.
 CHAL_TTL_S = 6.0
 CHAL_MAX = 256              # bound the pending-challenge table (anti-flood)
+# ...and a per-source-IP quota. The global bound alone is not enough: a replayed
+# HELLO needs no key, so anyone who captured one can mint challenges from hundreds
+# of spoofed source PORTS, and any eviction policy that treats all entries alike
+# then pushes out the real phone's outstanding nonce — stalling its handshake. A
+# per-IP cap makes a flood evict only its own entries. One genuine phone needs a
+# handful at most (a punch burst plus handshake retries).
+CHAL_PER_IP = 8
 
 # Verbs that actually drive the machine. While the user has taken over locally
 # (or after a panic), these are dropped; PING/VGET/HELLO/BYE still flow.
@@ -745,6 +752,9 @@ class Wire:
         self.cli_sid = None
         self.cli_ctr = -1
         self.secure_client = False
+        # Set when a correctly-tokened plaintext packet was refused because
+        # encryption is required; serve_loop turns it into a one-time explanation.
+        self.plaintext_refused = False
         self._pending = None            # (sid, ctr) of the in-flight HELLO/AUTH
         self._chal = {}                 # addr -> (nonce, expiry_monotonic): open challenges
 
@@ -773,7 +783,18 @@ class Wire:
             return verb, rest, True
         # plaintext v1
         if self.require_secure:
-            return None                         # secure-only mode: drop plaintext
+            # Nothing is accepted here — but tell apart "a real phone tried to pair
+            # with the manual code" from random junk, so the UI can explain the
+            # refusal. Otherwise flipping the default to secure-only turns manual
+            # pairing into an unexplained timeout, which is a worse experience than
+            # the insecure wire it replaced.
+            try:
+                head = data.decode("utf-8", "ignore").split(" ", 2)
+                if len(head) >= 2 and secrets.compare_digest(head[0], self.token):
+                    self.plaintext_refused = True
+            except Exception:
+                pass
+            return None
         try:
             text = data.decode("utf-8", "ignore").rstrip("\r\n")
         except Exception:
@@ -802,8 +823,26 @@ class Wire:
         if ent is not None and now <= ent[1]:
             nonce = ent[0]                      # reuse the live challenge for this addr
         else:
-            if len(self._chal) >= CHAL_MAX:     # anti-flood: drop stale/half-open batch
-                self._chal.clear()
+            # Make room without ever letting one source cost another its challenge.
+            # This used to clear the WHOLE table at the cap, so a replayed-HELLO
+            # flood (no key required) wiped the real phone's nonce and its AUTH
+            # echoed something the server had already discarded. Evicting merely the
+            # "oldest" is no better: a flood arriving inside the victim's TTL leaves
+            # nothing expired and the victim IS the oldest.
+            self.sweep_challenges(now)
+            same_ip = [a for a in self._chal if a[0] == addr[0]]
+            if len(same_ip) >= CHAL_PER_IP:
+                # This source is already holding plenty: recycle ITS oldest.
+                self._chal.pop(min(same_ip, key=lambda a: self._chal[a][1]), None)
+            elif len(self._chal) >= CHAL_MAX:
+                # Global cap reached across many sources: take from whichever IP
+                # holds the most entries — the flooder — never from a quiet one.
+                counts = {}
+                for a in self._chal:
+                    counts[a[0]] = counts.get(a[0], 0) + 1
+                worst = max(counts, key=counts.get)
+                victims = [a for a in self._chal if a[0] == worst]
+                self._chal.pop(min(victims, key=lambda a: self._chal[a][1]), None)
             nonce = secrets.token_bytes(16)
             self._chal[addr] = (nonce, now + CHAL_TTL_S)
         self._seal_reply(sock, addr, "CHAL " + base64.urlsafe_b64encode(nonce).rstrip(b"=").decode())
@@ -970,7 +1009,15 @@ def _clamp_int(tok, limit):
     return max(-limit, min(limit, int(tok)))
 
 
-def handle_packet(verb, rest, sock, addr):
+def handle_packet(verb, rest):
+    """Drive the machine for one authenticated verb.
+
+    Handlers NEVER reply. serve_loop owns every response and sends it through
+    wire.reply(), which encrypts when the client is on the secure wire. This used
+    to take (sock, addr) and contained its own PING/VGET answers that wrote
+    PLAINTEXT straight to the socket; they were dead code (serve_loop intercepts
+    both first) but would have leaked in clear the moment dispatch order changed.
+    Removing the parameters means a future handler can't reintroduce that."""
     if verb == "MOVE":
         try:
             a, b = rest.split()
@@ -1013,12 +1060,6 @@ def handle_packet(verb, rest, sock, addr):
     elif verb == "MUP":          # drag-lock: release
         mouse.release(Button.left)
 
-    elif verb == "PING":         # heartbeat / liveness probe
-        try:
-            sock.sendto(b"PONG", addr)
-        except OSError:
-            pass
-
     elif verb == "COMBO":
         do_combo(rest)
 
@@ -1039,13 +1080,6 @@ def handle_packet(verb, rest, sock, addr):
         except (IndexError, ValueError):
             return
         set_volume(pct)
-
-    elif verb == "VGET":
-        if get_volume is not None:
-            try:
-                sock.sendto(f"VOL {get_volume()}".encode("utf-8"), addr)
-            except OSError:
-                pass
 
     elif verb == "BRIGHT":
         if not brightness_svc.available:
@@ -1704,6 +1738,10 @@ class RendezvousManager:
 
 
 # ── server thread (used in GUI mode) ─────────────────────────────────────────
+def _chars(n):
+    return f"{n} char" if n == 1 else f"{n} chars"
+
+
 _ACTION_LABELS = {
     "CLICK":  lambda r: ("Left click", "act"),
     "RCLICK": lambda r: ("Right click", "act"),
@@ -1712,7 +1750,13 @@ _ACTION_LABELS = {
     "MUP":    lambda r: ("Drag end", "act"),
     "ZOOM":   lambda r: (f"Zoom {'in' if r.strip().lstrip('-').isdigit() and int(r) > 0 else 'out'}", "act"),
     "MEDIA":  lambda r: (f"Media · {r.strip()}", "act"),
-    "KEY":    lambda r: (f'Type · “{r[:24]}”', "act") if r else None,
+    # KEY and CLIP carry the user's actual keystrokes and clipboard text. Those used
+    # to be echoed into the activity feed (first 24 chars, in quotes) — on the
+    # laptop screen, which is exactly what an over-the-shoulder viewer or a screen
+    # share can see. The Advanced sheet pitches paste for "URLs, snippets,
+    # passwords", so this was printing the very thing AES-GCM is there to protect.
+    # Log the shape, never the content.
+    "KEY":    lambda r: (f"Type · {_chars(len(r))}", "act") if r else None,
     "KEYSP":  lambda r: (f"Key · {r.strip()}", "act"),
     "COMBO":  lambda r: (f"Shortcut · {r.strip()}", "act"),
     "ASW":    lambda r: (f"Switch app · {r.strip()}", "act"),
@@ -1720,7 +1764,7 @@ _ACTION_LABELS = {
     "PRES":   lambda r: (f"Slides · {r.strip()}", "act"),
     "VOL":    lambda r: (f"Volume → {r.strip()}%", "act"),
     "BRIGHT": lambda r: (f"Brightness → {r.strip()}%", "act"),
-    "CLIP":   lambda r: (f'Paste · “{r[:24]}”', "act") if r else None,
+    "CLIP":   lambda r: (f"Paste · {_chars(len(r))}", "act") if r else None,
 }
 
 
@@ -1751,6 +1795,7 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
     # instead of flooding the activity feed. Both clear with the rate window.
     handler_errors = set()   # verbs whose handler raised
     blocked_seen = set()     # addresses turned away while a phone is already paired
+    plaintext_hinted = False  # explained a secure-only refusal this window
     _client_connected.clear()
 
     def drop_client(reason=None):
@@ -1838,6 +1883,7 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
             bad, bad_win, warned = 0, now, False
             handler_errors.clear()
             blocked_seen.clear()
+            plaintext_hinted = False
             wire.sweep_challenges(mono)   # drop expired, unanswered HELLO challenges
 
         # Local takeover auto-resume: once physical input has been quiet for the
@@ -1883,6 +1929,13 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
         res = wire.parse(data, addr, client)
         if res is None:
             bad += 1
+            if wire.plaintext_refused:
+                wire.plaintext_refused = False
+                if not plaintext_hinted:
+                    plaintext_hinted = True
+                    emit("warn", "A phone tried to pair with the typed code, but "
+                                 "Require encryption is on — scan the QR instead "
+                                 "(or restart with --allow-plaintext).")
             if bad > RATE_MAX_BAD and not warned:
                 emit("warn", "High rate of rejected packets — possible brute-force / flood")
                 warned = True
@@ -1975,7 +2028,7 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
         # The GUI's event poll already guards itself for exactly this reason.
         try:
             emit("action", verb, rest)
-            handle_packet(verb, rest, sock, addr)
+            handle_packet(verb, rest)
         except Exception as e:
             if verb not in handler_errors:
                 handler_errors.add(verb)
@@ -2941,7 +2994,11 @@ def main():
     ap = argparse.ArgumentParser(description="LazeR server")
     ap.add_argument("--no-gui", action="store_true", help="terminal/headless mode")
     ap.add_argument("--secure-only", action="store_true",
-                    help="reject plaintext (v1) clients — require the encrypted QR wire")
+                    help="(now the default) reject plaintext v1 clients; kept so "
+                         "existing scripts and shortcuts keep working")
+    ap.add_argument("--allow-plaintext", action="store_true",
+                    help="permit manual-code (plaintext v1) pairing. Trusted LANs "
+                         "only — v1 offers no confidentiality and is replayable")
     ap.add_argument("--setup-firewall", action="store_true",
                     help="add the Windows Firewall inbound rule (self-elevates) and exit")
     ap.add_argument("--enable-startup", action="store_true",
@@ -2980,7 +3037,14 @@ def main():
 
     token = load_or_create_token()
     key = load_or_create_key()
-    require_secure = args.secure_only
+    # Encryption is required unless explicitly waived. QR pairing is the primary
+    # path and gives every user a key; manual-code entry is the rare fallback and is
+    # plaintext, so defaulting it OFF means the safe wire is what you get by default
+    # instead of what you have to know to ask for.
+    require_secure = not args.allow_plaintext
+    if args.allow_plaintext:
+        print("[security] plaintext (manual-code) pairing ALLOWED — trusted LAN "
+              "only. Omit --allow-plaintext to require encryption.")
     # Remote access: --rendezvous updates the persisted config; otherwise reuse it.
     if args.rendezvous is not None:
         rdv_spec = save_rdv(args.rendezvous)

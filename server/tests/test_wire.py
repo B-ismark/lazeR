@@ -474,25 +474,25 @@ class MotionArguments(unittest.TestCase):
                                  setattr(rs, "keyboard", self._kb)))
 
     def test_move_passes_normal_deltas_through(self):
-        rs.handle_packet("MOVE", "3 -4", None, CLIENT)
+        rs.handle_packet("MOVE", "3 -4")
         self.assertEqual(rs.mouse.calls, [("move", 3, -4)])
 
     def test_move_clamps_absurd_magnitudes(self):
-        rs.handle_packet("MOVE", "99999999999999999999 -10000000", None, CLIENT)
+        rs.handle_packet("MOVE", "99999999999999999999 -10000000")
         self.assertEqual(rs.mouse.calls,
                          [("move", rs.MOVE_MAX_PX, -rs.MOVE_MAX_PX)])
 
     def test_scroll_and_zoom_clamp(self):
-        rs.handle_packet("SCROLL", "0 -999999", None, CLIENT)
+        rs.handle_packet("SCROLL", "0 -999999")
         self.assertEqual(rs.mouse.calls, [("scroll", 0, -rs.SCROLL_MAX_STEPS)])
         rs.mouse.calls.clear()
-        rs.handle_packet("ZOOM", "500000", None, CLIENT)
+        rs.handle_packet("ZOOM", "500000")
         self.assertEqual(rs.mouse.calls, [("scroll", 0, rs.ZOOM_MAX_STEPS)])
 
     def test_zoom_always_releases_ctrl(self):
         # The press/release straddles a mouse.scroll; if that ever throws, a stuck
         # Ctrl would make the laptop unusable. It's in a finally — prove it.
-        rs.handle_packet("ZOOM", "1", None, CLIENT)
+        rs.handle_packet("ZOOM", "1")
         self.assertIn(("release", "<Key.ctrl>"), rs.keyboard.calls)
 
         def boom(*a, **kw):
@@ -500,7 +500,7 @@ class MotionArguments(unittest.TestCase):
         rs.mouse.scroll = boom
         rs.keyboard.calls.clear()
         with self.assertRaises(RuntimeError):
-            rs.handle_packet("ZOOM", "1", None, CLIENT)
+            rs.handle_packet("ZOOM", "1")
         self.assertIn(("release", "<Key.ctrl>"), rs.keyboard.calls)
 
     def test_malformed_motion_args_are_dropped_silently(self):
@@ -510,11 +510,11 @@ class MotionArguments(unittest.TestCase):
                            ("ZOOM", ""), ("ZOOM", "lots")]:
             rs.mouse.calls.clear()
             with self.subTest(verb=verb, rest=rest):
-                rs.handle_packet(verb, rest, None, CLIENT)   # must not raise
+                rs.handle_packet(verb, rest)   # must not raise
                 self.assertEqual(rs.mouse.calls, [])
 
     def test_unknown_verb_is_a_noop(self):
-        rs.handle_packet("NONSENSE", "whatever", None, CLIENT)
+        rs.handle_packet("NONSENSE", "whatever")
         self.assertEqual(rs.mouse.calls, [])
         self.assertEqual(rs.keyboard.calls, [])
 
@@ -594,6 +594,120 @@ class AdvertisedAddress(unittest.TestCase):
         rs._default_route_ip = lambda: "10.0.0.7"
         self.addCleanup(lambda: setattr(rs, "_default_route_ip", saved))
         self.assertEqual(rs.lan_ip(), "10.0.0.7")
+
+
+class ActivityFeedPrivacy(unittest.TestCase):
+    """The activity feed is rendered on the laptop screen. Echoing keystrokes and
+    clipboard text there defeats the point of encrypting them on the wire — a
+    shoulder-surfer or a screen share reads them straight off the window."""
+
+    SECRETS = ["hunter2", "correct horse battery staple",
+               "https://example.com/reset?token=abc123", "sk-live-0123456789"]
+
+    def test_typed_text_is_never_echoed(self):
+        label = rs._ACTION_LABELS["KEY"]
+        for s in self.SECRETS:
+            text = label(s)[0]
+            self.assertNotIn(s, text)
+            # not even a prefix: the old code logged the first 24 characters
+            self.assertNotIn(s[:8], text)
+            self.assertIn(str(len(s)), text)      # shape is still reported
+
+    def test_pasted_text_is_never_echoed(self):
+        label = rs._ACTION_LABELS["CLIP"]
+        for s in self.SECRETS:
+            text = label(s)[0]
+            self.assertNotIn(s, text)
+            self.assertNotIn(s[:8], text)
+
+    def test_empty_payloads_log_nothing(self):
+        self.assertIsNone(rs._ACTION_LABELS["KEY"](""))
+        self.assertIsNone(rs._ACTION_LABELS["CLIP"](""))
+
+    def test_singular_plural_reads_naturally(self):
+        self.assertEqual(rs._chars(1), "1 char")
+        self.assertEqual(rs._chars(2), "2 chars")
+        self.assertEqual(rs._chars(0), "0 chars")
+
+
+class SecureByDefault(unittest.TestCase):
+    """Plaintext v1 is now opt-in. Flipping that default must not turn manual
+    pairing into a silent timeout, so a correctly-tokened refusal is explainable."""
+
+    def test_refusing_a_valid_token_is_flagged_for_the_ui(self):
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        self.assertFalse(wire.plaintext_refused)
+        self.assertIsNone(wire.parse(f"{TOKEN} HELLO".encode(), CLIENT, None))
+        self.assertTrue(wire.plaintext_refused,
+                        "a real phone's manual-code attempt must be distinguishable")
+
+    def test_junk_does_not_raise_the_hint(self):
+        # Only a MATCHING token means a genuine phone; random traffic must not
+        # produce a misleading "scan the QR" message.
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        for junk in [b"WRONG1 HELLO", b"garbage", b"", b"\xff\xfe\x00",
+                     b"L2short", TOKEN.encode()]:
+            wire.plaintext_refused = False
+            wire.parse(junk, CLIENT, None)
+            self.assertFalse(wire.plaintext_refused, f"{junk!r} raised the hint")
+
+    def test_nothing_is_accepted_while_refusing(self):
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        self.assertIsNone(wire.parse(f"{TOKEN} CLICK".encode(), CLIENT, CLIENT))
+
+    def test_allowing_plaintext_does_not_set_the_flag(self):
+        wire = rs.Wire(TOKEN, KEY, require_secure=False)
+        self.assertIsNotNone(wire.parse(f"{TOKEN} CLICK".encode(), CLIENT, CLIENT))
+        self.assertFalse(wire.plaintext_refused)
+
+
+class ChallengeEviction(unittest.TestCase):
+    """The pending-challenge table is bounded, but HOW it sheds load matters: it
+    used to clear wholesale, so a replayed-HELLO flood (which needs no key) could
+    repeatedly wipe the real client's outstanding nonce and stall its handshake."""
+
+    def setUp(self):
+        self.wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        self.sock = FakeSock()
+
+    def test_a_live_challenge_survives_a_port_varying_flood(self):
+        self.wire.issue_challenge(self.sock, CLIENT, 100.0)
+        mine = unseal(KEY, self.sock.last()).split(" ", 1)[1]
+
+        # The cheap attack: replay one captured HELLO from hundreds of source ports,
+        # all inside the victim's TTL so nothing is expired and the victim is the
+        # oldest entry. Neither a wholesale clear nor evict-oldest survives this.
+        for i in range(rs.CHAL_MAX + 100):
+            self.wire.issue_challenge(self.sock, ("10.0.0.9", 1000 + i), 100.0)
+
+        self.assertLessEqual(len(self.wire._chal), rs.CHAL_MAX)
+        self.assertTrue(self.wire.verify_challenge(CLIENT, mine, 100.5),
+                        "the flood evicted the legitimate client's challenge")
+
+    def test_one_source_cannot_hoard_the_table(self):
+        for i in range(200):
+            self.wire.issue_challenge(self.sock, ("10.0.0.9", 1000 + i), 100.0)
+        held = [a for a in self.wire._chal if a[0] == "10.0.0.9"]
+        self.assertLessEqual(len(held), rs.CHAL_PER_IP)
+
+    def test_a_genuine_handshake_burst_still_fits(self):
+        # A real phone retries HELLO from ONE port (challenges are idempotent per
+        # address) and may re-punch from a few more. The quota must not clip that.
+        for port in range(41230, 41234):
+            self.wire.issue_challenge(self.sock, ("192.168.1.50", port), 100.0)
+        held = [a for a in self.wire._chal if a[0] == "192.168.1.50"]
+        self.assertEqual(len(held), 4)
+
+    def test_expired_entries_are_reclaimed_before_live_ones(self):
+        for i in range(rs.CHAL_MAX):
+            self.wire.issue_challenge(self.sock, ("10.0.0.1", 2000 + i), 100.0)
+        # Everything above is now expired; a new challenge should reclaim that space
+        # rather than evict itself.
+        later = 100.0 + rs.CHAL_TTL_S + 1
+        self.wire.issue_challenge(self.sock, CLIENT, later)
+        nonce = unseal(KEY, self.sock.last()).split(" ", 1)[1]
+        self.assertTrue(self.wire.verify_challenge(CLIENT, nonce, later))
+        self.assertLess(len(self.wire._chal), rs.CHAL_MAX)
 
 
 class ServeLoopResilience(unittest.TestCase):
