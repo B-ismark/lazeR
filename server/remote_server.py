@@ -745,6 +745,10 @@ def rotate_secrets(wire):
     wire.aes = AESGCM(key) if (key and _HAVE_CRYPTO) else None
     wire.cli_magic, wire.cli_sid, wire.cli_ctr = None, None, -1
     wire.secure_client = False
+    # Fresh key ⇒ start the server's send sessions over. Not strictly required (a
+    # repeated nonce under a DIFFERENT key is harmless), but it keeps the invariant
+    # "one (key, dialect, sid) never reuses a counter" true without a caveat.
+    wire._srv.clear()
     return token, key
 
 
@@ -756,11 +760,17 @@ class Wire:
         self.key = key
         self.require_secure = require_secure
         self.aes = AESGCM(key) if (key and _HAVE_CRYPTO) else None
-        # Which dialect we're speaking. Default to the current one; a client that
-        # opens with L2 flips us to L2 for that session so replies stay parseable.
+        # Default reply dialect, used only until a client is pinned. It is NOT
+        # mutated by incoming packets — see _seal_reply for why that mattered.
         self.wire_magic = MAGIC_V3
-        self.srv_sid = secrets.token_bytes(WIRE_FORMATS[MAGIC_V3][0])
-        self.srv_ctr = 0
+        # The server's own send session, PER DIALECT: magic -> [sid, counter].
+        # Per-dialect rather than one pair, because the two dialects have different
+        # sid widths, so a single pair would have to be re-drawn every time the
+        # dialect changed — and re-drawing a sid while restarting the counter at 0
+        # is exactly how a nonce gets repeated under a key that outlives the
+        # session. Each dialect keeps its own monotonic counter for the life of the
+        # key instead, so switching back and forth costs nothing and repeats nothing.
+        self._srv = {}
         # pinned client's secure session (set when a HELLO is authenticated via AUTH)
         self.cli_magic = None
         self.cli_sid = None
@@ -794,9 +804,13 @@ class Wire:
             text = pt.decode("utf-8", "ignore")
             verb, rest = _split_verb(text)
             if verb in ("HELLO", "AUTH"):
-                # Answer in whatever dialect the client used, or it can't read the
-                # CHAL and the handshake dead-ends.
-                self.wire_magic = magic
+                # Record the dialect so the CHAL goes back in the one this client
+                # used (it can't read the other one's framing offset reliably, and a
+                # dead-ended handshake is the result). Deliberately does NOT set
+                # self.wire_magic: a HELLO is unauthenticated in the sense that
+                # matters here — a REPLAYED one is tag-valid — so letting it change
+                # server-wide reply state let any keyless replayer re-draw the
+                # server's session id out from under the pinned phone.
                 self._pending = (magic, sid, ctr)  # commit_hello pins the AUTH session
                 return verb, rest, True
             if (addr != client or magic != self.cli_magic
@@ -829,10 +843,15 @@ class Wire:
             return None
         return parts[1], (parts[2] if len(parts) > 2 else ""), False
 
-    def issue_challenge(self, sock, addr, now):
+    def issue_challenge(self, sock, addr, now, magic=None):
         """Answer a secure HELLO with a one-time challenge (encrypted). The client
         must echo the nonce in an AUTH to be pinned. Does NOT pin — a replayed HELLO
         just draws a challenge the replayer can't answer.
+
+        [magic] is the dialect of the HELLO being answered; it defaults to the one
+        parse() just recorded, which is that same packet's. It is carried per
+        challenge rather than held server-wide so a stranger's HELLO can never
+        change how the PINNED client's replies are framed.
 
         The challenge is IDEMPOTENT per address: repeated HELLOs from the same addr
         (a handshake burst, or resends faster than a slow link's round trip) reuse
@@ -842,9 +861,14 @@ class Wire:
         the server's latest, and the relay handshake could never complete."""
         if self.aes is None:
             return
+        if magic is None:
+            magic = self._pending[0] if self._pending else self.wire_magic
         ent = self._chal.get(addr)
         if ent is not None and now <= ent[1]:
             nonce = ent[0]                      # reuse the live challenge for this addr
+            # Keep the nonce (that idempotency is the point) but track the dialect of
+            # the LATEST HELLO, in case the client retried on the legacy fallback.
+            self._chal[addr] = (nonce, ent[1], magic)
         else:
             # Make room without ever letting one source cost another its challenge.
             # This used to clear the WHOLE table at the cap, so a replayed-HELLO
@@ -867,8 +891,10 @@ class Wire:
                 victims = [a for a in self._chal if a[0] == worst]
                 self._chal.pop(min(victims, key=lambda a: self._chal[a][1]), None)
             nonce = secrets.token_bytes(16)
-            self._chal[addr] = (nonce, now + CHAL_TTL_S)
-        self._seal_reply(sock, addr, "CHAL " + base64.urlsafe_b64encode(nonce).rstrip(b"=").decode())
+            self._chal[addr] = (nonce, now + CHAL_TTL_S, magic)
+        self._seal_reply(sock, addr,
+                         "CHAL " + base64.urlsafe_b64encode(nonce).rstrip(b"=").decode(),
+                         magic=magic)
 
     def verify_challenge(self, addr, rest, now):
         """True iff [rest] echoes the fresh, unexpired challenge issued to [addr].
@@ -876,7 +902,7 @@ class Wire:
         ent = self._chal.pop(addr, None)
         if ent is None:
             return False
-        nonce, exp = ent
+        nonce, exp = ent[0], ent[1]
         if now > exp:
             return False
         try:
@@ -887,7 +913,7 @@ class Wire:
 
     def sweep_challenges(self, now):
         """Drop expired challenges so a flood of unanswered HELLOs can't accumulate."""
-        for a in [a for a, (_, exp) in self._chal.items() if now > exp]:
+        for a in [a for a, ent in self._chal.items() if now > ent[1]]:
             self._chal.pop(a, None)
 
     def commit_hello(self, secure):
@@ -899,20 +925,33 @@ class Wire:
         else:
             self.cli_magic, self.cli_sid, self.cli_ctr = None, None, -1
 
-    def _seal_reply(self, sock, addr, text):
-        """Encrypt+send a reply under the server's own sid/counter, in the dialect
-        the client is speaking."""
-        magic = self.wire_magic
+    def _srv_session(self, magic):
+        """This dialect's [sid, counter], created on first use. Never re-drawn on a
+        dialect change — only when the counter is genuinely spent."""
+        ent = self._srv.get(magic)
+        if ent is None:
+            ent = [secrets.token_bytes(WIRE_FORMATS[magic][0]), 0]
+            self._srv[magic] = ent
+        return ent
+
+    def reply_magic(self, magic=None):
+        """Which dialect to answer in: the one being answered if the caller knows
+        it, else the pinned client's, else the default. Never a value an incoming
+        packet was able to set."""
+        return magic or self.cli_magic or self.wire_magic
+
+    def _seal_reply(self, sock, addr, text, magic=None):
+        """Encrypt+send a reply under this dialect's own sid/counter."""
+        magic = self.reply_magic(magic)
         sid_len, ctr_len = WIRE_FORMATS[magic]
-        # Switching dialect (or exhausting a narrower counter) needs a fresh session
-        # id: reusing one while restarting the counter would repeat a nonce under a
-        # key that outlives the session, which is the failure this whole change is
-        # about avoiding.
-        if len(self.srv_sid) != sid_len or self.srv_ctr >= (1 << (8 * ctr_len)) - 1:
-            self.srv_sid = secrets.token_bytes(sid_len)
-            self.srv_ctr = 0
-        self.srv_ctr += 1
-        nonce = self.srv_sid + self.srv_ctr.to_bytes(ctr_len, "big")
+        ent = self._srv_session(magic)
+        # Only a spent counter re-keys. Wrapping would repeat a nonce under a key
+        # that outlives the session — the failure this whole dialect change exists
+        # to prevent — and a fresh sid restarts the counter safely.
+        if ent[1] >= (1 << (8 * ctr_len)) - 1:
+            ent[0], ent[1] = secrets.token_bytes(sid_len), 0
+        ent[1] += 1
+        nonce = ent[0] + ent[1].to_bytes(ctr_len, "big")
         hdr = magic + nonce
         ct = self.aes.encrypt(nonce, text.encode("utf-8"), hdr)
         sock.sendto(hdr + ct, addr)
@@ -2861,8 +2900,15 @@ def main():
     # path and gives every user a key; manual-code entry is the rare fallback and is
     # plaintext, so defaulting it OFF means the safe wire is what you get by default
     # instead of what you have to know to ask for.
-    require_secure = not args.allow_plaintext
-    if args.allow_plaintext:
+    # --secure-only is now the default and kept only so old shortcuts still run, but
+    # if someone passes BOTH flags the explicit request for security has to win —
+    # resolving a contradiction toward the weaker wire is how a "harmless" leftover
+    # flag in a script silently turns encryption off.
+    require_secure = not args.allow_plaintext or args.secure_only
+    if args.allow_plaintext and args.secure_only:
+        print("[security] --secure-only and --allow-plaintext conflict; honouring "
+              "--secure-only (encryption required).")
+    elif args.allow_plaintext:
         print("[security] plaintext (manual-code) pairing ALLOWED — trusted LAN "
               "only. Omit --allow-plaintext to require encryption.")
     ip = lan_ip()

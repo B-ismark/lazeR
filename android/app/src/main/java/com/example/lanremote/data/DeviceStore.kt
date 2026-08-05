@@ -70,8 +70,12 @@ class DeviceStore(context: Context) {
             SecretBox.open(blob)?.let { return parse(it) }
             // Sealed but unreadable. Nothing can recover it (that is the point of
             // encrypting), so report none rather than crashing — re-pairing is one QR
-            // scan. Leave the blob in place instead of deleting it: if this was a
-            // transient Keystore fault, the next launch reads it fine.
+            // scan. The blob is left in place, so a purely TRANSIENT Keystore fault
+            // resolves itself on the next launch. Note the limit of that: this session
+            // now believes there are no saved devices, so if the user pairs or deletes
+            // one before relaunching, save() overwrites the old blob and the records
+            // are gone for good. Not worth guarding against — refusing to save would
+            // trade a rare unreadable-blob case for a visible "nothing sticks" bug.
             return emptyList()
         }
         // Legacy plaintext written before this change. Read it, then migrate.
@@ -187,6 +191,10 @@ private object SecretBox {
         // off the cipher and store it alongside the ciphertext.
         cipher.init(Cipher.ENCRYPT_MODE, secretKey())
         val iv = cipher.iv
+        // open() reads the IV back as a fixed 12 bytes, so a provider that chose a
+        // different GCM IV length would produce a blob nothing could ever decrypt.
+        // AndroidKeyStore always uses 12, but fail here rather than persist that.
+        if (iv == null || iv.size != IV_BYTES) throw IllegalStateException("unexpected IV size")
         val ct = cipher.doFinal(plain.toByteArray(Charsets.UTF_8))
         Base64.encodeToString(iv + ct, Base64.NO_WRAP)
     } catch (e: Exception) {
