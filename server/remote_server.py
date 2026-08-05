@@ -1736,6 +1736,7 @@ def serve_loop(wire, emit, net, hostname):
     # instead of flooding the activity feed. Both clear with the rate window.
     handler_errors = set()   # verbs whose handler raised
     blocked_seen = set()     # addresses turned away while a phone is already paired
+    caps_asked = False       # logged this phone's capability query once
     plaintext_hinted = False  # explained a secure-only refusal this window
     _client_connected.clear()
 
@@ -1879,6 +1880,7 @@ def serve_loop(wire, emit, net, hostname):
                 last_pkt = now
                 wire.commit_hello(False)
                 _client_connected.set()
+                caps_asked = False              # fresh session, log its negotiation again
                 emit("connected", f"{addr[0]}:{addr[1]}", False)
                 if repin:
                     emit("warn", f"Control moved to {addr[0]}:{addr[1]} over PLAINTEXT "
@@ -1895,6 +1897,7 @@ def serve_loop(wire, emit, net, hostname):
                 last_pkt = now
                 wire.commit_hello(True)         # baseline = this AUTH's sid/counter
                 _client_connected.set()
+                caps_asked = False              # fresh session, log its negotiation again
                 emit("connected", f"{addr[0]}:{addr[1]}", True)
                 wire.reply(sock, addr, "OK")
             continue
@@ -1938,6 +1941,13 @@ def serve_loop(wire, emit, net, hostname):
             # is silently dropped by older servers — so a newer phone just sees no answer
             # and falls back. Additive in both directions, no flag day.
             wire.reply(sock, addr, f"CAPS {' '.join(SERVER_CAPS)}")
+            # Say so once per session. Negotiation is otherwise invisible, and when it
+            # silently doesn't happen the only symptom is a subtly worse feel (steppy
+            # scrolling) with nothing anywhere to explain why — which is exactly the kind
+            # of thing that costs hours to chase from the phone end.
+            if not caps_asked:
+                caps_asked = True
+                emit("log", f"Phone negotiated wire features: {' '.join(SERVER_CAPS)}")
             continue
 
         # Local input wins: while the user has taken over (or after a panic),
