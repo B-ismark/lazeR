@@ -188,8 +188,10 @@ class SecureChannelTest {
         val first = ch.seal("PING")
         val second = ch.seal("PING")
 
-        assertEquals('L'.code.toByte(), first[0])
-        assertEquals('2'.code.toByte(), first[1])
+        // Deliberately no magic-byte assertion here: `seal defaults to L3 and
+        // honours the legacy flag` owns that, and asserting the default dialect in
+        // two places is what let this test go stale when L3 landed. This one is
+        // about the counter and nonce uniqueness.
         assertEquals(14 + "PING".length + 16, first.size)
         assertEquals(1L, counterOf(first))
         assertEquals(2L, counterOf(second))
