@@ -118,16 +118,18 @@ import kotlin.math.hypot
 
 private const val SCROLL_STEP_PX = 16f   // smaller = finer scroll + more haptic detents
 private const val SWIPE_APP_PX = 120f    // three-finger horizontal travel per app switch — short hop, fits small screens
-private const val SWIPE_NAV_PX = 150f    // two-finger horizontal travel per browser back/forward — deliberate, not jittery scroll
 private const val ZOOM_STEP_PX = 22f     // two-finger spread change per ctrl+wheel zoom notch (finer = smoother zoom)
-// The 2-finger gesture latches once ACCUMULATED evidence crosses a threshold — not per
-// frame, which mis-fired zoom on a back-swipe (one wobbly first frame was enough). We
-// sum net spread (gap change) vs net centroid travel over the opening frames, then pick
-// the bigger. ZOOM_BIAS makes spread win only when it clearly dominates, so an ordinary
-// horizontal swipe (fingers drift together, gap ~steady) reliably lands on back/forward.
-private const val PINCH_LATCH_PX = 14f   // accumulated |gap change| that can commit to zoom
-private const val SCROLL_LATCH_PX = 10f  // accumulated centroid travel that can commit to scroll/nav
-private const val ZOOM_BIAS = 1.4f       // spread must beat travel by this factor to latch zoom
+// Zoom-vs-pan is re-decided every frame from a DECAYING evidence window, not a one-shot
+// permanent latch — the old one-shot version could mis-read one wobbly frame as a pinch
+// and stay wrong for the rest of the gesture. Each frame folds in the new spread/pan
+// delta and forgets old evidence (EVIDENCE_DECAY), so a stale wobble fades out instead of
+// being banked forever. Entering zoom needs spread to clearly dominate (ZOOM_ENTER_BIAS);
+// once in, sustained pan alone is enough to fall back out (looser ZOOM_EXIT_BIAS) — real
+// two-finger scrolling never gets stuck zoomed for the rest of the gesture.
+private const val PINCH_LATCH_PX = 14f    // decayed |gap change| that can read as zoom
+private const val EVIDENCE_DECAY = 0.85f  // per-frame retention of prior spread/pan evidence
+private const val ZOOM_ENTER_BIAS = 1.4f  // spread must beat pan by this factor to start a pinch
+private const val ZOOM_EXIT_BIAS = 1.0f   // ...but only needs to tie pan to fall back to a pan
 
 /** All the actions the control screen can fire. Bundled to keep the signature sane. */
 class ControlActions(
@@ -139,7 +141,6 @@ class ControlActions(
     val onMiddleClick: () -> Unit,
     val onSwitchStep: (Boolean) -> Unit,  // three-finger notch: true = next app, false = previous
     val onSwitchEnd: () -> Unit,          // fingers lifted: commit the highlighted app
-    val onBrowserNav: (Boolean) -> Unit,  // two-finger horizontal swipe: true = forward (→), false = back (←)
     val onDragStart: () -> Unit,
     val onDragEnd: () -> Unit,
     val onVolume: (Float) -> Unit,
@@ -584,8 +585,9 @@ private fun HoldDragButton(
 // Trackpad + scroll strip
 // ---------------------------------------------------------------------------
 
-/** 1 finger = move · 2 fingers = scroll (vertical) / horizontal swipe = browser
- *  back-forward, pinch = zoom · 3 fingers left/right = switch apps.
+/** 1 finger = move · 2 fingers = pan/scroll (both axes, like a real trackpad — the far
+ *  end decides what that means: canvas pan in Figma, scroll in most apps, swipe-nav in a
+ *  browser) · pinch = zoom · 3 fingers left/right = switch apps.
  *  Tap = left-click · two-finger tap = right-click. Hold does nothing, so a resting
  *  hand never fires a click. [naturalScroll] = true → content follows fingers.
  *
@@ -599,14 +601,12 @@ private fun Modifier.trackpadInput(
     onRightClick: () -> Unit,
     onSwitchStep: (Boolean) -> Unit,
     onSwitchEnd: () -> Unit,
-    onBrowserNav: (Boolean) -> Unit,
     naturalScroll: () -> Boolean,
 ): Modifier = this.pointerInput(Unit) {
     val slop = viewConfiguration.touchSlop
     val tapMs = viewConfiguration.longPressTimeoutMillis
-    val acc = floatArrayOf(0f, 0f)  // scroll x, y accumulators
+    val acc = floatArrayOf(0f, 0f)  // pan x, y accumulators
     var swipeAcc = 0f               // three-finger horizontal travel since last notch
-    var navAcc = 0f                 // two-finger horizontal travel since last back/forward
     var zoomAcc = 0f                // two-finger spread change since last zoom notch
     var switching = false           // Alt-Tab session open on the laptop
     // Per-touch session state — drives tap classification + gesture latches.
@@ -614,12 +614,12 @@ private fun Modifier.trackpadInput(
     var downMs = 0L                 // when the first finger landed
     var maxFingers = 0              // peak simultaneous fingers this sequence
     var travel = 0f                 // total finger travel this sequence
-    var moved = false               // fired a move/scroll/zoom/nav/switch ⇒ not a tap
+    var moved = false               // dragged past slop ⇒ not a tap
     var twoHold = 0                 // consecutive 2-finger frames (flicker guard)
-    var pinchMode = 0               // 0 undecided · 1 zoom · -1 scroll/nav — latched until <2 fingers
-    var latchGap = 0f               // accumulated net gap change while undecided
-    var latchPanX = 0f              // accumulated net centroid x-travel while undecided
-    var latchPanY = 0f              // accumulated net centroid y-travel while undecided
+    var isZoom = false              // current 2-finger read: pinch (true) vs pan (false)
+    var evGap = 0f                  // decaying evidence: net spread (gap) change
+    var evPanX = 0f                 // decaying evidence: net centroid x-travel
+    var evPanY = 0f                 // decaying evidence: net centroid y-travel
     awaitPointerEventScope {
         while (true) {
             val event = awaitPointerEvent()
@@ -628,9 +628,9 @@ private fun Modifier.trackpadInput(
             if (n > 0 && !active) {                 // sequence starts
                 active = true
                 downMs = event.changes.first().uptimeMillis
-                maxFingers = 0; travel = 0f; moved = false; twoHold = 0; pinchMode = 0
-                latchGap = 0f; latchPanX = 0f; latchPanY = 0f
-                acc[0] = 0f; acc[1] = 0f; swipeAcc = 0f; navAcc = 0f; zoomAcc = 0f
+                maxFingers = 0; travel = 0f; moved = false; twoHold = 0; isZoom = false
+                evGap = 0f; evPanX = 0f; evPanY = 0f
+                acc[0] = 0f; acc[1] = 0f; swipeAcc = 0f; zoomAcc = 0f
             }
             if (n > maxFingers) maxFingers = n
             when {
@@ -647,7 +647,7 @@ private fun Modifier.trackpadInput(
                         while (swipeAcc >= SWIPE_APP_PX) { onSwitchStep(true); switching = true; swipeAcc -= SWIPE_APP_PX }
                         while (swipeAcc <= -SWIPE_APP_PX) { onSwitchStep(false); switching = true; swipeAcc += SWIPE_APP_PX }
                     }
-                    acc[0] = 0f; acc[1] = 0f; navAcc = 0f; zoomAcc = 0f; twoHold = 0
+                    acc[0] = 0f; acc[1] = 0f; zoomAcc = 0f; twoHold = 0
                     pressed.forEach { it.consume() }
                 }
                 n == 2 -> {
@@ -667,35 +667,39 @@ private fun Modifier.trackpadInput(
                         val dx = two.sumOf { (it.position.x - it.previousPosition.x).toDouble() }.toFloat() / 2f
                         val dy = two.sumOf { (it.position.y - it.previousPosition.y).toDouble() }.toFloat() / 2f
                         travel += abs(dx) + abs(dy)
-                        // Latch into zoom OR scroll once one clearly dominates, then stay there
-                        // until the fingers lift — no per-frame flip-flop (that was the judder).
-                        // Decide on ACCUMULATED evidence, not a single frame: sum net spread vs
-                        // net travel over the opening frames so one wobbly first frame (uneven
-                        // finger landing, slight rotation) can't mis-latch a back-swipe to zoom.
-                        if (pinchMode == 0) {
-                            latchGap += dGap
-                            latchPanX += dx
-                            latchPanY += dy
-                            val spread = abs(latchGap)
-                            val pan = hypot(latchPanX.toDouble(), latchPanY.toDouble()).toFloat()
-                            if (spread >= PINCH_LATCH_PX && spread > pan * ZOOM_BIAS) pinchMode = 1
-                            else if (pan >= SCROLL_LATCH_PX) pinchMode = -1
-                        }
-                        if (pinchMode == 1) {
-                            moved = true
+                        if (travel > slop) moved = true   // past slop ⇒ a drag, not a tap
+
+                        // Re-read zoom-vs-pan every frame off a decaying evidence window (see
+                        // constants above) instead of committing once and staying there — that
+                        // one-shot version is what let a wobbly moment mid-scroll lock the whole
+                        // gesture into zoom.
+                        evGap = evGap * EVIDENCE_DECAY + dGap
+                        evPanX = evPanX * EVIDENCE_DECAY + dx
+                        evPanY = evPanY * EVIDENCE_DECAY + dy
+                        val spread = abs(evGap)
+                        val pan = hypot(evPanX.toDouble(), evPanY.toDouble()).toFloat()
+                        val bias = if (isZoom) ZOOM_EXIT_BIAS else ZOOM_ENTER_BIAS
+                        val wasZoom = isZoom
+                        isZoom = spread >= PINCH_LATCH_PX && spread > pan * bias
+                        if (isZoom && !wasZoom) { acc[0] = 0f; acc[1] = 0f }  // entering pinch: drop stale pan carry
+                        if (!isZoom && wasZoom) { zoomAcc = 0f }              // leaving pinch: drop stale zoom carry
+
+                        if (isZoom) {
                             zoomAcc += dGap
                             while (zoomAcc >= ZOOM_STEP_PX) { onZoom(1); zoomAcc -= ZOOM_STEP_PX }    // spread → zoom in
                             while (zoomAcc <= -ZOOM_STEP_PX) { onZoom(-1); zoomAcc += ZOOM_STEP_PX }  // pinch → zoom out
-                        } else if (pinchMode == -1) {
-                            moved = true
+                        } else {
+                            // Both axes, like a real trackpad — the app on the other end decides
+                            // what scroll means (Figma pans the canvas, browsers scroll or swipe-
+                            // navigate, most everything else just scrolls).
                             // m = -1 makes content follow the fingers (natural); +1 = reverse.
                             val m = if (naturalScroll()) -1 else 1
+                            acc[0] += dx
                             acc[1] += dy
+                            while (acc[0] <= -SCROLL_STEP_PX) { onScroll(m, 0); acc[0] += SCROLL_STEP_PX }
+                            while (acc[0] >= SCROLL_STEP_PX) { onScroll(-m, 0); acc[0] -= SCROLL_STEP_PX }
                             while (acc[1] <= -SCROLL_STEP_PX) { onScroll(0, m); acc[1] += SCROLL_STEP_PX }
                             while (acc[1] >= SCROLL_STEP_PX) { onScroll(0, -m); acc[1] -= SCROLL_STEP_PX }
-                            if (abs(dx) > abs(dy)) navAcc += dx
-                            while (navAcc >= SWIPE_NAV_PX) { onBrowserNav(true); navAcc -= SWIPE_NAV_PX }   // swipe right → forward
-                            while (navAcc <= -SWIPE_NAV_PX) { onBrowserNav(false); navAcc += SWIPE_NAV_PX }  // swipe left → back
                         }
                         pressed.forEach { it.consume() }
                     }
@@ -723,9 +727,9 @@ private fun Modifier.trackpadInput(
                         if (switching) { onSwitchEnd(); switching = false }
                         active = false
                     }
-                    acc[0] = 0f; acc[1] = 0f; swipeAcc = 0f; navAcc = 0f; zoomAcc = 0f
-                    twoHold = 0; pinchMode = 0
-                    latchGap = 0f; latchPanX = 0f; latchPanY = 0f
+                    acc[0] = 0f; acc[1] = 0f; swipeAcc = 0f; zoomAcc = 0f
+                    twoHold = 0; isZoom = false
+                    evGap = 0f; evPanX = 0f; evPanY = 0f
                 }
             }
         }
@@ -771,7 +775,7 @@ private fun TrackpadCard(modifier: Modifier, a: ControlActions, natural: Boolean
                     .background(MaterialTheme.colorScheme.surface)
                     .hexDots(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.22f))
                     .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
-                        a.onSwitchStep, a.onSwitchEnd, a.onBrowserNav, { natural }),
+                        a.onSwitchStep, a.onSwitchEnd, { natural }),
             )
             Spacer(Modifier.width(14.dp))
             ScrollStrip(a.onScroll)
@@ -873,7 +877,7 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
                     .background(MaterialTheme.colorScheme.surface)
                     .hexDots(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.22f))
                     .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
-                        a.onSwitchStep, a.onSwitchEnd, a.onBrowserNav, { state.settings.naturalScroll }),
+                        a.onSwitchStep, a.onSwitchEnd, { state.settings.naturalScroll }),
             )
             Spacer(Modifier.width(14.dp))
             ScrollStrip(a.onScroll)

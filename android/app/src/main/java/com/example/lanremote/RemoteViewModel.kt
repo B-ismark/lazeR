@@ -580,10 +580,6 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         client.appSwitch("end")
     }
 
-    // Two-finger horizontal swipe → browser back/forward, like a Windows touchpad.
-    // forward (swipe →) = Alt+Right, back (swipe ←) = Alt+Left.
-    fun browserNav(forward: Boolean) = client.combo(if (forward) "alt right" else "alt left")
-
     fun system(action: String) = client.system(action)
 
     // --- volume ---

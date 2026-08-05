@@ -84,10 +84,6 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
                     vm.switchAppStep(forward)
                 },
                 onSwitchEnd = vm::switchAppEnd,
-                onBrowserNav = { forward ->
-                    if (state.settings.haptics) haptics.scrollTick()
-                    vm.browserNav(forward)
-                },
                 onDragStart = {
                     if (state.settings.haptics) haptics.leftClick()
                     vm.dragStart()
