@@ -302,11 +302,16 @@ class Dialects(unittest.TestCase):
                          "two dialects share a sid width — the magic check in "
                          "Wire.parse is now load-bearing; test it directly")
 
-    def test_unknown_magic_is_not_treated_as_secure(self):
+    def test_only_known_magics_are_secure_dialects(self):
+        # parse() dispatches on WIRE_FORMATS membership, so an unknown magic must fall
+        # through to the plaintext path rather than being mis-sliced as v2/v3.
         for magic in (b"L1", b"L4", b"XX", b"\x00\x00"):
-            self.assertFalse(rs.is_secure_magic(magic + b"\x00" * 40))
-        self.assertTrue(rs.is_secure_magic(b"L2" + b"\x00" * 40))
-        self.assertTrue(rs.is_secure_magic(b"L3" + b"\x00" * 40))
+            self.assertNotIn(magic, rs.WIRE_FORMATS)
+        self.assertIn(rs.MAGIC_V2, rs.WIRE_FORMATS)
+        self.assertIn(rs.MAGIC_V3, rs.WIRE_FORMATS)
+        # ...and an unknown magic under secure-only is dropped, not parsed.
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        self.assertIsNone(wire.parse(b"L9" + b"\x00" * 40, CLIENT, CLIENT))
 
     def test_the_last_usable_counter_value_is_still_used(self):
         # 0xFFFFFFFF fits in four bytes, so it must be spent, not skipped. Pins the
@@ -910,7 +915,7 @@ class ServeLoopResilience(unittest.TestCase):
         self.thread = threading.Thread(
             target=rs.serve_loop,
             args=(self.wire, lambda kind, *a: self.events.append((kind,) + a),
-                  None, "testhost", None),
+                  None, "testhost"),
             daemon=True)
         self.thread.start()
         return self.wire

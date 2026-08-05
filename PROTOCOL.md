@@ -111,10 +111,11 @@ ahead of its laptop still pairs. There is no flag day in either direction.
   nonce (first `HELLO` = 1, then +1 per send).
 - A session is identified by **dialect + sid** together, so a packet that switches
   dialect mid-session is refused like any other unpinned session.
-- **Handshake (challenge-response, v2).** A valid GCM tag proves key possession but
-  NOT freshness, so a captured `HELLO`+control stream could otherwise be replayed by
-  anyone who lacks the key (e.g. the untrusted rendezvous, which sees all relayed
-  ciphertext). So a v2 `HELLO` is **not** pinned on arrival: the server replies
+- **Handshake (challenge-response).** A valid GCM tag proves key possession but NOT
+  freshness, so a captured `HELLO`+control stream could otherwise be replayed by
+  anyone who lacks the key — an on-path observer on the same network can record
+  ciphertext without being able to forge it. So a `HELLO` is **not** pinned on
+  arrival: the server replies
   `CHAL <nonce>` (a fresh single-use random nonce, encrypted), and only an `AUTH`
   that echoes that nonce (which requires the key to seal) pins the client — with the
   `AUTH` packet's `sid`/counter as the session baseline. A replayed `HELLO` just
@@ -174,89 +175,8 @@ gesture. Discrete actions (CLICK/RCLICK/VOL/MEDIA/KEY) also ride UDP — fine fo
   Scanning it fills everything and connects on the **secure (v2)** wire in one tap.
   Both token and key travel only in the QR (shown on the laptop screen), never over
   mDNS. Manual entry has no `k`, so it uses plaintext v1.
-  - With remote access enabled the URI also carries `&r=<rdv-host:port>`, so a
-    scanned phone learns where to reach this laptop when it's off the LAN.
 
-## Remote access (off-LAN / NAT traversal)
-
-On the same LAN the phone reaches the laptop's private IP directly. Off-LAN, that
-IP is unreachable, so a phone and its saved laptop find each other through a public
-**rendezvous coordinator** (`rendezvous/rendezvous_server.py`; deploy notes in
-`rendezvous/deploy.md`). Requires a **key** — remote access is v2-only; plaintext
-(manual-code) devices stay LAN-only. Enable on the laptop with
-`--rendezvous <host[:port]>` (remembered across launches; `off` to disable).
-**Enabling a rendezvous forces secure-only** (plaintext is refused on every path),
-since off-LAN the endpoint is internet-reachable where a v1 token would be
-brute-forceable/observable.
-
-**The coordinator is untrusted.** It never sees the AES key and cannot control or
-decrypt a laptop, and — because control is pinned via the fresh challenge-response —
-it **cannot replay a captured session** either. The worst a hostile/compromised
-rendezvous can do is learn a public IP, redirect/refuse a connection (DoS), or be
-used as a 1:1 relay reflector (bounded by its global rate cap). All control stays
-end-to-end encrypted (v2) whether the path is direct or relayed. (A residual: the
-`room` is a plaintext bearer, so an on-path observer who sees a `REG` can DoS/redirect
-that session — never decrypt it. Closing that needs a return-routability check on
-`REG`, tracked as a follow-up.)
-
-### Room id
-
-Both paired devices derive the same opaque id from the key they already share, and
-send only *that* to the rendezvous:
-
-```
-room = base64url( HMAC-SHA256(key, "lazer-rdv-v1")[:16] )      # 22 chars, no padding
-```
-
-### Rendezvous wire (UDP, its own port — default 50510)
-
-All control is UTF-8 text lines; relayed data is raw v2 datagrams.
-
-| Packet (client → rdv)      | Meaning                                             |
-|----------------------------|-----------------------------------------------------|
-| `REG <role> <room>`        | Register/refresh my endpoint. role `H`=laptop, `P`=phone. |
-| `RELAY <role> <room>`      | Switch this room to relay mode.                     |
-| `BYE <role> <room>`        | Forget my endpoint.                                 |
-
-| Packet (rdv → client)      | Meaning                                             |
-|----------------------------|-----------------------------------------------------|
-| `SELF <ip> <port>`         | Your reflexive (public) address — STUN-lite.        |
-| `PEER <ip> <port>`         | The other role's public endpoint.                   |
-| `RELAY OK`                 | Relay is active for your room.                       |
-
-Any datagram whose first two bytes are a secure-wire magic (`L2` or `L3`) is treated
-as **relay data**, not control: the rdv looks the sender up by address and forwards the bytes
-verbatim to the other role's endpoint in the same room. The data path **never
-amplifies** (out size = in size) and forwards only between two endpoints registered
-under the same room; a 128-bit `room` is the bearer. Registration is trusted by
-(spoofable) source address, so a spoofed `REG` could register a victim and have the
-data path aimed at it — a 1:1 reflector, not an amplifier, and bounded by the rdv's
-global rate cap. The rdv also caps its tables and expires unpaired rooms fast so a
-junk-`REG` flood can't exhaust memory or lock out new sessions.
-
-### Connect sequence
-
-1. **Register.** The laptop `REG H`s every ~20s (also a NAT keepalive), so its
-   public endpoint is always current at the rendezvous.
-2. **Introduce.** When a phone `REG P`s, the rendezvous replies `PEER` to the phone
-   **and** pushes `PEER` to the laptop, so each learns the other's public endpoint.
-3. **Hole-punch.** Both fire UDP at the other's endpoint at once: the laptop sends a
-   sustained punch burst (openers at ~30ms for a few seconds); the phone sends
-   encrypted `HELLO`s (v2) and completes the `CHAL`→`AUTH`→`OK` handshake once a
-   packet gets through. All of this rides the laptop's **same** `50505` socket, so the
-   NAT mapping the phone hits is the one carrying control traffic. (The laptop only
-   punches toward a **global** peer address a `PEER` line names — never loopback/
-   private — so a forged `PEER` can't aim it at an internal host.)
-4. **Relay fallback.** If the punch doesn't open a path within a few seconds
-   (symmetric / carrier-grade NAT), the phone sends `RELAY P` and re-sends its
-   `HELLO`s **to the rendezvous**, which forwards them (still encrypted) to the
-   laptop and relays the replies back. Higher latency, but works everywhere.
-
-Once `OK` arrives, the session is an ordinary v2 wire (§v2 above) over whichever
-path won — the phone's socket simply targets the peer (direct) or the rendezvous
-(relay), and everything else in this protocol is unchanged.
-
-> **Windows note.** Sending UDP to an endpoint with no listener (routine while
-> punching) makes the OS raise `WSAECONNRESET` on the socket's next receive. The
-> server disables that report (`SIO_UDP_CONNRESET` off) and ignores the error, so a
-> normal punch never tears down the receive loop.
+> **Windows note.** Sending UDP to an endpoint with no listener — routine when we
+> reply to a phone that has just vanished — makes the OS raise `WSAECONNRESET` on the
+> socket's next receive. The server disables that report (`SIO_UDP_CONNRESET` off)
+> and ignores the error, so a departed phone never tears down the receive loop.

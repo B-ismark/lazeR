@@ -14,7 +14,6 @@ import com.example.lanremote.data.Discovery
 import com.example.lanremote.data.Settings
 import com.example.lanremote.data.SettingsStore
 import com.example.lanremote.net.RemoteClient
-import com.example.lanremote.net.Rendezvous
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -64,12 +63,6 @@ data class UiState(
     val savedDevices: List<Device> = emptyList(),
     val discovered: List<DiscoveredHost> = emptyList(),
     val settings: Settings = Settings(),
-    // True when we're linked over the rendezvous (relay/hole-punch) even though the
-    // phone is on the SAME Wi-Fi subnet as the laptop — i.e. the fast direct LAN path
-    // was blocked (usually the laptop's firewall / a Public network profile) and we
-    // silently fell back to the slower off-LAN path. Surfaced as a warning so this
-    // degraded-but-connected state stops masking itself.
-    val relayWhileLocal: Boolean = false,
 )
 
 class RemoteViewModel(app: Application) : AndroidViewModel(app) {
@@ -163,7 +156,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         update { it.copy(name = device.name, ip = device.ip,
             port = device.port.toString(), token = device.token) }
         connect(device.name, device.ip, device.port, device.token, device.key,
-            save = false, rendezvous = device.rendezvous)
+            save = false)
     }
 
     fun useDiscovered(host: DiscoveredHost) {
@@ -186,26 +179,25 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val token = uri.getQueryParameter("token")?.uppercase().orEmpty()
         val name = uri.getQueryParameter("name") ?: ip
         val key = uri.getQueryParameter("k").orEmpty()   // 256-bit secret ⇒ encrypted wire
-        val rdv = uri.getQueryParameter("r").orEmpty()   // rendezvous host:port ⇒ off-LAN access
         if (token.isBlank()) {
             update { it.copy(error = "QR code has no token") }
             return
         }
         update { it.copy(name = name, ip = ip, port = port.toString(), token = token) }
-        connect(name, ip, port, token, key, save = true, rendezvous = rdv)
+        connect(name, ip, port, token, key, save = true)
     }
 
     private fun connect(name: String, ip: String, port: Int, token: String,
-                        key: String, save: Boolean, rendezvous: String = "") {
+                        key: String, save: Boolean) {
         if (ip.isBlank() || token.isBlank()) {
             update { it.copy(error = "Need an IP and token") }
             return
         }
         val dev = Device(id = "$ip:$port", name = name.ifBlank { ip },
-            ip = ip, port = port, token = token, key = key, rendezvous = rendezvous)
+            ip = ip, port = port, token = token, key = key)
         current = dev
         reconnectJob?.cancel()
-        update { it.copy(conn = ConnState.Connecting, error = null, relayWhileLocal = false) }
+        update { it.copy(conn = ConnState.Connecting, error = null) }
         viewModelScope.launch {
             val connected = connectResolving(dev, 2000)
             if (connected != null) {
@@ -219,8 +211,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 discovery.stop()   // no need to keep scanning Wi-Fi while controlling
                 holdWifi(true)     // pin the radio low-latency for the session
                 touch()
-                update { it.copy(conn = ConnState.Connected,
-                    relayWhileLocal = relayWhileLocal(connected)) }
+                update { it.copy(conn = ConnState.Connected) }
                 startHealthLoop()
             } else {
                 update {
@@ -234,8 +225,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * Connect to [dev]'s stored address; if that fails, try every laptop currently
      * visible via mDNS (its IP may have moved on a DHCP lease / reboot). The wrong
-     * host simply fails the authenticated handshake, so trying them is safe. Finally,
-     * if the laptop is off-LAN and we have a key + rendezvous, punch/relay to it.
+     * host simply fails the authenticated handshake, so trying them is safe.
      * @return the device that answered (its id preserved, ip/port refreshed), or null.
      */
     private suspend fun connectResolving(dev: Device, timeoutMs: Long): Device? {
@@ -247,38 +237,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 return dev.copy(ip = h.ip, port = h.port)
             }
         }
-        // Off-LAN: reach the laptop through the rendezvous coordinator. Keep the
-        // saved LAN ip/port untouched (returning `dev`) so the next attempt still
-        // tries the fast local path first.
-        val rdv = Rendezvous.parse(dev.rendezvous)
-        if (rdv != null && dev.key.isNotBlank()) {
-            if (client.connectRemote(rdv.first, rdv.second, dev.token, dev.key)) return dev
-        }
         return null
-    }
-
-    /** True when we ended up on the off-LAN path (relay or hole-punch) even though the
-     *  phone shares [dev]'s Wi-Fi subnet — the tell-tale of a blocked direct LAN link
-     *  (laptop firewall / Public network profile) that quietly fell back to the slow
-     *  path. Off-LAN by choice (phone truly elsewhere) shares no subnet, so it won't
-     *  trip. IPv4 /24 heuristic — good enough for home LANs, and we only ever warn. */
-    private fun relayWhileLocal(dev: Device): Boolean =
-        client.isRemote && phoneSharesSubnet(dev.ip)
-
-    private fun phoneSharesSubnet(target: String): Boolean {
-        val t = target.split(".").mapNotNull { it.toIntOrNull() }
-        if (t.size != 4) return false                    // not a plain IPv4 target
-        return try {
-            java.net.NetworkInterface.getNetworkInterfaces().asSequence()
-                .filter { it.isUp && !it.isLoopback }
-                .flatMap { it.inetAddresses.asSequence() }
-                .filterIsInstance<java.net.Inet4Address>()
-                .filter { it.isSiteLocalAddress }        // private LAN address on this phone
-                .mapNotNull { it.hostAddress?.split(".")?.mapNotNull { o -> o.toIntOrNull() } }
-                .any { it.size == 4 && it[0] == t[0] && it[1] == t[1] && it[2] == t[2] }
-        } catch (e: Exception) {
-            false
-        }
     }
 
     /** Watchdog: poll volume (doubles as liveness); on repeated misses, reconnect. */
@@ -288,14 +247,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             var misses = 0
             var tick = 0
             while (isActive) {
-                // Remote paths (hole-punched or relayed through the rendezvous) carry
-                // far higher RTT than the LAN, and the relay can briefly drop a reply.
-                // Widen the liveness timeouts and tolerate more consecutive misses so
-                // ordinary off-LAN latency isn't mistaken for a dead link and thrashed
-                // into a reconnect loop. LAN keeps its snappy, tight thresholds.
-                val remote = client.isRemote
-                val volTimeout = if (remote) 1200 else 400
-                val pingTimeout = if (remote) 1800 else 500
+                val volTimeout = 400
+                val pingTimeout = 500
                 // Ride out brief transients (a Wi-Fi airtime blip or a momentary
                 // server-loop stall) on the SAME socket instead of thrashing a healthy
                 // session into a reconnect. A reconnect is expensive — new socket, new
@@ -303,7 +256,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 // link dead after several consecutive misses. Paired with the fast
                 // re-probe below, dead detection is still ~2.5s while a 1–2s blip is
                 // absorbed with no drop at all.
-                val maxMisses = if (remote) 6 else 5
+                val maxMisses = 5
                 val v = client.queryVolume(volTimeout)
                 val alive = if (v != null) {
                     if (System.currentTimeMillis() - lastUserVolumeMs > 1200) {
@@ -379,8 +332,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     discovery.stop()
                     holdWifi(true)
-                    update { it.copy(conn = ConnState.Connected, error = null,
-                        relayWhileLocal = relayWhileLocal(c)) }
+                    update { it.copy(conn = ConnState.Connected, error = null) }
                     startHealthLoop()
                     return@launch
                 }
@@ -390,7 +342,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     // release the radio lock and tell the user what to try next.
                     holdWifi(false)
                     update {
-                        it.copy(conn = ConnState.Disconnected, relayWhileLocal = false,
+                        it.copy(conn = ConnState.Disconnected,
                             error = "Couldn't reconnect to ${dev.name}. It may be off or " +
                                 "asleep — if you re-paired it, scan the new QR to re-pair.")
                     }
@@ -415,7 +367,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         current = null
         client.disconnect()
         holdWifi(false)                     // let the radio power-save again
-        update { it.copy(conn = ConnState.Disconnected, relayWhileLocal = false) }
+        update { it.copy(conn = ConnState.Disconnected) }
         discovery.start { hosts -> update { it.copy(discovered = hosts) } }   // scan again for the connection screen
     }
 
