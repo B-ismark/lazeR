@@ -45,28 +45,14 @@ else:
     _APP_DIR = _BUNDLE_DIR
 TOKEN_FILE = os.path.join(_APP_DIR, ".lazer_token")
 KEY_FILE = os.path.join(_APP_DIR, ".lazer_key")
-RDV_FILE = os.path.join(_APP_DIR, ".lazer_rdv")   # remembers the rendezvous host:port
 ICON_FILE = os.path.join(_BUNDLE_DIR, "LazeR.ico")
 
-# Remote access (off-LAN) via the public rendezvous coordinator. Off unless the
-# user configures a host (--rendezvous host[:port]); no default is baked in.
-RDV_DEFAULT_PORT = 50510
-RDV_REG_INTERVAL_S = 20        # re-announce our endpoint this often (NAT keepalive)
-RDV_ROOM_INFO = b"lazer-rdv-v1"  # room id = base64url(HMAC-SHA256(key, this)[:16])
-# Hole-punch: after the rendezvous introduces a phone, keep firing openers at its
-# public endpoint for this long so our NAT mapping is open when the phone's HELLOs
-# arrive. A single short burst rarely aligns with the phone's punch window (even a
-# restricted-cone wifi NAT then falls back to relay), so we sustain it. While
-# punching, serve_loop drops its recv timeout to PUNCH_POLL_S so openers go out at
-# ~30ms cadence instead of once a second — without blocking the receive of the
-# HELLO that actually pins control.
-RDV_PUNCH_WINDOW_S = 5.0
-RDV_PUNCH_POLL_S = 0.03
 # HELLO freshness: a secure HELLO is answered with a one-time random challenge the
 # client must echo (encrypted) in an AUTH before it is pinned as controller. This
 # stops a captured session (a HELLO + its control packets) being replayed later by
-# anyone who lacks the key — e.g. a compromised/​untrusted rendezvous that sees all
-# relayed ciphertext. The challenge is single-use and expires quickly.
+# anyone who lacks the key — an on-path observer on the LAN can capture ciphertext
+# without being able to forge it, so possession of the key must be proven FRESH, not
+# merely proven. The challenge is single-use and expires quickly.
 CHAL_TTL_S = 6.0
 CHAL_MAX = 256              # bound the pending-challenge table (anti-flood)
 # ...and a per-source-IP quota. The global bound alone is not enough: a replayed
@@ -74,7 +60,7 @@ CHAL_MAX = 256              # bound the pending-challenge table (anti-flood)
 # of spoofed source PORTS, and any eviction policy that treats all entries alike
 # then pushes out the real phone's outstanding nonce — stalling its handshake. A
 # per-IP cap makes a flood evict only its own entries. One genuine phone needs a
-# handful at most (a punch burst plus handshake retries).
+# handful at most (handshake retries from one or two source ports).
 CHAL_PER_IP = 8
 
 # Verbs that actually drive the machine. While the user has taken over locally
@@ -701,10 +687,6 @@ MAGIC_V3 = b"L3"
 WIRE_FORMATS = {MAGIC_V2: (4, 8), MAGIC_V3: (8, 4)}   # magic -> (sid_len, ctr_len)
 
 
-def is_secure_magic(data):
-    """True if [data] opens with a known secure-wire magic (so it is v2/v3 data and
-    not a plaintext control line)."""
-    return data[:2] in WIRE_FORMATS
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     _HAVE_CRYPTO = True
@@ -853,8 +835,8 @@ class Wire:
         just draws a challenge the replayer can't answer.
 
         The challenge is IDEMPOTENT per address: repeated HELLOs from the same addr
-        (a punch/handshake burst, or resends faster than a high-latency relay's round
-        trip) reuse the SAME outstanding nonce until it's answered or expires. Without
+        (a handshake burst, or resends faster than a slow link's round trip) reuse
+        the SAME outstanding nonce until it's answered or expires. Without
         this, each HELLO would mint a new nonce and overwrite the last, so the client's
         AUTH — echoing whichever CHAL it happened to receive first — would never match
         the server's latest, and the relay handshake could never complete."""
@@ -1257,9 +1239,9 @@ def open_socket():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # Windows raises WSAECONNRESET (ConnectionResetError) on a UDP socket's *next*
-    # recv after we send to an endpoint with no listener — which hole-punching does
-    # constantly (firing at a phone before it's ready). SIO_UDP_CONNRESET off stops
-    # that spurious error so the recv loop isn't torn down by a normal punch.
+    # recv after we send to an endpoint with no listener — which happens routinely
+    # when we reply to a phone that has just vanished (app killed, Wi-Fi dropped).
+    # SIO_UDP_CONNRESET off stops that spurious error tearing down the recv loop.
     if sys.platform.startswith("win"):
         try:
             sock.ioctl(socket.SIO_UDP_CONNRESET, False)
@@ -1326,16 +1308,12 @@ def singleton_serve(lsock, eq):
         pass
 
 
-def build_uri(ip, token, hostname, key=None, rdv=None):
+def build_uri(ip, token, hostname, key=None):
     base = f"lazer://{ip}:{PORT}/?token={token}&name={hostname}"
     if key is not None:
         # The 256-bit key rides the QR only (shown on the laptop screen), enabling
         # the secure encrypted wire. It is never broadcast over mDNS.
         base += f"&k={key_b64(key)}"
-    if rdv:
-        # The rendezvous host lets a scanned phone reach this laptop off-LAN. It's
-        # only a coordinator address (no secret) — safe to carry in the QR.
-        base += f"&r={rdv}"
     return base
 
 
@@ -1615,180 +1593,6 @@ def show_qr(uri):
         print(f"     URI (QR failed): {uri}")
 
 
-# ── remote access: rendezvous / NAT hole-punch + relay ───────────────────────
-# A phone off the LAN can't reach our private IP. The public rendezvous server
-# (rendezvous/rendezvous_server.py) brokers a direct UDP path by hole-punching,
-# and relays (still-encrypted) packets when a symmetric/CGNAT refuses the punch.
-# Everything here rides the SAME 50505 socket serve_loop already owns, so the NAT
-# mapping the phone hits is the exact one carrying control traffic.
-def room_id_for(key):
-    """The room id both paired devices derive from the shared key (never sent):
-    base64url(HMAC-SHA256(key, "lazer-rdv-v1")[:16]). Rendezvous only sees this."""
-    import base64
-    import hashlib
-    import hmac
-    if not key:
-        return None
-    digest = hmac.new(key, RDV_ROOM_INFO, hashlib.sha256).digest()[:16]
-    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-
-
-def parse_rdv(spec):
-    """'host', 'host:port', or falsy → (host, port) or None. 'off'/'none' clears."""
-    if not spec:
-        return None
-    spec = spec.strip()
-    if spec.lower() in ("off", "none", "disable", "disabled", ""):
-        return None
-    if ":" in spec:
-        host, _, p = spec.rpartition(":")
-        try:
-            return host, int(p)
-        except ValueError:
-            return spec, RDV_DEFAULT_PORT
-    return spec, RDV_DEFAULT_PORT
-
-
-def _punchable_target(ip, port):
-    """True iff (ip, port) is a sane hole-punch target: a real port and a GLOBAL
-    unicast IP. A phone's public (reflexive) endpoint is always global; refusing
-    loopback/private/link-local/multicast/reserved stops a forged rendezvous PEER
-    from aiming our punch burst at an internal host or the machine itself."""
-    if not (0 < port <= 65535):
-        return False
-    try:
-        a = ipaddress.ip_address(ip)
-    except ValueError:
-        return False
-    return a.is_global and not a.is_multicast
-
-
-def load_rdv():
-    """Persisted rendezvous host:port string, or '' if remote access is off."""
-    try:
-        with open(RDV_FILE, "r") as f:
-            return f.read().strip()
-    except OSError:
-        return ""
-
-
-def save_rdv(spec):
-    """Persist (or clear) the rendezvous host:port. Returns the stored string."""
-    stored = "" if parse_rdv(spec) is None else spec.strip()
-    try:
-        if stored:
-            with open(RDV_FILE, "w") as f:
-                f.write(stored)
-        elif os.path.exists(RDV_FILE):
-            os.remove(RDV_FILE)
-    except OSError:
-        pass
-    return stored
-
-
-class RendezvousManager:
-    """Keeps our endpoint registered at the rendezvous and punches toward a phone
-    when the rendezvous introduces one. Stateless about the socket — serve_loop
-    passes its current `sock` in (it gets recreated across sleep/resume)."""
-
-    def __init__(self, spec, key, emit):
-        self.emit = emit
-        self.spec = (spec or "").strip()   # original host:port, for QR rebuilds
-        self.room = room_id_for(key)
-        self._hostport = parse_rdv(spec)
-        self.enabled = bool(self._hostport and self.room)
-        self.addr = None            # resolved (ip, port) of the rendezvous
-        self._last_reg = 0.0
-        self._last_resolve = 0.0
-        self._punch_target = None   # (ip, port) of a phone we're punching toward
-        self._punch_until = 0.0     # monotonic deadline; punch openers stop after
-        if self._hostport:
-            self._resolve()
-
-    def _resolve(self):
-        # Re-resolve occasionally so a DDNS rendezvous that moved is picked up.
-        host, port = self._hostport
-        try:
-            ip = socket.gethostbyname(host)
-            self.addr = (ip, port)
-        except OSError:
-            self.addr = None
-        self._last_resolve = time.monotonic()
-
-    def is_rdv(self, addr):
-        return self.enabled and self.addr is not None and addr == self.addr
-
-    def tick(self, sock):
-        """Called every serve_loop iteration; self-throttles the keepalive REG."""
-        if not self.enabled:
-            return
-        now = time.monotonic()
-        if self.addr is None and now - self._last_resolve > 30:
-            self._resolve()
-        if self.addr is None:
-            return
-        if now - self._last_reg >= RDV_REG_INTERVAL_S:
-            self._last_reg = now
-            self._send(sock, f"REG H {self.room}".encode())
-        # Sustained hole-punch: fire an opener at the phone each tick while the
-        # window is open. serve_loop spins fast (short recv timeout) during this,
-        # so this is ~30ms cadence — enough to hold our NAT mapping open until the
-        # phone's HELLO lands. Cleared the moment control is pinned (on HELLO).
-        if self._punch_target is not None and now < self._punch_until:
-            self._send(sock, b"LRPUNCH", self._punch_target)
-
-    def punching(self, now):
-        """True while we should keep firing punch openers (serve_loop polls fast)."""
-        return self._punch_target is not None and now < self._punch_until
-
-    def clear_punch(self):
-        """Stop punching — called once a HELLO pins the phone as the controller."""
-        self._punch_target = None
-
-    def on_rebind(self):
-        """After a sleep/resume rebind, re-announce immediately (mapping is new)."""
-        self._last_reg = 0.0
-
-    def handle_control(self, data, sock):
-        """A rendezvous control line arrived on our socket (addr == self.addr and
-        it isn't v2 data). Punch toward any phone the rendezvous introduces."""
-        try:
-            parts = data.decode("utf-8", "ignore").split()
-        except Exception:
-            return
-        if not parts:
-            return
-        verb = parts[0].upper()
-        if verb == "PEER" and len(parts) >= 3:
-            try:
-                port = int(parts[2])
-            except ValueError:
-                return
-            # Rendezvous control is trusted only by source address, which is
-            # spoofable — so validate the target before we fire openers at it, or a
-            # forged PEER turns us into a reflector aimed at an arbitrary victim.
-            # Only punch toward a GLOBAL unicast address (a phone's public endpoint
-            # is always global; loopback/private/link-local/multicast are refused).
-            if not _punchable_target(parts[1], port):
-                return
-            # Open a punch window instead of blocking on a burst here: this runs in
-            # serve_loop, which must stay free to RECEIVE the phone's HELLO. tick()
-            # fires the openers (serve_loop polls fast while punching); the phone's
-            # authenticated HELLO is what actually pins control.
-            self._punch_target = (parts[1], port)
-            self._punch_until = time.monotonic() + RDV_PUNCH_WINDOW_S
-            self._send(sock, b"LRPUNCH", self._punch_target)   # one immediate opener
-            self.emit("log", f"Remote: punching toward {parts[1]}:{port}")
-        elif verb == "RELAY":
-            self.emit("log", "Remote: relaying via rendezvous (direct path blocked)")
-
-    def _send(self, sock, payload, addr=None):
-        try:
-            sock.sendto(payload, addr or self.addr)
-        except OSError:
-            pass
-
-
 # ── server thread (used in GUI mode) ─────────────────────────────────────────
 def _chars(n):
     return f"{n} char" if n == 1 else f"{n} chars"
@@ -1829,13 +1633,12 @@ def _emit_action(event_q, verb, rest):
         event_q.put(("action", res[0], res[1]))
 
 
-def serve_loop(wire, emit, net, hostname, rdv=None):
+def serve_loop(wire, emit, net, hostname):
     """The one UDP loop, used by both GUI and terminal modes.
 
     [wire] handles auth/encrypt/replay. [emit](kind, *args) reports events
     (GUI → queue, terminal → print). [net] is a shared {"ip","zc","info"} dict
-    for mDNS re-announce after resume. [rdv] is an optional RendezvousManager for
-    off-LAN (remote) access — it shares this loop's socket."""
+    for mDNS re-announce after resume."""
     sock = open_socket()
     client = None
     last_tick = time.time()
@@ -1914,16 +1717,9 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
                 net["ip"] = new_ip
                 if new_ip != old_ip:
                     emit("netchange", new_ip,
-                         build_uri(new_ip, wire.token, hostname, wire.key,
-                                   rdv.spec if rdv else None))
+                         build_uri(new_ip, wire.token, hostname, wire.key))
             emit("log", "Network recovered after sleep")
-            if rdv is not None:
-                rdv.on_rebind()   # our NAT mapping is new — re-announce immediately
         last_tick = now
-
-        # Keep our endpoint registered at the rendezvous (NAT keepalive); self-throttled.
-        if rdv is not None:
-            rdv.tick(sock)
 
         # The phone pings ~every 1.5s; prolonged silence means it left without a
         # BYE (app killed, Wi-Fi dropped). Reflect that instead of showing it
@@ -1945,37 +1741,24 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
             _remote_paused.clear()
             emit("resumed")
 
-        # While hole-punching, poll fast so tick() fires openers at ~30ms cadence;
-        # otherwise idle at 1/s. (open_socket binds at 1.0s; this tracks punch state.)
-        if rdv is not None and rdv.punching(mono):
-            sock.settimeout(RDV_PUNCH_POLL_S)
-        else:
-            sock.settimeout(1.0)
+        sock.settimeout(1.0)   # 1/s idle wake-ups drive the resume/idle/rate checks
 
         try:
             data, addr = sock.recvfrom(2048)
         except socket.timeout:
             continue
         except ConnectionResetError:
-            # Windows: a prior send hit an endpoint with no listener (common while
-            # punching). Not fatal — the socket is fine; keep serving.
+            # Windows: a prior send hit an endpoint with no listener (a phone that
+            # left). Not fatal — the socket is fine; keep serving.
             continue
         except OSError:
             # A transient network error (e.g. host/net-unreachable surfacing on the
-            # next recv after a punch to a dead target) must NOT tear the loop down
+            # next recv after a send to a departed phone) must NOT tear the loop down
             # for good. Pause briefly and keep serving; a real dead socket is handled
             # by the sleep/resume rebind above.
             time.sleep(0.1)
             continue
         if not data:
-            continue
-
-        # Rendezvous control (PEER/SELF/RELAY) arrives on this same socket. It's
-        # never v2 data, so route it to the manager and skip auth. Relayed v2 data
-        # from the rendezvous (starts with the L2 magic) falls through to wire.parse
-        # like any other packet — it just pins the rendezvous as the client addr.
-        if rdv is not None and rdv.is_rdv(addr) and not is_secure_magic(data):
-            rdv.handle_control(data, sock)
             continue
 
         res = wire.parse(data, addr, client)
@@ -2009,8 +1792,6 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
                 client = addr
                 last_pkt = now
                 wire.commit_hello(False)
-                if rdv is not None:
-                    rdv.clear_punch()
                 _client_connected.set()
                 emit("connected", f"{addr[0]}:{addr[1]}", False)
                 if repin:
@@ -2027,8 +1808,6 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
                 client = addr
                 last_pkt = now
                 wire.commit_hello(True)         # baseline = this AUTH's sid/counter
-                if rdv is not None:
-                    rdv.clear_punch()
                 _client_connected.set()
                 emit("connected", f"{addr[0]}:{addr[1]}", True)
                 wire.reply(sock, addr, "OK")
@@ -2111,7 +1890,7 @@ _C = {
 
 
 class LazeRWindow:
-    def __init__(self, ip, port, wire, event_q, require_secure, rdv_host=""):
+    def __init__(self, ip, port, wire, event_q, require_secure):
         import tkinter as tk
         from tkinter import font as tkf
 
@@ -2120,9 +1899,8 @@ class LazeRWindow:
         self._wire = wire
         self._token = wire.token
         self._require_secure = require_secure
-        self._rdv_host = rdv_host
         self._hostname = socket.gethostname()
-        uri = build_uri(ip, wire.token, self._hostname, wire.key, rdv_host)
+        uri = build_uri(ip, wire.token, self._hostname, wire.key)
         token = wire.token
 
         root = tk.Tk()
@@ -2569,8 +2347,8 @@ class LazeRWindow:
     def _regenerate(self):
         rotate_secrets(self._wire)
         self._token = self._wire.token
-        uri = build_uri(self._ip, self._wire.token, self._hostname, self._wire.key,
-                        self._rdv_host)
+        uri = build_uri(self._ip, self._wire.token, self._hostname,
+                        self._wire.key)
         self._repaint_qr(uri)
         try:
             self._token_chip.config(text=self._wire.token)
@@ -2671,10 +2449,6 @@ class LazeRWindow:
         self._pill(pad, "Encryption",
                    "AES-256-GCM (QR scan)" if _HAVE_CRYPTO
                    else "unavailable — pip install cryptography", _HAVE_CRYPTO)
-        remote_on = bool(self._rdv_host)
-        self._pill(pad, "Remote access",
-                   self._rdv_host if remote_on
-                   else "off — --rendezvous host:port", remote_on)
         if sys.platform.startswith("win"):
             self._fw_pill = self._mutable_pill(pad, "Firewall", "checking…")
 
@@ -2932,9 +2706,9 @@ class LazeRWindow:
 
 
 # ── terminal mode ─────────────────────────────────────────────────────────────
-def run_terminal(token, key, ip, require_secure, rdv_spec=""):
+def run_terminal(token, key, ip, require_secure):
     hostname = socket.gethostname()
-    uri = build_uri(ip, token, hostname, key, rdv_spec)
+    uri = build_uri(ip, token, hostname, key)
     zc, mdns_info = start_mdns(ip, hostname)
     net = {"ip": ip, "zc": zc, "info": mdns_info}
 
@@ -2947,8 +2721,6 @@ def run_terminal(token, key, ip, require_secure, rdv_spec=""):
     print(f"  Token     : {token}")
     sec = "ON (QR scan)" if _HAVE_CRYPTO else "unavailable (pip install cryptography)"
     print(f"  Encryption: {sec}" + ("  · plaintext blocked" if require_secure else ""))
-    print(f"  Remote    : {rdv_spec}  (off-LAN via rendezvous)" if rdv_spec
-          else "  Remote    : off  (--rendezvous host:port to enable off-LAN)")
     print("=" * 44)
     print("  Scan this QR in the LazeR app:")
     print()
@@ -2992,7 +2764,6 @@ def run_terminal(token, key, ip, require_secure, rdv_spec=""):
             print(f"[info] {a[0]}")
 
     wire = Wire(token, key, require_secure)
-    rdv = RendezvousManager(rdv_spec, key, emit) if rdv_spec else None
     guard = LocalInputGuard(
         on_physical=lambda: _physical_event(emit),
         on_panic=lambda: _panic_event(emit),
@@ -3000,7 +2771,7 @@ def run_terminal(token, key, ip, require_secure, rdv_spec=""):
     guard.start()
 
     try:
-        serve_loop(wire, emit, net, hostname, rdv)
+        serve_loop(wire, emit, net, hostname)
     except KeyboardInterrupt:
         pass
     finally:
@@ -3057,9 +2828,6 @@ def main():
                     help="register LazeR to launch at Windows login (Startup folder) and exit")
     ap.add_argument("--disable-startup", action="store_true",
                     help="remove the launch-at-login registration and exit")
-    ap.add_argument("--rendezvous", metavar="HOST[:PORT]",
-                    help="enable off-LAN (remote) access via this rendezvous server; "
-                         "remembered across launches. Use 'off' to disable.")
     args = ap.parse_args()
 
     if args.enable_startup or args.disable_startup:
@@ -3097,20 +2865,6 @@ def main():
     if args.allow_plaintext:
         print("[security] plaintext (manual-code) pairing ALLOWED — trusted LAN "
               "only. Omit --allow-plaintext to require encryption.")
-    # Remote access: --rendezvous updates the persisted config; otherwise reuse it.
-    if args.rendezvous is not None:
-        rdv_spec = save_rdv(args.rendezvous)
-        print(f"[remote] rendezvous {'set to ' + rdv_spec if rdv_spec else 'disabled'}.")
-    else:
-        rdv_spec = load_rdv()
-    # Remote access is v2-only by design: off-LAN the server's endpoint is reachable
-    # from the internet, where the plaintext (v1) token is brute-forceable/observable
-    # and a v1 HELLO could downgrade an encrypted session. So enabling a rendezvous
-    # FORCES secure-only — plaintext is refused on every path, not just off-LAN.
-    if rdv_spec:
-        if not require_secure:
-            print("[remote] forcing secure-only (encryption required) — remote access is v2-only.")
-        require_secure = True
     ip = lan_ip()
     # Say so loudly when the default route is NOT the address we advertise: it means
     # a virtual/VPN adapter owns the route, which used to silently put an
@@ -3157,13 +2911,12 @@ def main():
             )
             guard.start()
 
-            rdv = RendezvousManager(rdv_spec, key, emit) if rdv_spec else None
             t = threading.Thread(target=serve_loop,
-                                 args=(wire, emit, net, hostname, rdv), daemon=True)
+                                 args=(wire, emit, net, hostname), daemon=True)
             t.start()
 
             try:
-                LazeRWindow(ip, PORT, wire, eq, require_secure, rdv_spec).run()
+                LazeRWindow(ip, PORT, wire, eq, require_secure).run()
             except KeyboardInterrupt:
                 pass
             finally:
@@ -3178,7 +2931,7 @@ def main():
                 print("Server stopped.")
             return
 
-    run_terminal(token, key, ip, require_secure, rdv_spec)
+    run_terminal(token, key, ip, require_secure)
 
 
 if __name__ == "__main__":

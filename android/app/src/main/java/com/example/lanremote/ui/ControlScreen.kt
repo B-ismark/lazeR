@@ -68,9 +68,7 @@ import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Tune
-import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ButtonGroup
 import androidx.compose.material3.Card
@@ -226,10 +224,6 @@ fun ControlScreen(state: UiState, a: ControlActions) {
                 .imePadding()
                 .padding(horizontal = 16.dp, vertical = 8.dp),
         ) {
-            if (state.relayWhileLocal) {
-                RelayWarningCard()
-                Spacer(Modifier.height(12.dp))
-            }
             ControlsPanel(state, a)
             Spacer(Modifier.height(12.dp))
             TrackpadCard(
@@ -294,46 +288,6 @@ private fun ControlsPanel(state: UiState, a: ControlActions) {
             // nothing an unrelated state change does can disturb the IME session.
             if (which == 0) MediaPanel(state, a)
             else KeyboardPanel(a)
-        }
-    }
-}
-
-/** Shown when we're linked through the rendezvous relay while actually on the laptop's
- *  Wi-Fi — the fast direct LAN path was blocked (usually the laptop's firewall / a
- *  Public network profile). Without this the degraded link looks like a normal
- *  connection while quietly dropping control packets. Dismissible per session. */
-@Composable
-private fun RelayWarningCard() {
-    var show by remember { mutableStateOf(true) }
-    if (!show) return
-    Card(
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.errorContainer,
-        ),
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Row(
-            modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 4.dp),
-            verticalAlignment = Alignment.Top,
-        ) {
-            Icon(Icons.Filled.WarningAmber, contentDescription = null,
-                tint = MaterialTheme.colorScheme.onErrorContainer,
-                modifier = Modifier.size(22.dp))
-            Column(Modifier.weight(1f).padding(start = 12.dp)) {
-                Text("Connected over the relay",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onErrorContainer)
-                Text("You're on the same Wi-Fi as the laptop, but the fast direct link is " +
-                        "blocked — so this runs slow and may drop out. Set the laptop's network " +
-                        "to Private, or allow LazeR through its firewall.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onErrorContainer)
-            }
-            IconButton(onClick = { show = false }) {
-                Icon(Icons.Filled.Close, contentDescription = "Dismiss",
-                    tint = MaterialTheme.colorScheme.onErrorContainer)
-            }
         }
     }
 }

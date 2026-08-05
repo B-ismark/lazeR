@@ -6,10 +6,7 @@ import org.json.JSONObject
 
 /** A saved laptop the user can reconnect to in one tap.
  *  [key] is the base64url 256-bit secret from the QR — present ⇒ encrypted wire.
- *  Empty ⇒ legacy plaintext (manual-code pairing on a trusted network).
- *  [rendezvous] is the "host:port" of the coordinator for off-LAN access — set
- *  from the QR's &r= param. Present (with a key) ⇒ we can reach this laptop when
- *  it isn't on the local network. */
+ *  Empty ⇒ legacy plaintext (manual-code pairing on a trusted network). */
 data class Device(
     val id: String,
     val name: String,
@@ -17,7 +14,6 @@ data class Device(
     val port: Int,
     val token: String,
     val key: String = "",
-    val rendezvous: String = "",
 )
 
 /** A laptop found live on the network via mDNS (no token yet). */
@@ -44,8 +40,10 @@ class DeviceStore(context: Context) {
                     ip = o.getString("ip"),
                     port = o.optInt("port", 50505),
                     token = o.getString("token"),
+                    // A "rendezvous" key may be present in records written before
+                    // off-LAN access was removed; it is simply ignored, and dropped
+                    // on the next save. No migration needed.
                     key = o.optString("key", ""),
-                    rendezvous = o.optString("rendezvous", ""),
                 )
             }
         } catch (e: Exception) {
@@ -64,7 +62,6 @@ class DeviceStore(context: Context) {
                     .put("port", d.port)
                     .put("token", d.token)
                     .put("key", d.key)
-                    .put("rendezvous", d.rendezvous)
             )
         }
         prefs.edit().putString(KEY, arr.toString()).apply()

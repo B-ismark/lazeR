@@ -5,7 +5,6 @@ import kotlinx.coroutines.withContext
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
-import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -32,15 +31,6 @@ class RemoteClient {
     @Volatile private var sender: ExecutorService? = null
     private val sendLock = Any()                 // serialize counter-assign + send
 
-    /** How the live session is routed. LAN = direct local; DIRECT = off-LAN via a
-     *  hole-punched path (near-local latency); RELAY = off-LAN through the
-     *  rendezvous (higher RTT). The watchdog reads this to widen its timeouts on
-     *  the slower remote paths so transient relay latency isn't seen as a drop. */
-    enum class Mode { LAN, DIRECT, RELAY }
-    @Volatile var mode: Mode = Mode.LAN
-        private set
-    val isRemote: Boolean get() = mode != Mode.LAN
-
     /**
      * Open the socket and perform the HELLO handshake.
      * @param key the 256-bit secret from the QR (base64url); blank ⇒ plaintext wire.
@@ -63,104 +53,20 @@ class RemoteClient {
             this@RemoteClient.token = token
             val rawKey = SecureChannel.keyFromBase64(key)
             channel = rawKey?.let { SecureChannel(it) }
-            mode = Mode.LAN
 
             // HELLO → (encrypted CHAL → AUTH) → OK on the secure wire; plain HELLO →
-            // OK on v1. Same handshake as the remote path, just a tighter budget.
+            // OK on v1.
             val ok = handshakeWithFallback(sock, addr, port, timeoutMs, rawKey)
             sock.soTimeout = 0
-            if (ok) sender = Executors.newSingleThreadExecutor() else close()
-            ok
-        } catch (e: Exception) {
-            close()
-            false
-        }
-    }
-
-    /**
-     * Off-LAN connect via the rendezvous coordinator (see PROTOCOL.md). Requires
-     * the secure [key] — remote access is v2-only. Tries a direct UDP hole-punch
-     * to the laptop's public endpoint first; on failure (symmetric / carrier NAT)
-     * falls back to relaying the still-encrypted packets through the rendezvous.
-     *
-     * On success the socket target is left pointed at the working path (the peer
-     * for a direct punch, the rendezvous for relay) so every later send() just
-     * works. @return true once the server's OK comes back over that path.
-     */
-    suspend fun connectRemote(
-        rdvHost: String,
-        rdvPort: Int,
-        token: String,
-        key: String,
-    ): Boolean = withContext(Dispatchers.IO) {
-        close()
-        val rawKey = SecureChannel.keyFromBase64(key) ?: return@withContext false
-        try {
-            val sock = DatagramSocket()
-            socket = sock
-            this@RemoteClient.token = token
-            channel = SecureChannel(rawKey)
-            val room = Rendezvous.roomId(rawKey)
-            val rdvAddr = InetAddress.getByName(rdvHost)
-            val reg = "REG P $room".toByteArray(Charsets.UTF_8)
-
-            // Phase A — register, learn the laptop's public endpoint (PEER reply).
-            // Bound on WALL-CLOCK time, not accumulated timeouts: otherwise a hostile
-            // rendezvous streaming non-PEER datagrams (each returns before the socket
-            // timeout) would spin this loop forever (C-F1).
-            var peer: InetSocketAddress? = null
-            val buf = ByteArray(256)
-            sock.soTimeout = 300
-            val deadline = System.currentTimeMillis() + 2500
-            var lastReg = 0L
-            while (System.currentTimeMillis() < deadline && peer == null) {
-                val nowMs = System.currentTimeMillis()
-                if (nowMs - lastReg >= 900) {           // (re)announce ~every 0.9s
-                    sock.send(DatagramPacket(reg, reg.size, rdvAddr, rdvPort))
-                    lastReg = nowMs
-                }
-                try {
-                    val p = DatagramPacket(buf, buf.size)
-                    sock.receive(p)
-                    val line = String(p.data, 0, p.length).trim()
-                    if (line.startsWith("PEER ")) {
-                        val parts = line.split(" ")
-                        val ip = parts.getOrNull(1)
-                        val pt = parts.getOrNull(2)?.toIntOrNull()
-                        if (ip != null && pt != null) peer = InetSocketAddress(ip, pt)
-                    }
-                } catch (e: SocketTimeoutException) {
-                    // no datagram this window — loop re-checks the deadline
-                }
-            }
-
-            // Phase B — direct hole-punch to the laptop's public endpoint. Give it a
-            // few seconds to overlap the laptop's ~5s punch-back before relaying.
-            peer?.let { pe ->
-                if (handshakeWithFallback(sock, pe.address, pe.port, 4000, rawKey, stepMs = 120)) {
-                    address = pe.address; port = pe.port
-                    mode = Mode.DIRECT
-                    drainStale(sock)
-                    sender = Executors.newSingleThreadExecutor()
-                    sock.soTimeout = 0
-                    return@withContext true
-                }
-            }
-
-            // Phase C — relay fallback: route encrypted packets via the rendezvous.
-            val relay = "RELAY P $room".toByteArray(Charsets.UTF_8)
-            sock.send(DatagramPacket(relay, relay.size, rdvAddr, rdvPort))
-            if (handshakeWithFallback(sock, rdvAddr, rdvPort, 3000, rawKey, stepMs = 120)) {
-                address = rdvAddr; port = rdvPort
-                mode = Mode.RELAY
+            if (ok) {
+                // The server answers OK to every retried HELLO/AUTH, so drain the
+                // duplicates before the first PING/VGET can misread one.
                 drainStale(sock)
                 sender = Executors.newSingleThreadExecutor()
-                sock.soTimeout = 0
-                return@withContext true
+            } else {
+                close()
             }
-
-            close()
-            false
+            ok
         } catch (e: Exception) {
             close()
             false
@@ -171,7 +77,7 @@ class RemoteClient {
      *  to every retried HELLO/AUTH, so several stale OKs can be waiting. Without this
      *  the first VGET/PING would read one and the watchdog would misfire a reconnect.
      *  Bounded by BOTH an idle timeout and a wall-clock deadline + packet cap, so a
-     *  hostile rendezvous flooding the socket can't trap us here (C-F2). */
+     *  flood of datagrams can't trap us here. */
     private fun drainStale(sock: DatagramSocket) {
         try {
             sock.soTimeout = 60
@@ -223,11 +129,10 @@ class RemoteClient {
      *  challenge proves freshness — a replayed HELLO/AUTH can't complete it — which
      *  is what stops a captured session being replayed by a keyless attacker.
      *
-     *  Also the hole-punch opener: each (re)send holds our NAT mapping open, so we
-     *  resend on a short [stepMs] cadence for up to [budgetMs]. If OK is lost after
-     *  AUTH (the challenge is single-use, so blind AUTH resends would stall), we drop
-     *  the nonce and re-HELLO to draw a fresh challenge. v1 (no channel) just sends a
-     *  plaintext HELLO and waits for OK. Stray rendezvous text is ignored. */
+     *  Resends on a short [stepMs] cadence for up to [budgetMs], since UDP can drop
+     *  any leg. If OK is lost after AUTH (the challenge is single-use, so blind AUTH
+     *  resends would stall), we drop the nonce and re-HELLO to draw a fresh challenge.
+     *  v1 (no channel) just sends a plaintext HELLO and waits for OK. */
     private fun doHandshake(
         sock: DatagramSocket, addr: InetAddress, port: Int, budgetMs: Long, stepMs: Int = 250,
     ): Boolean {

@@ -4,17 +4,13 @@ Phone-as-trackpad. Android (Kotlin + Jetpack Compose, **Material 3 Expressive**)
 + Python laptop server. Mouse move/click/scroll, system volume, display brightness, media
 keys, keyboard typing, clipboard paste, app-switch and browser gestures.
 
-On the **same Wi-Fi** it's direct UDP on `50505`. **Off-LAN** (mobile data or another
-network) a saved PC is reachable through a self-hosted **rendezvous coordinator** that
-hole-punches a direct path or relays when NAT blocks it — see
-[Remote access](#remote-access-off-lan) below. Secure pairing (QR) is AES-256-GCM with
-a replay-proof handshake; the coordinator never sees the key.
+Direct UDP on `50505` over the local network. Secure pairing (QR) is AES-256-GCM
+with a replay-proof handshake.
 
 ```
 android/     Jetpack Compose client
 server/      Python server (pynput + socket)
-rendezvous/  optional public coordinator for off-LAN access (stdlib-only)
-PROTOCOL.md  wire format shared by all three
+PROTOCOL.md  wire format shared by both
 ```
 
 ## How it works
@@ -121,31 +117,6 @@ no special device permissions.
 
 ---
 
-## Remote access (off-LAN)
-
-Control a saved PC from a **different network** (mobile data, another Wi-Fi), not just
-the same LAN. Requires QR pairing (a **key** — remote is v2-only) and a public
-**rendezvous coordinator** you host once.
-
-1. **Host the coordinator.** Deploy `rendezvous/rendezvous_server.py` on any always-on
-   box with a public IP + open UDP port (a free Oracle Cloud Always-Free VM works).
-   Full walkthrough in [rendezvous/deploy.md](rendezvous/deploy.md). It's stdlib-only,
-   ships a systemd unit, and is **untrusted by design** — it never sees the AES key.
-2. **Point the laptop at it.** `python remote_server.py --rendezvous <host:port>`
-   (remembered across launches; `off` to disable). This **forces secure-only**. The QR
-   then carries `&r=<host:port>` so a scanned phone learns where to reach this laptop
-   off-LAN.
-3. **Use it.** A saved phone tries the LAN first, then hole-punches a direct path
-   through the coordinator, then falls back to an encrypted relay if carrier-grade NAT
-   blocks the punch. All control stays end-to-end encrypted (v2) on every path.
-
-**Latency:** a direct punch is ~LAN-fast; the relay adds the round-trip to your
-coordinator, so host it near you (mouse feels laggy over an intercontinental relay —
-fine for clicks/typing/slides). Symmetric/carrier-grade NAT can't be punched, so those
-networks always relay.
-
----
-
 ## Security notes
 
 - **Encrypted by default (QR pairing).** Scanning the QR establishes an
@@ -155,9 +126,6 @@ networks always relay.
   handshake is **challenge-response** (`HELLO`→`CHAL`→`AUTH`), so a captured session
   can't be replayed even by a party that saw the ciphertext. See the v2 wire in
   [PROTOCOL.md](PROTOCOL.md).
-- **The rendezvous coordinator is untrusted.** It never sees the key and can't decrypt
-  or replay control — worst case it learns a public IP, refuses/redirects a connection
-  (DoS), or acts as a 1:1 relay (rate-capped). Remote access forces secure-only.
 - **Encryption is required by default.** Plaintext (v1) pairing by typed code is
   refused unless you opt in with `--allow-plaintext`, or turn **Require encryption**
   off in the GUI. QR pairing always gives the phone a key, so the safe wire is what

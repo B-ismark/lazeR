@@ -2,9 +2,6 @@
 # Match anywhere: the frozen exe writes these next to itself (e.g. dist/) too.
 .lazer_key
 .lazer_token
-# Per-install rendezvous endpoint (host:port). Machine-local config, not a secret,
-# but must never be baked into the repo — no default rendezvous is shipped.
-.lazer_rdv
 android/local.properties
 
 # --- Python ---
