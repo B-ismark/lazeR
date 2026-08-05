@@ -149,8 +149,6 @@ class ControlActions(
     val onSpecialKey: (String) -> Unit,
     val onCombo: (String) -> Unit,
     val onSystem: (String) -> Unit,
-    val onPresentation: (String) -> Unit,
-    val onPaste: (String) -> Unit,
     val onSensitivity: (Float) -> Unit,
     val onNaturalScroll: (Boolean) -> Unit,
     val onHaptics: (Boolean) -> Unit,

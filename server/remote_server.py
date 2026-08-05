@@ -75,8 +75,8 @@ CHAL_PER_IP = 8
 # (or after a panic), these are dropped; PING/VGET/HELLO/BYE still flow.
 CONTROL_VERBS = {
     "MOVE", "SCROLL", "ZOOM", "CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP",
-    "COMBO", "ASW", "SYS", "PRES", "VOL", "MEDIA", "KEY", "KEYSP",
-    "BRIGHT", "CLIP",
+    "COMBO", "ASW", "SYS", "VOL", "MEDIA", "KEY", "KEYSP",
+    "BRIGHT",
 }
 
 mouse = MouseController()
@@ -453,68 +453,6 @@ class BrightnessService:
 brightness_svc = BrightnessService(get_brightness, set_brightness, BRIGHTNESS_PANEL_KNOWN)
 
 
-# ── clipboard ───────────────────────────────────────────────────────────────
-def set_clipboard(text):
-    """Put text on the OS clipboard (no extra dependency). Returns True on success."""
-    plat = sys.platform
-    try:
-        if plat.startswith("win"):
-            import ctypes
-            from ctypes import wintypes
-            CF_UNICODETEXT = 13
-            GMEM_MOVEABLE = 0x0002
-            u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
-            # Pin signatures: without these, 64-bit HANDLEs are truncated to c_int
-            # and the lock/SetClipboardData calls silently corrupt the handle.
-            u32.OpenClipboard.argtypes = [wintypes.HWND]
-            u32.OpenClipboard.restype = wintypes.BOOL
-            k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
-            k32.GlobalAlloc.restype = wintypes.HGLOBAL
-            k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
-            k32.GlobalLock.restype = ctypes.c_void_p
-            k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
-            u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
-            u32.SetClipboardData.restype = wintypes.HANDLE
-            if not u32.OpenClipboard(None):
-                return False
-            try:
-                u32.EmptyClipboard()
-                buf = text.encode("utf-16-le") + b"\x00\x00"
-                h = k32.GlobalAlloc(GMEM_MOVEABLE, len(buf))
-                ptr = k32.GlobalLock(h)
-                if not ptr:
-                    return False
-                ctypes.memmove(ptr, buf, len(buf))
-                k32.GlobalUnlock(h)
-                # On success the system owns the memory block — don't free it.
-                return bool(u32.SetClipboardData(CF_UNICODETEXT, h))
-            finally:
-                u32.CloseClipboard()
-        import subprocess
-        if plat == "darwin":
-            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
-            return True
-        import shutil
-        for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]):
-            if shutil.which(cmd[0]):
-                subprocess.run(cmd, input=text.encode("utf-8"), check=False)
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def do_clip(text):
-    """Set the clipboard to text, then paste it (Ctrl+V / Cmd+V)."""
-    if not text or not set_clipboard(text):
-        return
-    paste_mod = Key.cmd if sys.platform == "darwin" else Key.ctrl
-    keyboard.press(paste_mod)
-    keyboard.press("v")
-    keyboard.release("v")
-    keyboard.release(paste_mod)
-
-
 MEDIA_KEYS = {
     "play_pause": Key.media_play_pause,
     "next":       Key.media_next,
@@ -538,14 +476,6 @@ MODIFIER_KEYS = {
     "shift": Key.shift,
     "win": Key.cmd, "cmd": Key.cmd, "super": Key.cmd, "meta": Key.cmd,
 }
-
-# Presentation actions -> the key they emit (works in PowerPoint / Keynote / Slides).
-PRES_KEYS = {
-    "start": Key.f5, "end": Key.esc,
-    "next": Key.right, "prev": Key.left,
-    "blank": "b",   # toggles a black screen in most presenters
-}
-
 
 def _resolve_key(name):
     """A combo's target key: a single literal char, a special, or a function key."""
@@ -653,14 +583,6 @@ def do_system(action):
         else:
             os.system("systemctl suspend 2>/dev/null")
         return
-
-
-def do_presentation(action):
-    key = PRES_KEYS.get(action)
-    if key is None:
-        return
-    keyboard.press(key)
-    keyboard.release(key)
 
 
 # ── crypto: secure wire (v2) ──────────────────────────────────────────────────
@@ -1150,9 +1072,6 @@ def handle_packet(verb, rest):
     elif verb == "SYS":
         do_system(rest.strip().lower())
 
-    elif verb == "PRES":
-        do_presentation(rest.strip().lower())
-
     elif verb == "VOL":
         if set_volume is None:
             return
@@ -1170,9 +1089,6 @@ def handle_packet(verb, rest):
         except (IndexError, ValueError):
             return
         brightness_svc.set_async(pct)   # offload the slow WMI write off the loop
-
-    elif verb == "CLIP":
-        do_clip(rest)
 
     elif verb == "MEDIA":
         key = MEDIA_KEYS.get(rest.strip())
@@ -1734,21 +1650,18 @@ _ACTION_LABELS = {
     "MUP":    lambda r: ("Drag end", "act"),
     "ZOOM":   lambda r: (f"Zoom {'in' if r.strip().lstrip('-').isdigit() and int(r) > 0 else 'out'}", "act"),
     "MEDIA":  lambda r: (f"Media · {r.strip()}", "act"),
-    # KEY and CLIP carry the user's actual keystrokes and clipboard text. Those used
-    # to be echoed into the activity feed (first 24 chars, in quotes) — on the
-    # laptop screen, which is exactly what an over-the-shoulder viewer or a screen
-    # share can see. The Advanced sheet pitches paste for "URLs, snippets,
-    # passwords", so this was printing the very thing AES-GCM is there to protect.
-    # Log the shape, never the content.
+    # KEY carries the user's actual keystrokes, which used to be echoed into the
+    # activity feed (first 24 chars, in quotes) — on the laptop screen, which is
+    # exactly what an over-the-shoulder viewer or a screen share can see. That was
+    # printing the very thing AES-GCM is there to protect. Log the shape, never the
+    # content. (CLIP carried the same risk for pasted text; the verb is gone now.)
     "KEY":    lambda r: (f"Type · {_chars(len(r))}", "act") if r else None,
     "KEYSP":  lambda r: (f"Key · {r.strip()}", "act"),
     "COMBO":  lambda r: (f"Shortcut · {r.strip()}", "act"),
     "ASW":    lambda r: (f"Switch app · {r.strip()}", "act"),
     "SYS":    lambda r: (f"System · {r.strip()}", "act"),
-    "PRES":   lambda r: (f"Slides · {r.strip()}", "act"),
     "VOL":    lambda r: (f"Volume → {r.strip()}%", "act"),
     "BRIGHT": lambda r: (f"Brightness → {r.strip()}%", "act"),
-    "CLIP":   lambda r: (f"Paste · {_chars(len(r))}", "act") if r else None,
 }
 
 

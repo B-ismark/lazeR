@@ -34,14 +34,12 @@ Every datagram is a single packet. No framing beyond the datagram boundary.
 | `<TOKEN> VGET`                | Ask server for current system volume.                | `VOL <0-100>`      |
 | `<TOKEN> BRIGHT <0-100>`      | Set display brightness to absolute percent.          | none               |
 | `<TOKEN> BGET`                | Ask server for current display brightness.           | `BRI <0-100>`      |
-| `<TOKEN> CLIP <text>`         | Set laptop clipboard to `text`, then paste (Ctrl+V). | none               |
 | `<TOKEN> MEDIA <action>`      | `play_pause` \| `next` \| `prev`.                    | none               |
 | `<TOKEN> KEY <text>`          | Type the literal UTF-8 text (spaces preserved).      | none               |
 | `<TOKEN> KEYSP <name>`        | Press one special key (see below).                   | none               |
 | `<TOKEN> COMBO <mods..> <key>`| Hold modifiers, tap key. e.g. `ctrl c`, `alt tab`.   | none               |
 | `<TOKEN> ASW <action>`        | App-switch session: `next`\|`prev`\|`end`.           | none               |
 | `<TOKEN> SYS <action>`        | `lock` \| `sleep` \| `mute`.                         | none               |
-| `<TOKEN> PRES <action>`       | Slides: `start`\|`end`\|`next`\|`prev`\|`blank`.     | none               |
 | `<TOKEN> BYE`                 | Client disconnects; server forgets it.               | none               |
 
 `KEYSP <name>` names: `enter`, `backspace`, `space`, `tab`, `esc`, `delete`,

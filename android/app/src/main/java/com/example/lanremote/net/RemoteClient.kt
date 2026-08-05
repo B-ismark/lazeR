@@ -209,14 +209,12 @@ class RemoteClient {
     fun mouseUp() = send("MUP")                            // drag-lock release
     fun setVolume(percent: Int) = send("VOL ${percent.coerceIn(0, 100)}")
     fun setBrightness(percent: Int) = send("BRIGHT ${percent.coerceIn(0, 100)}")
-    fun clipboardPaste(text: String) = send("CLIP $text")  // set laptop clipboard + paste
     fun media(action: String) = send("MEDIA $action")     // play_pause | next | prev
     fun key(text: String) = send("KEY $text")              // literal text, spaces ok
     fun keySpecial(name: String) = send("KEYSP $name")     // enter | backspace | ...
     fun combo(spec: String) = send("COMBO $spec")          // "ctrl c", "alt tab", ...
     fun appSwitch(dir: String) = send("ASW $dir")          // next | prev | end (Alt-Tab session)
     fun system(action: String) = send("SYS $action")       // lock | sleep | mute
-    fun presentation(action: String) = send("PRES $action") // start|end|next|prev|blank
 
     /**
      * Send a request, then wait up to [timeoutMs] for a reply whose first token is

@@ -206,7 +206,7 @@ class SecureChannelTest {
         // A fresh channel with the same key stands in for the server's Wire: if
         // seal's nonce/AAD construction ever drifts from what open expects, or the
         // payload isn't handled as UTF-8, these break.
-        for (body in listOf("OK", "VOL 42", "KEY hello  world", "CLIP naïve 🙂",
+        for (body in listOf("OK", "VOL 42", "KEY hello  world", "KEY naïve 🙂",
                             "COMBO ctrl shift t")) {
             val sender = SecureChannel(KEY)
             val receiver = SecureChannel(KEY)
