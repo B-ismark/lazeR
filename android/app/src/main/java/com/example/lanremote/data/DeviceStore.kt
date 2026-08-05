@@ -193,17 +193,21 @@ private object SecretBox {
         null
     }
 
-    fun open(blob: String): String? = try {
-        val raw = Base64.decode(blob, Base64.NO_WRAP)
-        if (raw.size <= IV_BYTES) return null
-        val cipher = Cipher.getInstance(TRANSFORM)
-        cipher.init(
-            Cipher.DECRYPT_MODE, secretKey(),
-            GCMParameterSpec(TAG_BITS, raw, 0, IV_BYTES),
-        )
-        String(cipher.doFinal(raw, IV_BYTES, raw.size - IV_BYTES), Charsets.UTF_8)
-    } catch (e: Exception) {
-        null
+    // Block body, not an expression body: the length guard below needs an early
+    // `return`, which Kotlin forbids inside `= try { ... }`.
+    fun open(blob: String): String? {
+        return try {
+            val raw = Base64.decode(blob, Base64.NO_WRAP)
+            if (raw.size <= IV_BYTES) return null
+            val cipher = Cipher.getInstance(TRANSFORM)
+            cipher.init(
+                Cipher.DECRYPT_MODE, secretKey(),
+                GCMParameterSpec(TAG_BITS, raw, 0, IV_BYTES),
+            )
+            String(cipher.doFinal(raw, IV_BYTES, raw.size - IV_BYTES), Charsets.UTF_8)
+        } catch (e: Exception) {
+            null
+        }
     }
 
     /** The existing Keystore key, or a freshly generated one. */

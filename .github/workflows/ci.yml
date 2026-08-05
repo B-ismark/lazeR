@@ -58,9 +58,13 @@ jobs:
 
       # Debug only: assembleRelease signs with the local ~/.android/debug.keystore
       # "sideload" config, which doesn't exist on a runner.
+      # No --stacktrace: on a Kotlin compile error it buries the actual
+      # "e: file://... error: ..." lines under ~120 lines of Gradle internals, which
+      # makes the log unreadable from an API tail. Compile errors and test failures
+      # both print clearly without it.
       - name: Unit tests
         working-directory: android
-        run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
+        run: ./gradlew :app:testDebugUnitTest --no-daemon
 
       - name: Debug build
         working-directory: android
