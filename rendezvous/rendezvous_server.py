@@ -58,7 +58,13 @@ import sys
 import time
 
 DEFAULT_PORT = 50510
+# Secure-wire magics. Anything opening with one of these is relay DATA, not
+# control. L3 is the current dialect (sid(8)|counter(4)); L2 is the legacy one,
+# still accepted for one release. Both must be listed here or relayed traffic
+# from an updated phone would be misread as a control line and dropped.
 V2_MAGIC = b"L2"
+V3_MAGIC = b"L3"
+DATA_MAGICS = (V2_MAGIC, V3_MAGIC)
 
 # Lifetimes / limits. A laptop re-REGs every ~20s, so 90s of slack survives a
 # missed beat; any traffic (data too) refreshes the entry, so live sessions never
@@ -168,7 +174,7 @@ class Rendezvous:
             if not data or not self._allow_global(time.monotonic()) or not self._allow(addr):
                 continue
             self._maybe_sweep()
-            if data[:2] == V2_MAGIC:
+            if data[:2] in DATA_MAGICS:
                 self._forward(data, addr)          # relayed encrypted payload
             elif len(data) <= MAX_LINE:
                 self._control(data, addr)          # REG / RELAY / BYE

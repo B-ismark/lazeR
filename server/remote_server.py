@@ -677,7 +677,34 @@ def do_presentation(action):
 # The 256-bit key is shipped in the QR (and auto-discovery never carries it). A valid
 # GCM tag *is* the authentication (proves key possession) — no token on the wire —
 # and the monotonic counter gives replay protection. Sniffing/forgery/replay all fail.
+# Two wire dialects, differing ONLY in how the 12-byte GCM nonce is split. The
+# header is 14 bytes either way (magic 2 + nonce 12), so nothing else about framing
+# changes:
+#   L2 (legacy)  sid(4) | counter(8)   — 32-bit session space
+#   L3 (current) sid(8) | counter(4)   — 64-bit session space
+#
+# Why: the key is PERSISTENT across launches while the sid is random per session, so
+# a sid collision means GCM nonce reuse under the same key — which leaks the
+# authentication key, not just a plaintext. A 4-byte sid puts that at the birthday
+# bound of 2^32: ~1.2% odds by 10k sessions, ~39% by 65k. Every reconnect mints a
+# session and the watchdog reconnects on any drop, so those numbers are reachable
+# over a phone's lifetime. Moving four bytes from the counter to the sid buys 2^64
+# at zero real cost: a 4-byte counter still allows 4.29e9 packets in one session.
+#
+# L2 is accepted for one release so a phone that hasn't been updated keeps working;
+# it is scheduled for removal the release after v2.0. Do not add a third dialect
+# without also updating the golden vectors in server/tests/test_wire.py AND
+# android/.../SecureChannelTest.kt — they are what stop the two implementations
+# drifting apart.
 MAGIC_V2 = b"L2"
+MAGIC_V3 = b"L3"
+WIRE_FORMATS = {MAGIC_V2: (4, 8), MAGIC_V3: (8, 4)}   # magic -> (sid_len, ctr_len)
+
+
+def is_secure_magic(data):
+    """True if [data] opens with a known secure-wire magic (so it is v2/v3 data and
+    not a plaintext control line)."""
+    return data[:2] in WIRE_FORMATS
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     _HAVE_CRYPTO = True
@@ -734,7 +761,8 @@ def rotate_secrets(wire):
     wire.token = token
     wire.key = key
     wire.aes = AESGCM(key) if (key and _HAVE_CRYPTO) else None
-    wire.cli_sid, wire.cli_ctr, wire.secure_client = None, -1, False
+    wire.cli_magic, wire.cli_sid, wire.cli_ctr = None, None, -1
+    wire.secure_client = False
     return token, key
 
 
@@ -746,9 +774,13 @@ class Wire:
         self.key = key
         self.require_secure = require_secure
         self.aes = AESGCM(key) if (key and _HAVE_CRYPTO) else None
-        self.srv_sid = secrets.token_bytes(4)
+        # Which dialect we're speaking. Default to the current one; a client that
+        # opens with L2 flips us to L2 for that session so replies stay parseable.
+        self.wire_magic = MAGIC_V3
+        self.srv_sid = secrets.token_bytes(WIRE_FORMATS[MAGIC_V3][0])
         self.srv_ctr = 0
         # pinned client's secure session (set when a HELLO is authenticated via AUTH)
+        self.cli_magic = None
         self.cli_sid = None
         self.cli_ctr = -1
         self.secure_client = False
@@ -765,9 +797,14 @@ class Wire:
         other secure verb must come FROM the pinned client, carry the pinned sid, and a
         strictly-greater counter — and the counter watermark advances ONLY for such
         packets, so a tag-valid replay from a stranger can't desync the real client."""
-        if data[:2] == MAGIC_V2 and self.aes is not None and len(data) >= 14 + 16:
-            sid = data[2:6]
-            ctr = int.from_bytes(data[6:14], "big")
+        fmt = WIRE_FORMATS.get(data[:2])
+        if fmt is not None and self.aes is not None and len(data) >= 14 + 16:
+            magic = data[:2]
+            sid_len = fmt[0]
+            # The nonce is the 12 bytes after the magic either way; only the point at
+            # which it stops being a session id and starts being a counter moves.
+            sid = data[2:2 + sid_len]
+            ctr = int.from_bytes(data[2 + sid_len:14], "big")
             try:
                 pt = self.aes.decrypt(data[2:14], data[14:], data[0:14])
             except Exception:
@@ -775,9 +812,13 @@ class Wire:
             text = pt.decode("utf-8", "ignore")
             verb, rest = _split_verb(text)
             if verb in ("HELLO", "AUTH"):
-                self._pending = (sid, ctr)      # commit_hello pins the AUTH's session
+                # Answer in whatever dialect the client used, or it can't read the
+                # CHAL and the handshake dead-ends.
+                self.wire_magic = magic
+                self._pending = (magic, sid, ctr)  # commit_hello pins the AUTH session
                 return verb, rest, True
-            if addr != client or sid != self.cli_sid or ctr <= self.cli_ctr:
+            if (addr != client or magic != self.cli_magic
+                    or sid != self.cli_sid or ctr <= self.cli_ctr):
                 return None                     # not the pinned client / replay / reorder
             self.cli_ctr = ctr
             return verb, rest, True
@@ -868,18 +909,29 @@ class Wire:
             self._chal.pop(a, None)
 
     def commit_hello(self, secure):
-        """Pin the just-authenticated session (the AUTH packet's sid/ctr) as controller."""
+        """Pin the just-authenticated session (the AUTH packet's dialect/sid/ctr)."""
         self.secure_client = secure
         if secure and self._pending is not None:
-            self.cli_sid, self.cli_ctr = self._pending
+            self.cli_magic, self.cli_sid, self.cli_ctr = self._pending
+            self.wire_magic = self.cli_magic
         else:
-            self.cli_sid, self.cli_ctr = None, -1
+            self.cli_magic, self.cli_sid, self.cli_ctr = None, None, -1
 
     def _seal_reply(self, sock, addr, text):
-        """Encrypt+send a reply under the server's own sid/counter (v2)."""
+        """Encrypt+send a reply under the server's own sid/counter, in the dialect
+        the client is speaking."""
+        magic = self.wire_magic
+        sid_len, ctr_len = WIRE_FORMATS[magic]
+        # Switching dialect (or exhausting a narrower counter) needs a fresh session
+        # id: reusing one while restarting the counter would repeat a nonce under a
+        # key that outlives the session, which is the failure this whole change is
+        # about avoiding.
+        if len(self.srv_sid) != sid_len or self.srv_ctr >= (1 << (8 * ctr_len)) - 1:
+            self.srv_sid = secrets.token_bytes(sid_len)
+            self.srv_ctr = 0
         self.srv_ctr += 1
-        nonce = self.srv_sid + self.srv_ctr.to_bytes(8, "big")
-        hdr = MAGIC_V2 + nonce
+        nonce = self.srv_sid + self.srv_ctr.to_bytes(ctr_len, "big")
+        hdr = magic + nonce
         ct = self.aes.encrypt(nonce, text.encode("utf-8"), hdr)
         sock.sendto(hdr + ct, addr)
 
@@ -1922,7 +1974,7 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
         # never v2 data, so route it to the manager and skip auth. Relayed v2 data
         # from the rendezvous (starts with the L2 magic) falls through to wire.parse
         # like any other packet — it just pins the rendezvous as the client addr.
-        if rdv is not None and rdv.is_rdv(addr) and data[:2] != MAGIC_V2:
+        if rdv is not None and rdv.is_rdv(addr) and not is_secure_magic(data):
             rdv.handle_control(data, sock)
             continue
 

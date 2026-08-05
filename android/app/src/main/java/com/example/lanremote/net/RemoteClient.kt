@@ -61,12 +61,13 @@ class RemoteClient {
             address = addr
             this@RemoteClient.port = port
             this@RemoteClient.token = token
-            channel = SecureChannel.keyFromBase64(key)?.let { SecureChannel(it) }
+            val rawKey = SecureChannel.keyFromBase64(key)
+            channel = rawKey?.let { SecureChannel(it) }
             mode = Mode.LAN
 
             // HELLO → (encrypted CHAL → AUTH) → OK on the secure wire; plain HELLO →
             // OK on v1. Same handshake as the remote path, just a tighter budget.
-            val ok = doHandshake(sock, addr, port, timeoutMs)
+            val ok = handshakeWithFallback(sock, addr, port, timeoutMs, rawKey)
             sock.soTimeout = 0
             if (ok) sender = Executors.newSingleThreadExecutor() else close()
             ok
@@ -136,7 +137,7 @@ class RemoteClient {
             // Phase B — direct hole-punch to the laptop's public endpoint. Give it a
             // few seconds to overlap the laptop's ~5s punch-back before relaying.
             peer?.let { pe ->
-                if (doHandshake(sock, pe.address, pe.port, 4000, stepMs = 120)) {
+                if (handshakeWithFallback(sock, pe.address, pe.port, 4000, rawKey, stepMs = 120)) {
                     address = pe.address; port = pe.port
                     mode = Mode.DIRECT
                     drainStale(sock)
@@ -149,7 +150,7 @@ class RemoteClient {
             // Phase C — relay fallback: route encrypted packets via the rendezvous.
             val relay = "RELAY P $room".toByteArray(Charsets.UTF_8)
             sock.send(DatagramPacket(relay, relay.size, rdvAddr, rdvPort))
-            if (doHandshake(sock, rdvAddr, rdvPort, 3000, stepMs = 120)) {
+            if (handshakeWithFallback(sock, rdvAddr, rdvPort, 3000, rawKey, stepMs = 120)) {
                 address = rdvAddr; port = rdvPort
                 mode = Mode.RELAY
                 drainStale(sock)
@@ -187,6 +188,34 @@ class RemoteClient {
         } catch (e: Exception) {
             // best effort
         }
+    }
+
+    /**
+     * Handshake, retrying once on the legacy L2 dialect if L3 draws no reply.
+     *
+     * A server that predates L3 doesn't recognise the magic, so it treats our
+     * packets as junk and answers nothing — indistinguishable from an unreachable
+     * host. Since the APK and the .exe ship together but are installed separately,
+     * a phone updated ahead of its laptop would otherwise just fail to pair.
+     *
+     * The budget is SPLIT rather than doubled, so a genuinely dead host still fails
+     * in the caller's expected time — that matters because connectResolving() walks
+     * every mDNS-discovered host in turn. L3 gets two thirds (still several resends
+     * at the 250ms cadence), L2 the rest. Plaintext v1 has no dialect, so it skips
+     * the retry entirely.
+     */
+    private fun handshakeWithFallback(
+        sock: DatagramSocket, addr: InetAddress, port: Int, budgetMs: Long,
+        rawKey: ByteArray?, stepMs: Int = 250,
+    ): Boolean {
+        // Always (re)start on the current dialect, so a previous call that ended on
+        // the legacy fallback doesn't leave us silently downgraded.
+        if (rawKey != null) channel = SecureChannel(rawKey)
+        val first = if (rawKey == null) budgetMs else budgetMs * 2 / 3
+        if (doHandshake(sock, addr, port, first, stepMs)) return true
+        if (rawKey == null) return false          // v1: nothing to fall back to
+        channel = SecureChannel(rawKey, legacy = true)
+        return doHandshake(sock, addr, port, budgetMs - first, stepMs)
     }
 
     /** Handshake to (addr,port) until the server pins us: send HELLO, answer the

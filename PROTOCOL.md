@@ -73,20 +73,44 @@ mid-gesture can't leave `Alt` stuck. Maps to the Windows three-finger touchpad s
 
 Two datagram encodings coexist; the server auto-detects per packet.
 
-### v2 — secure (default for QR pairing)
+### v2/v3 — secure (default for QR pairing)
 
 ```
-packet = "L2" (2) | sid (4) | counter (8, big-endian) | AES-256-GCM(ciphertext+tag)
-nonce  = sid | counter                 (12 bytes)
-AAD    = "L2" | sid | counter          (the packet's first 14 bytes)
+packet = MAGIC (2) | nonce (12) | AES-256-GCM(ciphertext+tag)
+AAD    = the packet's first 14 bytes
 plaintext = "<VERB> [args]"            (the v1 line minus the token)
 ```
 
+Two dialects differ **only** in how the 12-byte nonce is split. The header is 14
+bytes either way, so framing, AAD and every other rule below are identical:
+
+| Magic | nonce split              | session space | status |
+|-------|--------------------------|---------------|--------|
+| `L3`  | `sid(8)` \| `counter(4)` | 2^64          | **current** |
+| `L2`  | `sid(4)` \| `counter(8)` | 2^32          | legacy — accepted for one release, removed after v2.0 |
+
+**Why the split moved.** The key is *persistent* across launches while the `sid` is
+random per session, so a `sid` collision means GCM nonce reuse under one key — which
+leaks the authentication key, not merely a plaintext. A 4-byte `sid` put that at the
+birthday bound of 2^32: roughly 1.2% odds by 10 000 sessions and 39% by 65 000. Every
+reconnect mints a session and the phone's watchdog reconnects on any drop, so those
+counts are reachable over a device's lifetime. Moving four bytes from the counter to
+the `sid` buys 2^64 at no practical cost — a 4-byte counter still allows 4.29e9
+packets in a single session, and exhausting it re-keys the `sid` rather than wrapping.
+
+**Compatibility.** The server accepts both and **replies in whichever dialect the
+client opened with** (otherwise the phone couldn't read its own `CHAL`). The client
+sends `L3` and, if that draws no reply, retries once on `L2` — so a phone updated
+ahead of its laptop still pairs. There is no flag day in either direction.
+
 - The 256-bit key is shared **only** via the QR (`&k=` below); never on the wire,
   never over mDNS. A valid GCM tag *is* the authentication — it proves the sender
-  holds the key, so no token rides v2 packets.
-- `sid` is a random 4-byte per-session id the client picks at connect; `counter`
-  is a per-session monotonic uint64 (first `HELLO` = 1, then +1 per send).
+  holds the key, so no token rides secure packets.
+- `sid` is a random per-session id the client picks at connect (8 bytes on `L3`,
+  4 on `L2`); `counter` is a per-session monotonic integer filling the rest of the
+  nonce (first `HELLO` = 1, then +1 per send).
+- A session is identified by **dialect + sid** together, so a packet that switches
+  dialect mid-session is refused like any other unpinned session.
 - **Handshake (challenge-response, v2).** A valid GCM tag proves key possession but
   NOT freshness, so a captured `HELLO`+control stream could otherwise be replayed by
   anyone who lacks the key (e.g. the untrusted rendezvous, which sees all relayed
@@ -200,8 +224,8 @@ All control is UTF-8 text lines; relayed data is raw v2 datagrams.
 | `PEER <ip> <port>`         | The other role's public endpoint.                   |
 | `RELAY OK`                 | Relay is active for your room.                       |
 
-Any datagram whose first two bytes are `L2` (the v2 magic) is treated as **relay
-data**, not control: the rdv looks the sender up by address and forwards the bytes
+Any datagram whose first two bytes are a secure-wire magic (`L2` or `L3`) is treated
+as **relay data**, not control: the rdv looks the sender up by address and forwards the bytes
 verbatim to the other role's endpoint in the same room. The data path **never
 amplifies** (out size = in size) and forwards only between two endpoints registered
 under the same room; a 128-bit `room` is the bearer. Registration is trusted by
