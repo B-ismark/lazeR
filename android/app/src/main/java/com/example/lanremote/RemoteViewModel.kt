@@ -585,7 +585,6 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun browserNav(forward: Boolean) = client.combo(if (forward) "alt right" else "alt left")
 
     fun system(action: String) = client.system(action)
-    fun presentation(action: String) = client.presentation(action)
 
     // --- volume ---
     fun setVolume(v: Float) {
@@ -607,11 +606,6 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
     fun nudgeBrightness(delta: Float) =
         setBrightness((_state.value.brightness + delta).coerceIn(0f, 100f))
-
-    // --- clipboard ---
-    fun pasteText(text: String) {
-        if (text.isNotEmpty()) client.clipboardPaste(text)
-    }
 
     // --- media ---
     fun media(action: String) { touch(); client.media(action) }

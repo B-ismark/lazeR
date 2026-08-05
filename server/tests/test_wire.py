@@ -841,9 +841,9 @@ class AdvertisedAddress(unittest.TestCase):
 
 
 class ActivityFeedPrivacy(unittest.TestCase):
-    """The activity feed is rendered on the laptop screen. Echoing keystrokes and
-    clipboard text there defeats the point of encrypting them on the wire — a
-    shoulder-surfer or a screen share reads them straight off the window."""
+    """The activity feed is rendered on the laptop screen. Echoing keystrokes there
+    defeats the point of encrypting them on the wire — a shoulder-surfer or a screen
+    share reads them straight off the window."""
 
     SECRETS = ["hunter2", "correct horse battery staple",
                "https://example.com/reset?token=abc123", "sk-live-0123456789"]
@@ -857,16 +857,57 @@ class ActivityFeedPrivacy(unittest.TestCase):
             self.assertNotIn(s[:8], text)
             self.assertIn(str(len(s)), text)      # shape is still reported
 
-    def test_pasted_text_is_never_echoed(self):
-        label = rs._ACTION_LABELS["CLIP"]
-        for s in self.SECRETS:
-            text = label(s)[0]
-            self.assertNotIn(s, text)
-            self.assertNotIn(s[:8], text)
-
     def test_empty_payloads_log_nothing(self):
         self.assertIsNone(rs._ACTION_LABELS["KEY"](""))
-        self.assertIsNone(rs._ACTION_LABELS["CLIP"](""))
+
+    # Verbs whose payload is arbitrary text the USER typed or pasted. These are the
+    # only ones where echoing the payload leaks something the wire encryption was
+    # protecting. Every other verb carries a bounded enum (MEDIA play_pause, SYS
+    # lock, KEYSP enter) or a number, which is safe to show and useful to see — the
+    # feed would be worthless if it hid those too.
+    #
+    # ADD TO THIS SET when a new verb carries free text. CLIP used to be here and
+    # was the second offender found; it has since been removed along with PRES.
+    FREE_TEXT_VERBS = {"KEY"}
+
+    def test_free_text_verbs_never_echo_their_payload(self):
+        for verb in self.FREE_TEXT_VERBS:
+            label = rs._ACTION_LABELS[verb]
+            for s in self.SECRETS:
+                text = label(s)[0]
+                self.assertNotIn(s, text, f"{verb} echoed a full payload")
+                self.assertNotIn(s[:8], text, f"{verb} echoed a payload prefix")
+
+    def test_the_free_text_set_still_matches_the_verbs_that_take_text(self):
+        # Guards the SET above, not the labels: if a verb starts carrying user text
+        # and isn't listed, the test above silently stops covering it. KEY is the
+        # only free-text verb left, so anything new in _ACTION_LABELS is a prompt to
+        # classify it deliberately rather than by omission.
+        known = {"CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP", "ZOOM", "MEDIA",
+                 "KEY", "KEYSP", "COMBO", "ASW", "SYS", "VOL", "BRIGHT"}
+        self.assertEqual(set(rs._ACTION_LABELS), known,
+                         "a verb was added/removed in _ACTION_LABELS — decide "
+                         "whether its payload is free text and update "
+                         "FREE_TEXT_VERBS accordingly")
+
+    def test_removed_verbs_are_gone_from_every_table(self):
+        # PRES (slides) and CLIP (paste-text-to-laptop) were removed with their UI.
+        # Half a removal is how the "complete but unreachable" PRES verb survived
+        # from the first commit: server-side support with no caller. If either comes
+        # back it must come back everywhere, including a UI entry point.
+        for verb in ("PRES", "CLIP"):
+            self.assertNotIn(verb, rs.CONTROL_VERBS, f"{verb} still gated as control")
+            self.assertNotIn(verb, rs._ACTION_LABELS, f"{verb} still has a feed label")
+        self.assertFalse(hasattr(rs, "do_presentation"))
+        self.assertFalse(hasattr(rs, "PRES_KEYS"))
+        self.assertFalse(hasattr(rs, "do_clip"))
+        self.assertFalse(hasattr(rs, "set_clipboard"))
+
+    def test_a_removed_verb_is_ignored_without_killing_the_loop(self):
+        # An un-updated phone will keep sending these. The dispatch guard must treat
+        # them as unknown-and-harmless, not raise on the one receive thread.
+        for verb in ("PRES", "CLIP"):
+            rs.handle_packet(verb, "next")     # must not raise
 
     def test_singular_plural_reads_naturally(self):
         self.assertEqual(rs._chars(1), "1 char")
