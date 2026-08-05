@@ -953,24 +953,43 @@ class LocalInputGuard:
 
 
 # ── packet handler ────────────────────────────────────────────────────────────
+# Bounds on motion arguments. A real gesture is a few hundred px at most, so these
+# sit far above anything the client sends — they exist because the values go
+# straight into ctypes/OS calls: an out-of-range magnitude (a bigint from a buggy
+# or hostile client) raises out of pynput, and before serve_loop guarded the
+# dispatch that killed the one receive thread outright. Clamping keeps the OS layer
+# in its comfort zone; the guard is the backstop.
+MOVE_MAX_PX = 20_000
+SCROLL_MAX_STEPS = 1_000
+ZOOM_MAX_STEPS = 100
+
+
+def _clamp_int(tok, limit):
+    """Parse a signed int argument and clamp it to ±[limit]. Raises ValueError on
+    junk so the caller can drop the packet."""
+    return max(-limit, min(limit, int(tok)))
+
+
 def handle_packet(verb, rest, sock, addr):
     if verb == "MOVE":
         try:
-            dx, dy = (int(x) for x in rest.split())
-        except ValueError:
+            a, b = rest.split()
+            dx, dy = _clamp_int(a, MOVE_MAX_PX), _clamp_int(b, MOVE_MAX_PX)
+        except ValueError:        # wrong arity or non-numeric
             return
         mouse.move(dx, dy)
 
     elif verb == "SCROLL":
         try:
-            dx, dy = (int(x) for x in rest.split())
+            a, b = rest.split()
+            dx, dy = _clamp_int(a, SCROLL_MAX_STEPS), _clamp_int(b, SCROLL_MAX_STEPS)
         except ValueError:
             return
         mouse.scroll(dx, dy)
 
     elif verb == "ZOOM":          # pinch → ctrl+wheel (zoom in/out in most apps)
         try:
-            steps = int(rest.split()[0])
+            steps = _clamp_int(rest.split()[0], ZOOM_MAX_STEPS)
         except (IndexError, ValueError):
             return
         keyboard.press(Key.ctrl)
@@ -1058,15 +1077,92 @@ def handle_packet(verb, rest, sock, addr):
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-def lan_ip():
+# Interface-name fragments that mark an adapter a phone can NEVER reach us on:
+# hypervisor/container bridges, tunnels and VPN adapters. A dev laptop routinely
+# has several, and any of them can end up owning the default route.
+_VIRTUAL_IF_NEEDLES = (
+    "vethernet", "hyper-v", "vmware", "virtualbox", "vbox", "docker", "wsl",
+    "loopback", "teredo", "isatap", "tailscale", "zerotier", "utun", "tap-",
+    "tun", "wintun", "vpn", "forti", "wireguard", "openvpn", "zscaler",
+    "globalprotect", "anyconnect", "nordlynx", "expressvpn", "pangp", "bridge",
+)
+# ...and fragments suggesting the Wi-Fi NIC, where a phone most likely shares our
+# subnet. Only used to rank, never to exclude.
+_WIFI_IF_NEEDLES = ("wi-fi", "wifi", "wlan", "wlp", "wlo", "en0", "airport")
+
+
+def _default_route_ip():
+    """The address owning the default route — what we have always advertised."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("8.8.8.8", 80))
+        s.connect(("8.8.8.8", 80))     # no packet is sent; this just picks a route
         return s.getsockname()[0]
     except Exception:
-        return "127.0.0.1"
+        return None
     finally:
         s.close()
+
+
+def candidate_ips():
+    """Private IPv4 addresses a phone could plausibly reach us on, best first.
+
+    Virtual/tunnel adapters are EXCLUDED, not merely deprioritised — the whole
+    point is to answer "is this address one a phone could use?", and an address
+    that only sorts last still answers yes. Wi-Fi ranks above wired because that
+    is where a phone most often shares our subnet.
+
+    Needs psutil. An empty list (no psutil, or nothing but virtual adapters) just
+    means the caller falls back to the default-route probe — i.e. the old
+    behaviour, never anything worse."""
+    try:
+        import psutil
+        addrs, stats = psutil.net_if_addrs(), psutil.net_if_stats()
+    except Exception:
+        return []
+    out = []
+    for name, entries in addrs.items():
+        st = stats.get(name)
+        if st is not None and not getattr(st, "isup", False):
+            continue                    # down / unplugged
+        low = name.lower()
+        if any(n in low for n in _VIRTUAL_IF_NEEDLES):
+            continue                    # a phone can never reach us here
+        rank_wifi = not any(n in low for n in _WIFI_IF_NEEDLES)
+        for e in entries:
+            if getattr(e, "family", None) != socket.AF_INET:
+                continue
+            try:
+                a = ipaddress.ip_address(e.address)
+            except ValueError:
+                continue
+            # Private LAN space only: a public or link-local address is never the
+            # one a phone on the same Wi-Fi is talking to.
+            if not a.is_private or a.is_loopback or a.is_link_local:
+                continue
+            out.append(((rank_wifi, e.address), e.address, name))
+    out.sort(key=lambda t: t[0])
+    return [(ip, name) for _, ip, name in out]
+
+
+def lan_ip():
+    """The address to put in the QR and the mDNS advertisement.
+
+    The default-route probe alone is wrong more often than it looks: WSL2,
+    Hyper-V, Docker, VirtualBox and VPN adapters all install virtual interfaces
+    that can own the default route, and when one does we advertise an address no
+    phone can reach — while the server still looks perfectly healthy, because
+    loopback and the GUI do not care which NIC it is. The phone just times out.
+
+    So the probe stays authoritative WHENEVER it names a real LAN interface (no
+    behaviour change on an ordinary machine); we override it only when it points
+    somewhere a phone provably cannot follow."""
+    probe = _default_route_ip()
+    cands = candidate_ips()
+    if probe and any(ip == probe for ip, _ in cands):
+        return probe
+    if cands:
+        return cands[0][0]
+    return probe or "127.0.0.1"
 
 
 def open_socket():
@@ -1651,6 +1747,10 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
     bad = 0
     bad_win = last_tick
     warned = False
+    # Per-window "already reported" sets, so a repeating condition warns once
+    # instead of flooding the activity feed. Both clear with the rate window.
+    handler_errors = set()   # verbs whose handler raised
+    blocked_seen = set()     # addresses turned away while a phone is already paired
     _client_connected.clear()
 
     def drop_client(reason=None):
@@ -1736,6 +1836,8 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
 
         if now - bad_win > RATE_WINDOW_S:
             bad, bad_win, warned = 0, now, False
+            handler_errors.clear()
+            blocked_seen.clear()
             wire.sweep_challenges(mono)   # drop expired, unanswered HELLO challenges
 
         # Local takeover auto-resume: once physical input has been quiet for the
@@ -1833,6 +1935,17 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
             continue
 
         if addr != client:
+            # Authenticated but not from the pinned phone. Reachable on the v1
+            # plaintext wire, where a token match is the only gate — so this is a
+            # second phone (or someone who learned the code) trying to take over a
+            # live session. The GUI and terminal have always had a handler for this
+            # event, but nothing ever emitted it, so the attempt was invisible.
+            # On the v2 wire the same attempt is rejected inside wire.parse (wrong
+            # source for the pinned sid) and lands in the `bad` counter instead,
+            # which is what raises the brute-force/flood warning.
+            if client is not None and addr not in blocked_seen:
+                blocked_seen.add(addr)
+                emit("blocked", f"{addr[0]}:{addr[1]}")
             continue
         last_pkt = now   # pinned phone is alive — keep the idle timer fed
 
@@ -1854,8 +1967,20 @@ def serve_loop(wire, emit, net, hostname, rdv=None):
         if verb in CONTROL_VERBS and (_remote_paused.is_set() or _panic_latched.is_set()):
             continue
 
-        emit("action", verb, rest)
-        handle_packet(verb, rest, sock, addr)
+        # A verb handler — or an activity-log label, which the GUI emitter
+        # evaluates inline on THIS thread — must never take the receive loop down
+        # with it. This is the single thread serving every phone: an unhandled
+        # raise here left the server permanently deaf, window still green and
+        # "server running" still lit, every packet ignored until a manual restart.
+        # The GUI's event poll already guards itself for exactly this reason.
+        try:
+            emit("action", verb, rest)
+            handle_packet(verb, rest, sock, addr)
+        except Exception as e:
+            if verb not in handler_errors:
+                handler_errors.add(verb)
+                emit("warn", f"{verb} failed and was ignored "
+                             f"({type(e).__name__}: {e})")
 
     try:
         sock.close()
@@ -2419,6 +2544,14 @@ class LazeRWindow:
         row("Port", str(port))
         self._fullcode_value = row("Full code", token)
 
+        # More than one LAN address (Wi-Fi + Ethernet, or a virtual adapter) means
+        # we had to CHOOSE which to advertise, and choosing wrong is the classic
+        # invisible "phone times out but the server looks fine" failure. Show the
+        # alternates so it is diagnosable instead of a mystery.
+        others = [a for a, _ in candidate_ips() if a != ip]
+        if others:
+            row("Also at", ", ".join(others[:3]))
+
         tk.Frame(pad, bg=_C["border"], height=1).pack(fill="x", pady=(14, 12))
 
         vol_ok = VOLUME_BACKEND is not None
@@ -2863,6 +2996,13 @@ def main():
             print("[remote] forcing secure-only (encryption required) — remote access is v2-only.")
         require_secure = True
     ip = lan_ip()
+    # Say so loudly when the default route is NOT the address we advertise: it means
+    # a virtual/VPN adapter owns the route, which used to silently put an
+    # unreachable IP in the QR.
+    _probe = _default_route_ip()
+    if _probe and _probe != ip:
+        print(f"[network] default route is {_probe}, which phones cannot reach "
+              f"(virtual/VPN adapter) — advertising {ip} instead.")
     hostname = socket.gethostname()
 
     if not args.no_gui:

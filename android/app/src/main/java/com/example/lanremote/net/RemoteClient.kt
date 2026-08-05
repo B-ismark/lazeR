@@ -21,12 +21,15 @@ import java.util.concurrent.Executors
  */
 class RemoteClient {
 
-    private var socket: DatagramSocket? = null
-    private var address: InetAddress? = null
-    private var port: Int = 0
-    private var token: String = ""
-    private var channel: SecureChannel? = null   // non-null ⇒ encrypted v2 wire
-    private var sender: ExecutorService? = null
+    // Written on the IO dispatcher (connect) and on the sender thread (teardown),
+    // read on both plus the main thread — so publication has to be guaranteed
+    // rather than assumed.
+    @Volatile private var socket: DatagramSocket? = null
+    @Volatile private var address: InetAddress? = null
+    @Volatile private var port: Int = 0
+    @Volatile private var token: String = ""
+    @Volatile private var channel: SecureChannel? = null  // non-null ⇒ encrypted v2 wire
+    @Volatile private var sender: ExecutorService? = null
     private val sendLock = Any()                 // serialize counter-assign + send
 
     /** How the live session is routed. LAN = direct local; DIRECT = off-LAN via a
@@ -351,9 +354,38 @@ class RemoteClient {
         }
     }
 
+    /**
+     * Leave cleanly, actually getting the BYE onto the wire.
+     *
+     * This used to be `send("BYE"); close()` — but close() calls shutdownNow(),
+     * which cancels queued tasks, so the BYE the sender thread had just been handed
+     * was usually thrown away. The server then had to wait out its ~12s idle
+     * timeout before it noticed we'd gone, showing a phone as connected long after
+     * it left. Sending inline instead isn't an option either: disconnect() runs on
+     * the main thread and a blocking socket write there is a
+     * NetworkOnMainThreadException.
+     *
+     * So queue the BYE *and* the socket close as one ordered task on the sender
+     * thread, then shutdown() (which lets the queue drain) rather than
+     * shutdownNow(). The packet goes out, the socket closes right behind it, and
+     * the main thread never blocks.
+     */
     fun disconnect() {
-        send("BYE")
-        close()
+        val s = sender
+        sender = null
+        if (s == null) {
+            closeSocket()
+            return
+        }
+        s.execute {
+            try {
+                sendNow("BYE")
+            } catch (_: Exception) {
+                // best effort — the idle timeout is the backstop
+            }
+            closeSocket()
+        }
+        s.shutdown()
     }
 
     /** Queue a packet on the sender thread. */
@@ -382,14 +414,23 @@ class RemoteClient {
         }
     }
 
-    private fun close() {
-        sender?.shutdownNow()
-        sender = null
+    /** Drop the socket and secure session. Safe to call from any thread — and it
+     *  IS called from two (the main thread via close(), the sender thread at the
+     *  end of a disconnect), which is why the fields it touches are @Volatile. */
+    private fun closeSocket() {
         try {
             socket?.close()
         } catch (_: Exception) {
         }
         socket = null
         channel = null
+    }
+
+    /** Hard teardown: abandon anything queued. Used when a connect attempt fails
+     *  or is superseded, where there's no session worth saying goodbye to. */
+    private fun close() {
+        sender?.shutdownNow()
+        sender = null
+        closeSocket()
     }
 }
