@@ -22,7 +22,10 @@ crash-safety of the code that runs on the single UDP thread.
 
 import base64
 import os
+import socket
 import sys
+import threading
+import time
 import types
 import unittest
 
@@ -456,6 +459,298 @@ class Dispatch(unittest.TestCase):
         rs.do_appswitch("sideways")
         self.assertEqual(rs.keyboard.calls, [])
         self.assertFalse(rs._alt_held)
+
+
+class MotionArguments(unittest.TestCase):
+    """MOVE/SCROLL/ZOOM arguments go straight into ctypes/OS calls, so magnitude
+    and shape both matter. A bigint used to raise out of pynput and — before the
+    serve-loop guard — kill the one receive thread, leaving the server deaf with
+    the window still showing "running"."""
+
+    def setUp(self):
+        self._mouse, self._kb = rs.mouse, rs.keyboard
+        rs.mouse, rs.keyboard = _Recorder(), _Recorder()
+        self.addCleanup(lambda: (setattr(rs, "mouse", self._mouse),
+                                 setattr(rs, "keyboard", self._kb)))
+
+    def test_move_passes_normal_deltas_through(self):
+        rs.handle_packet("MOVE", "3 -4", None, CLIENT)
+        self.assertEqual(rs.mouse.calls, [("move", 3, -4)])
+
+    def test_move_clamps_absurd_magnitudes(self):
+        rs.handle_packet("MOVE", "99999999999999999999 -10000000", None, CLIENT)
+        self.assertEqual(rs.mouse.calls,
+                         [("move", rs.MOVE_MAX_PX, -rs.MOVE_MAX_PX)])
+
+    def test_scroll_and_zoom_clamp(self):
+        rs.handle_packet("SCROLL", "0 -999999", None, CLIENT)
+        self.assertEqual(rs.mouse.calls, [("scroll", 0, -rs.SCROLL_MAX_STEPS)])
+        rs.mouse.calls.clear()
+        rs.handle_packet("ZOOM", "500000", None, CLIENT)
+        self.assertEqual(rs.mouse.calls, [("scroll", 0, rs.ZOOM_MAX_STEPS)])
+
+    def test_zoom_always_releases_ctrl(self):
+        # The press/release straddles a mouse.scroll; if that ever throws, a stuck
+        # Ctrl would make the laptop unusable. It's in a finally — prove it.
+        rs.handle_packet("ZOOM", "1", None, CLIENT)
+        self.assertIn(("release", "<Key.ctrl>"), rs.keyboard.calls)
+
+        def boom(*a, **kw):
+            raise RuntimeError("scroll failed")
+        rs.mouse.scroll = boom
+        rs.keyboard.calls.clear()
+        with self.assertRaises(RuntimeError):
+            rs.handle_packet("ZOOM", "1", None, CLIENT)
+        self.assertIn(("release", "<Key.ctrl>"), rs.keyboard.calls)
+
+    def test_malformed_motion_args_are_dropped_silently(self):
+        for verb, rest in [("MOVE", ""), ("MOVE", "1"), ("MOVE", "1 2 3"),
+                           ("MOVE", "a b"), ("MOVE", "1 x"), ("MOVE", "  "),
+                           ("SCROLL", ""), ("SCROLL", "up down"),
+                           ("ZOOM", ""), ("ZOOM", "lots")]:
+            rs.mouse.calls.clear()
+            with self.subTest(verb=verb, rest=rest):
+                rs.handle_packet(verb, rest, None, CLIENT)   # must not raise
+                self.assertEqual(rs.mouse.calls, [])
+
+    def test_unknown_verb_is_a_noop(self):
+        rs.handle_packet("NONSENSE", "whatever", None, CLIENT)
+        self.assertEqual(rs.mouse.calls, [])
+        self.assertEqual(rs.keyboard.calls, [])
+
+
+class AdvertisedAddress(unittest.TestCase):
+    """Which IP goes in the QR. Getting this wrong is silent: the server looks
+    healthy (loopback and the GUI don't care) while every phone times out."""
+
+    def _fake_psutil(self, ifaces, down=()):
+        """ifaces: {name: [ip, ...]}. Names in [down] report isup=False."""
+        import socket as _s
+        snic = lambda ip: types.SimpleNamespace(family=_s.AF_INET, address=ip)
+        mod = types.ModuleType("psutil")
+        mod.net_if_addrs = lambda: {n: [snic(i) for i in ips]
+                                    for n, ips in ifaces.items()}
+        mod.net_if_stats = lambda: {n: types.SimpleNamespace(isup=n not in down)
+                                    for n in ifaces}
+        self._saved = sys.modules.get("psutil")
+        sys.modules["psutil"] = mod
+        self.addCleanup(lambda: sys.modules.pop("psutil", None)
+                        if self._saved is None
+                        else sys.modules.__setitem__("psutil", self._saved))
+
+    def test_virtual_adapters_are_excluded_not_just_deprioritised(self):
+        # Excluded, because the caller asks "could a phone use this address?" and a
+        # merely low-ranked entry still answers yes. (This was a real bug: ranking
+        # alone let the WSL address satisfy the default-route check and win.)
+        self._fake_psutil({
+            "vEthernet (WSL)": ["172.28.0.1"],
+            "Docker Bridge": ["172.17.0.1"],
+            "Wi-Fi": ["192.168.1.20"],
+        })
+        self.assertEqual([ip for ip, _ in rs.candidate_ips()], ["192.168.1.20"])
+
+    def test_down_interfaces_are_skipped(self):
+        self._fake_psutil({"Wi-Fi": ["192.168.1.20"], "Ethernet": ["192.168.1.5"]},
+                          down={"Ethernet"})
+        self.assertEqual([ip for ip, _ in rs.candidate_ips()], ["192.168.1.20"])
+
+    def test_wifi_ranks_above_ethernet(self):
+        self._fake_psutil({"Ethernet": ["192.168.1.5"], "Wi-Fi": ["192.168.1.20"]})
+        self.assertEqual([ip for ip, _ in rs.candidate_ips()],
+                         ["192.168.1.20", "192.168.1.5"])
+
+    def test_public_loopback_and_linklocal_are_excluded(self):
+        self._fake_psutil({"Wi-Fi": ["192.168.1.20"], "lo": ["127.0.0.1"],
+                           "ppp0": ["8.8.4.4"], "eth9": ["169.254.3.4"]})
+        self.assertEqual([ip for ip, _ in rs.candidate_ips()], ["192.168.1.20"])
+
+    def test_probe_is_kept_when_it_names_a_real_nic(self):
+        # No behaviour change on an ordinary machine: if the default route already
+        # points at a genuine LAN interface, that's what we advertise.
+        self._fake_psutil({"Wi-Fi": ["192.168.1.20"], "Ethernet": ["192.168.1.5"]})
+        saved = rs._default_route_ip
+        rs._default_route_ip = lambda: "192.168.1.5"     # wired route
+        self.addCleanup(lambda: setattr(rs, "_default_route_ip", saved))
+        self.assertEqual(rs.lan_ip(), "192.168.1.5")
+
+    def test_probe_is_overridden_when_it_names_a_virtual_adapter(self):
+        # The WSL2/Hyper-V/Docker/VPN case: the route works for the internet but is
+        # unreachable from a phone, so advertising it guarantees a timeout.
+        self._fake_psutil({"vEthernet (WSL)": ["172.28.0.1"],
+                           "Wi-Fi": ["192.168.1.20"]})
+        saved = rs._default_route_ip
+        rs._default_route_ip = lambda: "172.28.0.1"
+        self.addCleanup(lambda: setattr(rs, "_default_route_ip", saved))
+        self.assertEqual(rs.lan_ip(), "192.168.1.20")
+
+    def test_falls_back_to_the_probe_when_psutil_is_unusable(self):
+        self._saved = sys.modules.get("psutil")
+        sys.modules["psutil"] = None      # import psutil -> raises
+        self.addCleanup(lambda: sys.modules.pop("psutil", None)
+                        if self._saved is None
+                        else sys.modules.__setitem__("psutil", self._saved))
+        self.assertEqual(rs.candidate_ips(), [])
+        saved = rs._default_route_ip
+        rs._default_route_ip = lambda: "10.0.0.7"
+        self.addCleanup(lambda: setattr(rs, "_default_route_ip", saved))
+        self.assertEqual(rs.lan_ip(), "10.0.0.7")
+
+
+class ServeLoopResilience(unittest.TestCase):
+    """Integration tests over a real loopback socket.
+
+    serve_loop is the ONLY thread serving every phone. An unhandled raise inside a
+    verb handler used to end it for good: the process stayed up, the window kept
+    showing "server running", and every subsequent packet was ignored until a
+    manual restart. These drive an actual handshake and then break things on
+    purpose."""
+
+    def setUp(self):
+        # Bind on an ephemeral port so a real server on 50505 can't collide.
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        self._saved = (rs.PORT, rs.HOST, rs.mouse, rs.keyboard)
+        rs.PORT, rs.HOST = port, "127.0.0.1"
+        rs.mouse, rs.keyboard = _Recorder(), _Recorder()
+        self.srv = ("127.0.0.1", port)
+        self.events = []
+        self.thread = None
+        rs._stop.clear()
+        self.cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.cli.settimeout(2.0)
+        self.addCleanup(self._teardown)
+
+    def _teardown(self):
+        rs._stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=5)
+            self.assertFalse(self.thread.is_alive(), "serve_loop did not shut down")
+        self.cli.close()
+        rs.PORT, rs.HOST, rs.mouse, rs.keyboard = self._saved
+        rs._stop.clear()
+        _client_connected_clear()
+
+    def _start(self, require_secure=True):
+        self.wire = rs.Wire(TOKEN, KEY, require_secure)
+        self.thread = threading.Thread(
+            target=rs.serve_loop,
+            args=(self.wire, lambda kind, *a: self.events.append((kind,) + a),
+                  None, "testhost", None),
+            daemon=True)
+        self.thread.start()
+        return self.wire
+
+    def _recv_secure(self):
+        data, _ = self.cli.recvfrom(2048)
+        return unseal(KEY, data)
+
+    def _pair_secure(self):
+        """Complete a real HELLO→CHAL→AUTH→OK over the socket. Retries because the
+        loop may not have finished binding on the first send."""
+        fc = FakeClient(KEY)
+        for _ in range(25):
+            pkt, _ = fc.seal("HELLO")
+            self.cli.sendto(pkt, self.srv)
+            try:
+                reply = self._recv_secure()
+            except (socket.timeout, Exception):
+                continue
+            if reply.startswith("CHAL "):
+                pkt, _ = fc.seal("AUTH " + reply.split(" ", 1)[1])
+                self.cli.sendto(pkt, self.srv)
+                self.assertEqual(self._recv_secure(), "OK")
+                return fc
+        self.fail("secure handshake never completed")
+
+    def _await_event(self, pred, what, timeout=6.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if any(pred(e) for e in self.events):
+                return
+            time.sleep(0.05)
+        self.fail(f"never saw {what}; events={self.events}")
+
+    def test_handshake_over_a_real_socket(self):
+        self._start()
+        self._pair_secure()
+        self._await_event(lambda e: e[0] == "connected", "a connected event")
+
+    def test_loop_survives_a_raising_handler_and_keeps_serving(self):
+        self._start()
+        fc = self._pair_secure()
+
+        def boom(*a, **kw):
+            raise RuntimeError("injected handler failure")
+        rs.mouse.move = boom
+
+        pkt, _ = fc.seal("MOVE 1 1")
+        self.cli.sendto(pkt, self.srv)
+        self._await_event(lambda e: e[0] == "warn" and "MOVE" in str(e[1]),
+                          "a warning about the failed MOVE")
+        self.assertTrue(self.thread.is_alive(), "the raise killed the loop")
+
+        # The real proof: the very next packet is still served.
+        pkt, _ = fc.seal("PING")
+        self.cli.sendto(pkt, self.srv)
+        self.assertEqual(self._recv_secure(), "PONG")
+
+    def test_repeated_failures_do_not_flood_the_feed(self):
+        self._start()
+        fc = self._pair_secure()
+
+        def boom(*a, **kw):
+            raise RuntimeError("injected handler failure")
+        rs.mouse.move = boom
+
+        for i in range(6):
+            pkt, _ = fc.seal(f"MOVE {i} {i}")
+            self.cli.sendto(pkt, self.srv)
+        self._await_event(lambda e: e[0] == "warn", "the first warning")
+        # Give any extra warnings time to show up before counting.
+        time.sleep(0.4)
+        warns = [e for e in self.events if e[0] == "warn"]
+        self.assertEqual(len(warns), 1, f"expected one warning per window, got {warns}")
+
+    def test_bigint_motion_no_longer_reaches_the_os_layer(self):
+        # The concrete crash that motivated the guard: a magnitude that raises out
+        # of ctypes. It's now clamped before it gets there, so no warning at all.
+        self._start()
+        fc = self._pair_secure()
+        pkt, _ = fc.seal("MOVE 99999999999999999999 0")
+        self.cli.sendto(pkt, self.srv)
+        pkt, _ = fc.seal("PING")
+        self.cli.sendto(pkt, self.srv)
+        self.assertEqual(self._recv_secure(), "PONG")
+        self.assertEqual([e for e in self.events if e[0] == "warn"], [])
+        self.assertIn(("move", rs.MOVE_MAX_PX, 0), rs.mouse.calls)
+
+    def test_second_plaintext_phone_is_turned_away_and_reported(self):
+        # v1 is gated only by the token, so a second phone that knows the code
+        # reaches the pinned-source check. The GUI and terminal have always had a
+        # handler for this; nothing ever emitted it, so takeovers were invisible.
+        self._start(require_secure=False)
+        self.cli.sendto(f"{TOKEN} HELLO".encode(), self.srv)
+        for _ in range(25):
+            try:
+                if self.cli.recvfrom(2048)[0] == b"OK":
+                    break
+            except socket.timeout:
+                self.cli.sendto(f"{TOKEN} HELLO".encode(), self.srv)
+        else:
+            self.fail("plaintext handshake never completed")
+
+        intruder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(intruder.close)
+        intruder.sendto(f"{TOKEN} CLICK".encode(), self.srv)
+        self._await_event(lambda e: e[0] == "blocked", "a blocked-takeover event")
+        # ...and the intruder's click must not have been executed.
+        self.assertNotIn(("click", "<Key.left>", 1), rs.mouse.calls)
+
+
+def _client_connected_clear():
+    rs._client_connected.clear()
 
 
 class UriAndToken(unittest.TestCase):

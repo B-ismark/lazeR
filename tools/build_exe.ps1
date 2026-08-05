@@ -41,7 +41,7 @@ Write-Host "Building with $(& $py --version)" -ForegroundColor Cyan
 # without pip, so fall back to `uv pip` (targeting this interpreter) when pip is
 # absent. The install is idempotent - already-present packages are skipped.
 $pkgs = @("pyinstaller", "pynput", "cryptography", "pycaw", "comtypes",
-          "zeroconf", "qrcode", "pillow", "pystray")
+          "zeroconf", "qrcode", "pillow", "pystray", "psutil")
 # uv-created venvs ship without pip, so fall back to `uv pip` (targeting this
 # interpreter) when pip is absent. find_spec is silent + exits 0/1, so it's a clean
 # probe; every install is gated on $LASTEXITCODE (stderr flows to the console).

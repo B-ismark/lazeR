@@ -3,9 +3,12 @@ name: CI
 # The v2 secure wire is implemented twice (Python `Wire` + Kotlin `SecureChannel`)
 # and must agree byte for byte. Both suites assert the SAME golden packet, so this
 # workflow is what stops the two drifting apart.
+# push is limited to main: any other branch worth testing has a PR, and
+# `pull_request` already covers those. Including feature branches here ran every
+# push twice (one push run + one pull_request run) for no extra signal.
 on:
   push:
-    branches: [main, 'claude/**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
