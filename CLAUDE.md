@@ -19,11 +19,16 @@ protocol change phones must adopt, or an explicit version bump the user asks for
 When in doubt, ask the user before publishing — don't release on every change.
 
 To publish a major release, use the helper (builds both artifacts, handles the
-OneDrive build-lock, creates or refreshes the release):
+OneDrive build-lock, creates or refreshes the release) — **run it from the repo
+root**, since `-File` resolves against the current directory and PowerShell starts
+in `%USERPROFILE%`, where `tools\` doesn't exist:
 
 ```
 powershell -ExecutionPolicy Bypass -File tools\publish_release.ps1 -Tag v1.2.0 -Title "LazeR v1.2 — <headline>"
 ```
+
+From anywhere else, give `-File` the full path instead. Only the invocation path
+matters; the script resolves everything it touches from its own location.
 
 It prompts for confirmation (major-only policy) unless `-Yes`, and needs `gh`
 authenticated (`gh auth login`). It re-runs `--clobber` if the tag already exists.
