@@ -112,8 +112,12 @@ In the app:
 motion, shape-morph buttons, connected button groups, morphing loading indicators) —
 see [android/EXPRESSIVE_MIGRATION.md](android/EXPRESSIVE_MIGRATION.md) for version
 constraints (material3 is pinned to a 1.5.0-alpha; don't bump it blindly).
-Only `INTERNET` permission — no volume-button hooks,
-no special device permissions.
+Permissions: `INTERNET`, `ACCESS_NETWORK_STATE`, `ACCESS_WIFI_STATE`,
+`CHANGE_WIFI_MULTICAST_STATE` (mDNS discovery), `WAKE_LOCK` (the low-latency
+WifiLock that keeps the cursor smooth — see
+[android/EXPRESSIVE_MIGRATION.md](android/EXPRESSIVE_MIGRATION.md)) and `VIBRATE`.
+No CAMERA permission: QR scanning uses Google's on-device code scanner, which runs
+in Play Services. No volume-button hooks.
 
 ---
 

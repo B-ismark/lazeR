@@ -1653,7 +1653,7 @@ def serve_loop(wire, emit, net, hostname):
     plaintext_hinted = False  # explained a secure-only refusal this window
     _client_connected.clear()
 
-    def drop_client(reason=None):
+    def drop_client():
         nonlocal client
         if client is not None:
             appswitch_reset()
@@ -1665,7 +1665,7 @@ def serve_loop(wire, emit, net, hostname):
         now = time.time()
         mono = time.monotonic()
 
-        # Resume detection: a tick gap far longer than the 0.5s recv timeout means
+        # Resume detection: a tick gap far longer than the 1s recv timeout means
         # the process was frozen (laptop slept). Rebind + re-announce so a phone
         # can reach us again without a restart.
         if now - last_tick > RESUME_GAP_S:
@@ -1725,7 +1725,7 @@ def serve_loop(wire, emit, net, hostname):
         # BYE (app killed, Wi-Fi dropped). Reflect that instead of showing it
         # "connected" forever — so the status is always truthful.
         if client is not None and now - last_pkt > CLIENT_IDLE_S:
-            drop_client("idle")
+            drop_client()
 
         if now - bad_win > RATE_WINDOW_S:
             bad, bad_win, warned = 0, now, False

@@ -26,6 +26,13 @@ import kotlin.math.min
 
 enum class ConnState { Disconnected, Connecting, Connected, Reconnecting }
 
+/** Dotted-quad to a 32-bit int, or null if it isn't a plain IPv4 literal. */
+private fun ipv4ToInt(s: String): Int? {
+    val parts = s.split(".").mapNotNull { it.toIntOrNull() }
+    if (parts.size != 4 || parts.any { it !in 0..255 }) return null
+    return (parts[0] shl 24) or (parts[1] shl 16) or (parts[2] shl 8) or parts[3]
+}
+
 // Pointer acceleration: smoothed speed at/above which the gain saturates, and the
 // max multiplier applied to a fast flick. Slow drags stay near 1× for precision.
 private const val ACCEL_REF_PX = 12f
@@ -84,7 +91,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     // router) those packets get batched and the cursor micro-stutters. A low-latency
     // Wi-Fi lock asks the radio to stay awake in a low-latency mode for as long as it's
     // held — the same knob real-time games use — flattening that variance across networks.
-    // No permission beyond ACCESS_WIFI_STATE (already granted). Released on disconnect.
+    // Requires android.permission.WAKE_LOCK — NOT CHANGE_WIFI_STATE, the usual wrong
+    // guess. Without it acquire() throws a SecurityException that holdWifi swallows, so
+    // the lock silently never engages and the cursor lag comes back. Keep WAKE_LOCK in
+    // the manifest. Released on disconnect.
     private val wifiLock: WifiManager.WifiLock? by lazy {
         val wm = getApplication<Application>().applicationContext
             .getSystemService(Context.WIFI_SERVICE) as? WifiManager
@@ -216,10 +226,64 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             } else {
                 update {
                     it.copy(conn = ConnState.Disconnected,
-                        error = "Couldn't reach $ip — check it's on, same Wi-Fi, token correct")
+                        error = connectFailureMessage(dev))
                 }
             }
         }
+    }
+
+    /**
+     * Explain a failed connection instead of listing every possible cause.
+     *
+     * "Couldn't reach X — check it's on, same Wi-Fi, token correct" covered four
+     * unrelated failures at once, and the most common one is invisible from the
+     * phone: a router whose 2.4 GHz and 5 GHz SSIDs are separate networks, so the
+     * phone and the laptop never share a subnet. We already know our own addresses,
+     * so we can tell that apart from "same network, nothing answered".
+     */
+    private fun connectFailureMessage(dev: Device): String {
+        val mine = localIPv4s()
+        return when {
+            mine.isEmpty() ->
+                "This phone has no Wi-Fi address — join the laptop's network and retry."
+            mine.none { it.sharesSubnetWith(dev.ip) } ->
+                "Your phone is on ${mine.first().address} but ${dev.ip} is on a " +
+                    "different network, so they can't reach each other. Put both on the " +
+                    "same Wi-Fi — note that a router's 2.4 GHz and 5 GHz names are " +
+                    "sometimes separate networks, and guest networks always are."
+            else ->
+                "${dev.ip} is on your network but didn't answer. Check LazeR is running " +
+                    "on the laptop and that you allowed its firewall prompt — the LazeR " +
+                    "window warns when inbound UDP is blocked. Some routers also block " +
+                    "device-to-device traffic (\"client isolation\")."
+        }
+    }
+
+    private data class LocalV4(val address: String, val prefix: Int) {
+        /** True if [target] falls inside this interface's subnet. Uses the interface's
+         *  REAL prefix length rather than assuming /24, so a /16 or /22 LAN — common
+         *  on larger home mesh setups and offices — isn't misreported as "different
+         *  network". */
+        fun sharesSubnetWith(target: String): Boolean {
+            val a = ipv4ToInt(address) ?: return false
+            val b = ipv4ToInt(target) ?: return false
+            if (prefix !in 1..32) return false
+            val mask = if (prefix == 32) -1 else (-1 shl (32 - prefix))
+            return (a and mask) == (b and mask)
+        }
+    }
+
+    private fun localIPv4s(): List<LocalV4> = try {
+        java.net.NetworkInterface.getNetworkInterfaces().asSequence()
+            .filter { it.isUp && !it.isLoopback }
+            .flatMap { it.interfaceAddresses.asSequence() }
+            .filter { it.address is java.net.Inet4Address && it.address.isSiteLocalAddress }
+            .mapNotNull { ia ->
+                ia.address.hostAddress?.let { LocalV4(it, ia.networkPrefixLength.toInt()) }
+            }
+            .toList()
+    } catch (e: Exception) {
+        emptyList()
     }
 
     /**
@@ -343,8 +407,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     holdWifi(false)
                     update {
                         it.copy(conn = ConnState.Disconnected,
-                            error = "Couldn't reconnect to ${dev.name}. It may be off or " +
-                                "asleep — if you re-paired it, scan the new QR to re-pair.")
+                            error = "Couldn't reconnect to ${dev.name}. " +
+                                connectFailureMessage(dev) +
+                                " If you re-paired the laptop, scan its new QR.")
                     }
                     return@launch
                 }
