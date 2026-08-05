@@ -92,9 +92,10 @@ laggy; it's best for clicks, typing, and slides.
   authenticated, replay-protected channel — your keystrokes and clicks can't be
   sniffed, spoofed, or replayed by others on the Wi-Fi. The window shows
   **Connected · encrypted** when it's on.
-- **Manual code entry is plaintext** (no encryption) — use it only on a trusted home
-  network. In **Show details**, flip **Require encryption** on to refuse plaintext
-  entirely (QR-only).
+- **Encryption is on by default, so scan the QR.** Typing the code by hand uses an
+  unencrypted connection and is now refused unless you allow it: in **Show details**,
+  flip **Require encryption** off (or start with `--allow-plaintext`). If a phone
+  tries the typed code while it's required, the activity log tells you.
 - **Your mouse always wins.** Touch the laptop's own mouse/touchpad/keyboard and the
   remote pauses instantly; it resumes a couple of seconds after you stop. Press
   **Ctrl+Alt+Shift+L** (panic) to hard-stop the remote — it stays off until you click

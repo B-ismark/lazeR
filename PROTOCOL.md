@@ -109,8 +109,10 @@ plaintext = "<VERB> [args]"            (the v1 line minus the token)
 
 `"<TOKEN> <VERB> [args]"` as before. Used when pairing by **manually typed code**
 (no key). Offers no confidentiality and is replayable/spoofable on the wire — fine
-on a trusted home network, unsafe on open Wi-Fi. The server's **Require encryption**
-toggle (or `--secure-only`) rejects v1 entirely.
+on a trusted home network, unsafe on open Wi-Fi. **The server rejects v1 by
+default**; `--allow-plaintext` (or turning **Require encryption** off in the GUI)
+permits it. A refused packet whose token actually matches is reported to the UI, so
+a manual-code attempt gets an explanation instead of a silent timeout.
 
 ## Security model
 
