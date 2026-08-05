@@ -8,6 +8,7 @@ import java.net.InetAddress
 import java.net.SocketTimeoutException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * UDP client speaking the protocol in PROTOCOL.md. Every packet is prefixed
@@ -317,15 +318,23 @@ class RemoteClient {
             closeSocket()
             return
         }
-        s.execute {
-            try {
-                sendNow("BYE")
-            } catch (_: Exception) {
-                // best effort — the idle timeout is the backstop
+        try {
+            s.execute {
+                try {
+                    sendNow("BYE")
+                } catch (_: Exception) {
+                    // best effort — the idle timeout is the backstop
+                }
+                closeSocket()
             }
+            s.shutdown()
+        } catch (_: RejectedExecutionException) {
+            // A concurrent close() (a failing connect attempt racing the user
+            // hitting disconnect) already shut this executor down, so nothing will
+            // run our task — close the socket here instead of leaking it, and never
+            // let the rejection surface on the main thread.
             closeSocket()
         }
-        s.shutdown()
     }
 
     /** Queue a packet on the sender thread. */

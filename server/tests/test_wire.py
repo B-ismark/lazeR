@@ -277,6 +277,82 @@ class Dialects(unittest.TestCase):
                 self.assertEqual(sock.last()[:2], magic)
                 self.assertTrue(unseal(KEY, sock.last()).startswith("CHAL "))
 
+    def test_switching_dialects_never_repeats_a_reply_nonce(self):
+        """The whole point of L3 is that a nonce is never reused under the
+        persistent key. Supporting two dialects nearly gave that away again: the
+        server used ONE (sid, counter) pair, so every dialect change had to re-draw
+        the sid — and re-drawing a sid while restarting the counter at 0 repeats a
+        nonce as soon as two draws collide. With a 4-byte L2 sid that is the 2^32
+        birthday bound, reachable at packet rate, and a keyless attacker can drive
+        it by replaying one captured HELLO of each dialect.
+
+        A repeated (magic, nonce) leaks the GHASH subkey, i.e. forgery for the rest
+        of the key's life.
+
+        Asserted as "sid stable per dialect, counter strictly increasing" rather
+        than "no duplicate nonce appeared": a duplicate only shows up once two
+        random 4-byte draws collide, which needs ~77k flips to be even odds, so a
+        uniqueness check over a few hundred would pass with the bug present. This
+        pins the mechanism instead, and fails on the first flip.
+        """
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        sock = FakeSock()
+        per_dialect = {}
+        seen = set()
+        for i in range(60):
+            magic = rs.MAGIC_V2 if i % 2 else rs.MAGIC_V3
+            fc = FakeClient(KEY, magic=magic)
+            pkt, _ = fc.seal("HELLO")
+            wire.parse(pkt, CLIENT, None)
+            wire.issue_challenge(sock, CLIENT, 100.0 + i * 0.001)
+            out = sock.last()
+            self.assertEqual(out[:2], magic)
+            sid_len = rs.WIRE_FORMATS[magic][0]
+            sid = out[2:2 + sid_len]
+            ctr = int.from_bytes(out[2 + sid_len:14], "big")
+            prev = per_dialect.get(magic)
+            if prev is not None:
+                self.assertEqual(sid, prev[0],
+                                 f"{magic} sid re-drawn on flip {i} — a restarted "
+                                 f"counter under a new sid is how nonces repeat")
+                self.assertGreater(ctr, prev[1], f"{magic} counter did not advance")
+            per_dialect[magic] = (sid, ctr)
+            nonce = out[:14]
+            self.assertNotIn(nonce, seen, f"nonce repeated outright on flip {i}")
+            seen.add(nonce)
+
+    def test_each_dialect_keeps_its_own_monotonic_counter(self):
+        # Per-dialect sessions: flipping away and back must RESUME that dialect's
+        # counter, not restart it under a fresh sid.
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        sock = FakeSock()
+        first = wire._srv_session(rs.MAGIC_V2)[0]
+        wire._seal_reply(sock, CLIENT, "a", magic=rs.MAGIC_V2)
+        wire._seal_reply(sock, CLIENT, "b", magic=rs.MAGIC_V3)
+        wire._seal_reply(sock, CLIENT, "c", magic=rs.MAGIC_V2)
+        sess = wire._srv_session(rs.MAGIC_V2)
+        self.assertEqual(sess[0], first, "L2 sid was re-drawn by the round trip")
+        self.assertEqual(sess[1], 2, "L2 counter restarted instead of resuming")
+
+    def test_a_strangers_hello_cannot_move_the_pinned_clients_session(self):
+        # A replayed HELLO is tag-valid, so it must not be able to touch reply state
+        # the pinned phone depends on. The client pins the server's sid on the first
+        # reply and rejects a changed one, so re-drawing it here would silently break
+        # the live session (every PONG dropped -> watchdog reconnect loop).
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        sock = FakeSock()
+        handshake(wire, sock, magic=rs.MAGIC_V3)
+        wire.reply(sock, CLIENT, "PONG")
+        before = sock.last()[:10]              # magic + 8-byte sid
+        # Stranger replays a captured L2 HELLO from a different port.
+        other = FakeClient(KEY, magic=rs.MAGIC_V2)
+        pkt, _ = other.seal("HELLO")
+        wire.parse(pkt, STRANGER, CLIENT)
+        wire.issue_challenge(sock, STRANGER, 100.0)
+        wire.reply(sock, CLIENT, "PONG")
+        self.assertEqual(sock.last()[:10], before,
+                         "a stranger's HELLO changed the pinned client's reply session")
+
     def test_a_cross_dialect_packet_is_rejected_mid_session(self):
         # Same key, same address, valid tag — but a different dialect is a different
         # session and must not be accepted against the pinned one.
@@ -319,11 +395,12 @@ class Dialects(unittest.TestCase):
         wire = rs.Wire(TOKEN, KEY, require_secure=True)
         sock = FakeSock()
         handshake(wire, sock, magic=rs.MAGIC_V3)
-        wire.srv_ctr = (1 << 32) - 2
-        sid_before = wire.srv_sid
+        sess = wire._srv_session(rs.MAGIC_V3)
+        sess[1] = (1 << 32) - 2
+        sid_before = sess[0]
         wire.reply(sock, CLIENT, "PONG")
-        self.assertEqual(wire.srv_sid, sid_before)
-        self.assertEqual(wire.srv_ctr, (1 << 32) - 1)
+        self.assertEqual(sess[0], sid_before)
+        self.assertEqual(sess[1], (1 << 32) - 1)
         self.assertEqual(int.from_bytes(sock.last()[10:14], "big"), (1 << 32) - 1)
 
     def test_exhausting_the_counter_rekeys_instead_of_wrapping(self):
@@ -332,12 +409,14 @@ class Dialects(unittest.TestCase):
         wire = rs.Wire(TOKEN, KEY, require_secure=True)
         sock = FakeSock()
         handshake(wire, sock, magic=rs.MAGIC_V3)
-        wire.srv_ctr = (1 << 32) - 1          # no headroom left
-        sid_before = wire.srv_sid
+        sess = wire._srv_session(rs.MAGIC_V3)
+        sess[1] = (1 << 32) - 1               # no headroom left
+        sid_before = sess[0]
         wire.reply(sock, CLIENT, "PONG")
-        self.assertNotEqual(wire.srv_sid, sid_before)
-        self.assertEqual(len(wire.srv_sid), 8)
-        self.assertEqual(wire.srv_ctr, 1)
+        sess = wire._srv_session(rs.MAGIC_V3)
+        self.assertNotEqual(sess[0], sid_before)
+        self.assertEqual(len(sess[0]), 8)
+        self.assertEqual(sess[1], 1)
         self.assertEqual(unseal(KEY, sock.last()), "PONG")
 
     def test_rotate_secrets_clears_the_pinned_dialect(self):
