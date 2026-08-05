@@ -6,9 +6,18 @@
   explicit version bump). Routine commits just get pushed - see CLAUDE.md. The
   script asks for confirmation unless you pass -Yes.
 
-  Usage (from anywhere):
+  Usage - FROM THE REPO ROOT, because -File takes a path relative to your CURRENT
+  directory (PowerShell opens in %USERPROFILE%, where tools\ does not exist):
     powershell -ExecutionPolicy Bypass -File tools\publish_release.ps1 -Tag v1.2.0 `
         -Title "LazeR v1.2 - <headline>" [-Notes "..."] [-Yes]
+
+  Or from any directory, by giving -File the full path:
+    powershell -ExecutionPolicy Bypass -File C:\path\to\lazeR\tools\publish_release.ps1 `
+        -Tag v1.2.0 -Title "LazeR v1.2 - <headline>"
+
+  Only the INVOCATION path matters. Everything the script itself touches is resolved
+  from $root (derived from its own location below), so once it starts, the working
+  directory is irrelevant.
 
   Prereqs: gh CLI authenticated (`gh auth login`), the uv venv at server\.venv.
 #>
