@@ -108,21 +108,23 @@ class FakeSock:
 
 
 class FakeClient:
-    """Minimal mirror of the Kotlin SecureChannel's send side."""
+    """Minimal mirror of the Kotlin SecureChannel's send side, either dialect."""
 
-    def __init__(self, key, sid=b"\x11\x22\x33\x44"):
+    def __init__(self, key, magic=None, sid=None):
         self.aes = AESGCM(key)
-        self.sid = sid
+        self.magic = magic or rs.MAGIC_V3
+        self.sid_len, self.ctr_len = rs.WIRE_FORMATS[self.magic]
+        self.sid = sid if sid is not None else bytes(range(0x11, 0x11 + self.sid_len))
         self.ctr = 0
 
     def seal(self, body, ctr=None, sid=None):
-        """Build a v2 datagram. [ctr]/[sid] override for replay/forgery cases."""
+        """Build a datagram. [ctr]/[sid] override for replay/forgery cases."""
         sid = sid if sid is not None else self.sid
         if ctr is None:
             self.ctr += 1
             ctr = self.ctr
-        nonce = sid + ctr.to_bytes(8, "big")
-        hdr = rs.MAGIC_V2 + nonce
+        nonce = sid + ctr.to_bytes(self.ctr_len, "big")
+        hdr = self.magic + nonce
         return hdr + self.aes.encrypt(nonce, body.encode("utf-8"), hdr), ctr
 
 
@@ -132,9 +134,9 @@ def unseal(key, data):
     return AESGCM(key).decrypt(hdr[2:14], body, hdr).decode("utf-8")
 
 
-def handshake(wire, sock, addr=CLIENT, client=None, now=100.0):
+def handshake(wire, sock, addr=CLIENT, client=None, now=100.0, magic=None):
     """Drive a full HELLO→CHAL→AUTH→OK and return the pinned FakeClient."""
-    fc = FakeClient(KEY)
+    fc = FakeClient(KEY, magic=magic)
     pkt, _ = fc.seal("HELLO")
     assert wire.parse(pkt, addr, client)[0] == "HELLO"
     wire.issue_challenge(sock, addr, now)
@@ -147,7 +149,7 @@ def handshake(wire, sock, addr=CLIENT, client=None, now=100.0):
     return fc
 
 
-# ── the cross-implementation anchor ──────────────────────────────────────────
+# ── the cross-implementation anchors ─────────────────────────────────────────
 class GoldenVector(unittest.TestCase):
     """One frozen packet both implementations must agree on.
 
@@ -181,9 +183,165 @@ class GoldenVector(unittest.TestCase):
 
     def test_wire_accepts_it_from_the_pinned_client(self):
         wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        wire.cli_magic = rs.MAGIC_V2
         wire.cli_sid, wire.cli_ctr, wire.secure_client = bytes([1, 2, 3, 4]), 0, True
         self.assertEqual(wire.parse(self.pkt, CLIENT, CLIENT),
                          ("MOVE", "3 -4", True))
+
+
+class GoldenVectorL3(unittest.TestCase):
+    """The CURRENT dialect's frozen packet — the one that matters going forward.
+
+    key = bytes(0..31), sid = 0102030405060708, counter = 1, "MOVE 3 -4".
+    SecureChannelTest.kt asserts these same bytes. L3 moves four bytes from the
+    counter to the session id: same 14-byte header, same 12-byte nonce, but a 2^64
+    session space instead of 2^32, because the key outlives the session and a sid
+    collision would mean GCM nonce reuse under it."""
+
+    HEX = ("4c3301020304050607080000000128"
+           "c4b7f683f190dd940a5b824850a6437fe2cda8b9655271b8")
+    PLAINTEXT = "MOVE 3 -4"
+
+    def setUp(self):
+        self.pkt = bytes.fromhex(self.HEX)
+
+    def test_layout_is_frozen(self):
+        self.assertEqual(len(self.pkt), 14 + len(self.PLAINTEXT) + 16)
+        self.assertEqual(self.pkt[:2], b"L3")
+        self.assertEqual(self.pkt[2:10], bytes([1, 2, 3, 4, 5, 6, 7, 8]))
+        self.assertEqual(int.from_bytes(self.pkt[10:14], "big"), 1)
+
+    def test_header_and_nonce_widths_match_l2(self):
+        # The point of splitting differently rather than resizing: framing is
+        # untouched, so nothing but the sid/counter boundary had to change.
+        l2 = bytes.fromhex(GoldenVector.HEX)
+        self.assertEqual(len(self.pkt), len(l2))
+        self.assertEqual(len(self.pkt[2:14]), 12)      # GCM nonce width
+
+    def test_decrypts_with_nonce_and_aad_as_specified(self):
+        nonce, aad = self.pkt[2:14], self.pkt[0:14]
+        self.assertEqual(
+            AESGCM(KEY).decrypt(nonce, self.pkt[14:], aad).decode(),
+            self.PLAINTEXT)
+
+    def test_wire_accepts_it_from_the_pinned_client(self):
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        wire.cli_magic = rs.MAGIC_V3
+        wire.cli_sid = bytes([1, 2, 3, 4, 5, 6, 7, 8])
+        wire.cli_ctr, wire.secure_client = 0, True
+        self.assertEqual(wire.parse(self.pkt, CLIENT, CLIENT),
+                         ("MOVE", "3 -4", True))
+
+
+class Dialects(unittest.TestCase):
+    """L2 stays accepted for one release so an un-updated phone keeps working, and
+    the server must answer in whichever dialect the client opened with — otherwise
+    the phone can't read its own CHAL and the handshake dead-ends."""
+
+    def setUp(self):
+        self.wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        self.sock = FakeSock()
+
+    def test_both_dialects_complete_a_handshake(self):
+        for magic in (rs.MAGIC_V2, rs.MAGIC_V3):
+            with self.subTest(magic=magic):
+                wire = rs.Wire(TOKEN, KEY, require_secure=True)
+                fc = handshake(wire, FakeSock(), magic=magic)
+                self.assertEqual(wire.cli_magic, magic)
+                self.assertEqual(wire.cli_sid, fc.sid)
+                pkt, _ = fc.seal("CLICK")
+                self.assertEqual(wire.parse(pkt, CLIENT, CLIENT),
+                                 ("CLICK", "", True))
+
+    def test_replies_use_the_clients_dialect(self):
+        for magic in (rs.MAGIC_V2, rs.MAGIC_V3):
+            with self.subTest(magic=magic):
+                wire = rs.Wire(TOKEN, KEY, require_secure=True)
+                sock = FakeSock()
+                handshake(wire, sock, magic=magic)
+                wire.reply(sock, CLIENT, "PONG")
+                self.assertEqual(sock.last()[:2], magic)
+                self.assertEqual(unseal(KEY, sock.last()), "PONG")
+
+    def test_challenge_is_answered_in_the_clients_dialect(self):
+        # The very first reply happens BEFORE pinning, so the dialect has to be
+        # picked up from the HELLO itself.
+        for magic in (rs.MAGIC_V2, rs.MAGIC_V3):
+            with self.subTest(magic=magic):
+                wire = rs.Wire(TOKEN, KEY, require_secure=True)
+                sock = FakeSock()
+                fc = FakeClient(KEY, magic=magic)
+                pkt, _ = fc.seal("HELLO")
+                wire.parse(pkt, CLIENT, None)
+                wire.issue_challenge(sock, CLIENT, 100.0)
+                self.assertEqual(sock.last()[:2], magic)
+                self.assertTrue(unseal(KEY, sock.last()).startswith("CHAL "))
+
+    def test_a_cross_dialect_packet_is_rejected_mid_session(self):
+        # Same key, same address, valid tag — but a different dialect is a different
+        # session and must not be accepted against the pinned one.
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        handshake(wire, FakeSock(), magic=rs.MAGIC_V3)
+        other = FakeClient(KEY, magic=rs.MAGIC_V2)
+        pkt, _ = other.seal("CLICK", ctr=10_000)
+        self.assertIsNone(wire.parse(pkt, CLIENT, CLIENT))
+
+    def test_dialect_sid_widths_stay_distinct(self):
+        # Honest note on the check above: parse() compares (dialect, sid), but the
+        # DIALECT half is currently belt-and-braces — it is unreachable as the sole
+        # reason for a rejection, because the two sid widths differ and so a
+        # cross-dialect sid can never compare equal. Mutating the magic comparison
+        # away therefore breaks no test.
+        #
+        # That reasoning is only valid while the widths differ. If a future dialect
+        # reuses one, the magic comparison becomes load-bearing and its absence would
+        # silently accept a foreign session. This asserts the premise so that day
+        # fails here instead of in the field.
+        widths = [fmt[0] for fmt in rs.WIRE_FORMATS.values()]
+        self.assertEqual(len(set(widths)), len(widths),
+                         "two dialects share a sid width — the magic check in "
+                         "Wire.parse is now load-bearing; test it directly")
+
+    def test_unknown_magic_is_not_treated_as_secure(self):
+        for magic in (b"L1", b"L4", b"XX", b"\x00\x00"):
+            self.assertFalse(rs.is_secure_magic(magic + b"\x00" * 40))
+        self.assertTrue(rs.is_secure_magic(b"L2" + b"\x00" * 40))
+        self.assertTrue(rs.is_secure_magic(b"L3" + b"\x00" * 40))
+
+    def test_the_last_usable_counter_value_is_still_used(self):
+        # 0xFFFFFFFF fits in four bytes, so it must be spent, not skipped. Pins the
+        # boundary from below so the re-key can't creep early.
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        sock = FakeSock()
+        handshake(wire, sock, magic=rs.MAGIC_V3)
+        wire.srv_ctr = (1 << 32) - 2
+        sid_before = wire.srv_sid
+        wire.reply(sock, CLIENT, "PONG")
+        self.assertEqual(wire.srv_sid, sid_before)
+        self.assertEqual(wire.srv_ctr, (1 << 32) - 1)
+        self.assertEqual(int.from_bytes(sock.last()[10:14], "big"), (1 << 32) - 1)
+
+    def test_exhausting_the_counter_rekeys_instead_of_wrapping(self):
+        # Wrapping would repeat a nonce under a key that outlives the session — the
+        # exact failure L3 exists to prevent. A fresh sid restarts the counter safely.
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        sock = FakeSock()
+        handshake(wire, sock, magic=rs.MAGIC_V3)
+        wire.srv_ctr = (1 << 32) - 1          # no headroom left
+        sid_before = wire.srv_sid
+        wire.reply(sock, CLIENT, "PONG")
+        self.assertNotEqual(wire.srv_sid, sid_before)
+        self.assertEqual(len(wire.srv_sid), 8)
+        self.assertEqual(wire.srv_ctr, 1)
+        self.assertEqual(unseal(KEY, sock.last()), "PONG")
+
+    def test_rotate_secrets_clears_the_pinned_dialect(self):
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        handshake(wire, FakeSock(), magic=rs.MAGIC_V3)
+        rs.rotate_secrets(wire)
+        self.assertIsNone(wire.cli_magic)
+        self.assertIsNone(wire.cli_sid)
+        self.assertFalse(wire.secure_client)
 
 
 # ── handshake: freshness via challenge-response ──────────────────────────────
@@ -283,7 +441,8 @@ class ReplayAndForgery(unittest.TestCase):
         self.assertIsNone(self.wire.parse(again, CLIENT, CLIENT))
 
     def test_wrong_sid_rejected(self):
-        pkt, _ = self.fc.seal("CLICK", sid=b"\xaa\xbb\xcc\xdd")
+        # Same width as the pinned sid, so this tests authorisation and not framing.
+        pkt, _ = self.fc.seal("CLICK", sid=b"\xaa" * self.fc.sid_len)
         self.assertIsNone(self.wire.parse(pkt, CLIENT, CLIENT))
 
     def test_right_session_from_wrong_source_rejected(self):
