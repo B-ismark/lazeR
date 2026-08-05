@@ -14,6 +14,7 @@ Run:
 import argparse
 import base64
 import ipaddress
+import math
 import os
 import queue
 import secrets
@@ -74,10 +75,16 @@ CHAL_PER_IP = 8
 # Verbs that actually drive the machine. While the user has taken over locally
 # (or after a panic), these are dropped; PING/VGET/HELLO/BYE still flow.
 CONTROL_VERBS = {
-    "MOVE", "SCROLL", "ZOOM", "CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP",
+    "MOVE", "SCROLL", "SCRU", "ZOOM", "CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP",
     "COMBO", "ASW", "SYS", "VOL", "MEDIA", "KEY", "KEYSP",
     "BRIGHT",
 }
+
+# Answered to a CAPS query, so a phone can use newer wire features only when the
+# laptop actually understands them. Add a name here when you add a capability;
+# never remove one without thinking about phones already in the wild.
+#   hires — understands SCRU (scroll in raw wheel units; see handle_packet)
+SERVER_CAPS = ("hires",)
 
 mouse = MouseController()
 keyboard = KeyboardController()
@@ -1004,12 +1011,30 @@ class LocalInputGuard:
 MOVE_MAX_PX = 20_000
 SCROLL_MAX_STEPS = 1_000
 ZOOM_MAX_STEPS = 100
+WHEEL_DELTA = 120        # Windows' wheel units per detent
+SCROLL_MAX_UNITS = SCROLL_MAX_STEPS * WHEEL_DELTA   # same ceiling as SCROLL, in units
 
 
 def _clamp_int(tok, limit):
     """Parse a signed int argument and clamp it to ±[limit]. Raises ValueError on
     junk so the caller can drop the packet."""
     return max(-limit, min(limit, int(tok)))
+
+
+def _to_notches(units):
+    """Wheel units -> the notch count pynput wants, such that it lands on exactly
+    [units] again.
+
+    pynput computes `int(notches * 120)`, and 1/120 has no exact binary form, so the
+    obvious `units / 120` sometimes multiplies back a hair LOW and truncates a unit
+    away (400 such values in the clamp range alone — e.g. 8189, 8187, 8185). Nudging
+    half a unit outward swamps that error by ~11 orders of magnitude and truncation
+    then always lands right; verified exact across the whole clamp range. Half a unit
+    is 1/240 of a detent, far below anything perceptible even if a future backend
+    rounds instead of truncating."""
+    if not units:
+        return 0.0
+    return (units + math.copysign(0.5, units)) / WHEEL_DELTA
 
 
 def handle_packet(verb, rest):
@@ -1036,6 +1061,26 @@ def handle_packet(verb, rest):
         except ValueError:
             return
         mouse.scroll(dx, dy)
+
+    elif verb == "SCRU":
+        # High-resolution scroll: args are RAW WHEEL UNITS, 120 (WHEEL_DELTA) = one
+        # detent, instead of whole notches. Windows and every modern app accept
+        # sub-detent wheel deltas.
+        #
+        # Why this verb exists: SCROLL's quantum is a whole 120-unit detent, so a pan
+        # became a train of discrete hops (~31/second at a normal drag speed, and an
+        # uneven 1,1,2,1,1 per frame as the accumulator crossed the boundary) — which
+        # reads as stepping and jitter no matter how good the phone's gesture code is.
+        # Units are integers on purpose: a fractional-notch wire format would be at the
+        # mercy of the sender's locale decimal separator ("0,25" on a French phone).
+        try:
+            a, b = rest.split()
+            dx = _clamp_int(a, SCROLL_MAX_UNITS)
+            dy = _clamp_int(b, SCROLL_MAX_UNITS)
+        except ValueError:
+            return
+        if dx or dy:
+            mouse.scroll(_to_notches(dx), _to_notches(dy))
 
     elif verb == "ZOOM":          # pinch → ctrl+wheel (zoom in/out in most apps)
         try:
@@ -1885,6 +1930,14 @@ def serve_loop(wire, emit, net, hostname):
         if verb == "BGET":
             if brightness_svc.available:
                 wire.reply(sock, addr, f"BRI {brightness_svc.get_cached()}")   # cached: never blocks the loop
+            continue
+        if verb == "CAPS":
+            # Capability query. Deliberately its own verb rather than extra fields on the
+            # handshake's "OK": phones compare that reply for exact equality, so appending
+            # to it would break every already-shipped client. An unknown verb, by contrast,
+            # is silently dropped by older servers — so a newer phone just sees no answer
+            # and falls back. Additive in both directions, no flag day.
+            wire.reply(sock, addr, f"CAPS {' '.join(SERVER_CAPS)}")
             continue
 
         # Local input wins: while the user has taken over (or after a panic),

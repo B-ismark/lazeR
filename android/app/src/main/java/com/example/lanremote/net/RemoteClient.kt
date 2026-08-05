@@ -201,6 +201,17 @@ class RemoteClient {
 
     fun move(dx: Int, dy: Int) = send("MOVE $dx $dy")
     fun scroll(dx: Int, dy: Int) = send("SCROLL $dx $dy")
+
+    /**
+     * High-resolution scroll, in raw wheel units (120 = one detent) rather than whole
+     * detents. Only send this when the laptop advertised `hires` via [queryCaps] —
+     * older servers don't know the verb and would drop it, killing scroll entirely.
+     *
+     * Units are integers on purpose. A fractional-detent format would be formatted by
+     * the phone's locale, and a comma decimal separator ("0,25") is unparseable on the
+     * far end — a bug that would only ever show up for some users.
+     */
+    fun scrollUnits(dx: Int, dy: Int) = send("SCRU $dx $dy")
     fun zoom(steps: Int) = send("ZOOM $steps")             // ctrl+wheel pinch zoom (+ in, − out)
     fun click() = send("CLICK")
     fun rightClick() = send("RCLICK")
@@ -275,6 +286,27 @@ class RemoteClient {
             awaitReply("BRI", timeoutMs)?.getOrNull(1)?.toIntOrNull()
         } catch (e: Exception) {
             null
+        } finally {
+            try { socket?.soTimeout = 0 } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * Ask the laptop which optional wire features it understands (CAPS -> "CAPS a b c").
+     *
+     * @return the advertised capability names, or an EMPTY set on timeout — which is
+     * exactly what an older server produces, since it doesn't know the verb and stays
+     * silent. So "no answer" degrades to "no optional features", and the only cost of
+     * asking an old laptop is one short timeout at connect. Never null: callers should
+     * not have to tell "old server" apart from "server with no extras".
+     */
+    suspend fun queryCaps(timeoutMs: Int = 500): Set<String> = withContext(Dispatchers.IO) {
+        socket ?: return@withContext emptySet()
+        try {
+            sendNow("CAPS")
+            awaitReply("CAPS", timeoutMs)?.drop(1)?.toSet() ?: emptySet()
+        } catch (e: Exception) {
+            emptySet()
         } finally {
             try { socket?.soTimeout = 0 } catch (_: Exception) {}
         }

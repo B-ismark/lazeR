@@ -22,7 +22,8 @@ Every datagram is a single packet. No framing beyond the datagram boundary.
 | `<TOKEN> HELLO`               | Handshake, step 1. v1: pins sender + `OK`. v2: draws a challenge. | `OK` (v1) / `CHAL <nonce>` (v2) |
 | `<TOKEN> AUTH <nonce>`        | Handshake, step 2 (v2 only). Echo the `CHAL` nonce to be pinned. | `OK`               |
 | `<TOKEN> MOVE <dx> <dy>`      | Relative cursor move, signed ints (px).              | none (lossy)       |
-| `<TOKEN> SCROLL <dx> <dy>`    | Scroll wheel, signed ints (steps). +dy = up.         | none (lossy)       |
+| `<TOKEN> SCROLL <dx> <dy>`    | Scroll wheel, signed ints (whole detents). +dy = up. | none (lossy)       |
+| `<TOKEN> SCRU <dx> <dy>`      | Scroll wheel, signed ints in **wheel units** (120 = one detent). +dy = up. Only after `CAPS` advertises `hires`. | none (lossy) |
 | `<TOKEN> ZOOM <steps>`        | Ctrl+wheel zoom (pinch). +steps = in, − = out.       | none (lossy)       |
 | `<TOKEN> CLICK`               | Left mouse click.                                    | none               |
 | `<TOKEN> RCLICK`              | Right mouse click.                                   | none               |
@@ -34,6 +35,7 @@ Every datagram is a single packet. No framing beyond the datagram boundary.
 | `<TOKEN> VGET`                | Ask server for current system volume.                | `VOL <0-100>`      |
 | `<TOKEN> BRIGHT <0-100>`      | Set display brightness to absolute percent.          | none               |
 | `<TOKEN> BGET`                | Ask server for current display brightness.           | `BRI <0-100>`      |
+| `<TOKEN> CAPS`                | Ask which optional wire features this server has.    | `CAPS <names...>`  |
 | `<TOKEN> MEDIA <action>`      | `play_pause` \| `next` \| `prev`.                    | none               |
 | `<TOKEN> KEY <text>`          | Type the literal UTF-8 text (spaces preserved).      | none               |
 | `<TOKEN> KEYSP <name>`        | Press one special key (see below).                   | none               |
@@ -66,6 +68,32 @@ mid-gesture can't leave `Alt` stuck. Maps to the Windows three-finger touchpad s
   the phone keep its brightness slider in sync (two-way, same shape as `VOL`).
 - `PONG` — answer to `PING`; lets the phone confirm the laptop is still alive and
   trigger an auto-reconnect when it goes silent.
+- `CAPS <names...>` — answer to `CAPS`: the optional wire features this server
+  understands, space-separated. Currently just `hires` (knows `SCRU`).
+
+### Capability negotiation
+
+Optional features are gated on an explicit `CAPS` query rather than a version number,
+and the client asks **once per session** (every connect *and* reconnect — the laptop
+may not be the one it last spoke to, or may have been upgraded since).
+
+The rule that makes this safe in both directions: **an unknown verb draws no reply**.
+So a new phone asking an old laptop simply times out, reads that as "no optional
+features", and stays on the baseline verbs; an old phone never asks and is unaffected.
+The only cost is one short timeout at connect against an old server. There is no flag
+day, and no version needs bumping to add a capability.
+
+This is deliberately its **own verb** rather than extra fields on the handshake's `OK`:
+shipped clients compare that reply for exact equality, so appending to it would break
+every phone already in the wild.
+
+**Scroll resolution.** `SCROLL`'s quantum is one whole 120-unit detent, which makes a
+drag a train of discrete hops (~31/second at a normal speed, and an uneven 1,1,2,1,1
+per frame as the sender's accumulator crosses the boundary) — it reads as stepping and
+jitter however good the phone's gesture code is. `SCRU` carries raw wheel units
+instead, so a gesture goes out at its true resolution, batched one packet per frame.
+Units are integers on purpose: a fractional-detent format would be rendered by the
+sender's locale, and a comma decimal separator (`0,25`) is unparseable on the far end.
 
 ## Wire formats
 

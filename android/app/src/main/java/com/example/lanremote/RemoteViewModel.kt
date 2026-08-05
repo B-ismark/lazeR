@@ -52,6 +52,11 @@ private const val RECONNECT_GIVEUP_MS = 90_000L
 private const val SMOOTH_FLOOR = 0.45f       // min blend at rest — lower = smoother, more lag
 private const val SMOOTH_REF_PX = 7f         // per-event speed at which smoothing fully disengages
 
+/** Wheel units in one detent — Windows' WHEEL_DELTA. The UI measures scrolling in units
+ *  so it can express a gesture at full resolution; only the wire format cares about
+ *  detents, and only when talking to a laptop too old to understand [RemoteClient.scrollUnits]. */
+const val WHEEL_UNITS_PER_DETENT = 120f
+
 data class UiState(
     val name: String = "",
     val ip: String = "",
@@ -90,6 +95,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var lastUserBrightnessMs: Long = 0
     private var lastInteractionMs: Long = 0   // drives adaptive health-poll backoff
     private var current: Device? = null   // device we're connected to / reconnecting
+    // Negotiated per session in startHealthLoop: does the laptop understand SCRU?
+    private var hiResScroll = false
+    // Leftover wheel units when we have to quantise to whole detents for an old server.
+    private var scrollUnitAccX = 0f
+    private var scrollUnitAccY = 0f
 
     // Held for the duration of a live session. Trackpad packets are tiny, frequent UDP
     // datagrams; when the phone's Wi-Fi radio drops into power-save between beacons (how
@@ -364,6 +374,18 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private fun startHealthLoop() {
         healthJob?.cancel()
         healthJob = viewModelScope.launch {
+            // Renegotiate optional wire features for THIS session. Both the first connect
+            // and every reconnect land here, and the laptop on the other end may not be
+            // the one we last spoke to (or may have been upgraded since), so this must
+            // never be cached across sessions. An old server stays silent and we fall
+            // back to whole-detent scrolling.
+            // Assume nothing until it answers: the query suspends for up to its timeout
+            // while the session is ALREADY connected, so a scroll in that window would
+            // otherwise go out in the previous laptop's dialect and be dropped on the
+            // floor. Falling back for a few hundred ms is invisible; losing scroll isn't.
+            hiResScroll = false
+            hiResScroll = "hires" in client.queryCaps()
+            scrollUnitAccX = 0f; scrollUnitAccY = 0f
             var misses = 0
             var tick = 0
             while (isActive) {
@@ -552,10 +574,32 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Scroll by [dx]/[dy] WHEEL UNITS (120 = one detent). The UI always speaks units so
+     * gesture code doesn't have to know what the laptop supports; picking a wire format
+     * is this layer's job. Direction is decided in the UI (per-surface).
+     *
+     * On a `hires` server the units go straight out, so a pan is a smooth stream at the
+     * true resolution of the gesture. Otherwise they're accumulated and emitted as whole
+     * detents, with the remainder carried — never dropped, or a slow drag would lose
+     * travel and a long one would drift short.
+     */
     fun scroll(dx: Int, dy: Int) {
         if (dx == 0 && dy == 0) return
         touch()
-        client.scroll(dx, dy)   // direction decided in the UI (per-surface)
+        if (hiResScroll) {
+            client.scrollUnits(dx, dy)
+            return
+        }
+        scrollUnitAccX += dx
+        scrollUnitAccY += dy
+        val nx = (scrollUnitAccX / WHEEL_UNITS_PER_DETENT).toInt()   // toward zero
+        val ny = (scrollUnitAccY / WHEEL_UNITS_PER_DETENT).toInt()
+        if (nx != 0 || ny != 0) {
+            scrollUnitAccX -= nx * WHEEL_UNITS_PER_DETENT
+            scrollUnitAccY -= ny * WHEEL_UNITS_PER_DETENT
+            client.scroll(nx, ny)
+        }
     }
 
     fun zoom(steps: Int) {

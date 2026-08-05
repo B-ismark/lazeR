@@ -1323,5 +1323,70 @@ class UpdateCheck(unittest.TestCase):
         self.assertIn("B-ismark/lazeR", rs.RELEASES_PAGE)
 
 
+class HighResolutionScroll(unittest.TestCase):
+    """SCRU carries raw wheel units (120 = one detent) so a pan isn't a train of
+    whole-detent hops. Its whole reason to exist is landing on the EXACT unit count,
+    so the conversion is the thing worth pinning down."""
+
+    def setUp(self):
+        self._real_mouse = rs.mouse
+        self.calls = []
+        test = self
+
+        class FakeMouse:
+            def scroll(self, dx, dy):
+                test.calls.append((dx, dy))
+
+        rs.mouse = FakeMouse()
+
+    def tearDown(self):
+        rs.mouse = self._real_mouse
+
+    def emitted(self):
+        """What pynput would put on the wire: int(notches * WHEEL_DELTA)."""
+        return [(int(dx * rs.WHEEL_DELTA), int(dy * rs.WHEEL_DELTA))
+                for dx, dy in self.calls]
+
+    def test_units_survive_the_notch_round_trip_exactly(self):
+        # int(units/120*120) silently loses a unit for ~400 values in the clamp range
+        # (8189, 8187, 8185, ...) because 1/120 has no exact binary form. _to_notches
+        # nudges half a unit outward so truncation can never land short. Exhaustive:
+        # this is cheap and the failures are scattered, so sampling would miss them.
+        for units in range(-rs.SCROLL_MAX_UNITS, rs.SCROLL_MAX_UNITS + 1):
+            if int(rs._to_notches(units) * rs.WHEEL_DELTA) != units:
+                self.fail(f"{units} units did not round-trip exactly")
+
+    def test_sub_detent_deltas_reach_the_mouse(self):
+        # The point of the verb: a quarter-detent must stay a quarter-detent.
+        rs.handle_packet("SCRU", "30 -45")
+        self.assertEqual(self.emitted(), [(30, -45)])
+
+    def test_a_zero_delta_sends_nothing(self):
+        rs.handle_packet("SCRU", "0 0")
+        self.assertEqual(self.calls, [])
+
+    def test_junk_and_wrong_arity_are_dropped_not_raised(self):
+        # handle_packet runs on the single receive thread; a raise here used to leave
+        # the server permanently deaf, so a hostile arg must be a no-op.
+        for bad in ("", "5", "1 2 3", "x y", "1.5 0", "0x10 0"):
+            with self.subTest(rest=bad):
+                rs.handle_packet("SCRU", bad)
+                self.assertEqual(self.calls, [], f"{bad!r} should have been dropped")
+
+    def test_magnitude_is_clamped(self):
+        rs.handle_packet("SCRU", "99999999 -99999999")
+        self.assertEqual(self.emitted(),
+                         [(rs.SCROLL_MAX_UNITS, -rs.SCROLL_MAX_UNITS)])
+
+    def test_scru_is_paused_by_local_takeover(self):
+        # Every machine-driving verb must yield to the laptop's own mouse.
+        self.assertIn("SCRU", rs.CONTROL_VERBS)
+
+    def test_hires_capability_is_advertised(self):
+        # The phone only sends SCRU when CAPS says the laptop groks it; if the name
+        # and the advertisement drift, high-res scroll silently never turns on.
+        self.assertIn("hires", rs.SERVER_CAPS)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
