@@ -54,7 +54,12 @@ data class UiState(
     val volume: Float = 50f,
     val brightness: Float = 50f,
     val brightnessAvailable: Boolean = false,
-    val keyboardText: String = "",
+    // NOTE: the keyboard's staging text deliberately does NOT live here. It used to,
+    // and that was the bug: this whole object is rewritten on every health-loop tick
+    // (volume/brightness sync, every 1.5-4s), which re-fed a plain String into a
+    // fully-controlled TextField and discarded whatever the IME was still holding as
+    // uncommitted composing text. The field owns its own editing state now — see
+    // KeyboardPanel — and the ViewModel keeps only the diff, not the display value.
     val error: String? = null,
     val savedDevices: List<Device> = emptyList(),
     val discovered: List<DiscoveredHost> = emptyList(),
@@ -410,7 +415,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         current = null
         client.disconnect()
         holdWifi(false)                     // let the radio power-save again
-        update { it.copy(conn = ConnState.Disconnected, keyboardText = "", relayWhileLocal = false) }
+        update { it.copy(conn = ConnState.Disconnected, relayWhileLocal = false) }
         discovery.start { hosts -> update { it.copy(discovered = hosts) } }   // scan again for the connection screen
     }
 
@@ -539,8 +544,17 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun media(action: String) { touch(); client.media(action) }
 
     // --- keyboard ---
-    fun onKeyboardInput(new: String) {
-        val old = _state.value.keyboardText
+    /**
+     * Send the difference between the field's previous and current text.
+     *
+     * Both sides are passed in by the caller rather than read from state: the text
+     * field owns its own contents (so selection and the IME composing region survive
+     * recomposition), and this is a pure "what changed" translation. Keeping a copy
+     * here as the source of truth is what let an unrelated state update clobber the
+     * field mid-word.
+     */
+    fun onKeyboardInput(old: String, new: String) {
+        touch()
         when {
             new == old -> Unit
             new.length > old.length && new.startsWith(old) ->
@@ -548,16 +562,17 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             new.length < old.length && old.startsWith(new) ->
                 repeat(old.length - new.length) { client.keySpecial("backspace") }
             else -> {
+                // Neither a pure append nor a pure delete (autocorrect or a swipe
+                // replacing a whole word): rewind what we sent and retype it.
                 repeat(old.length) { client.keySpecial("backspace") }
                 if (new.isNotEmpty()) client.key(new)
             }
         }
-        update { it.copy(keyboardText = new) }
     }
 
     fun specialKey(name: String) {
+        touch()
         client.keySpecial(name)
-        if (name == "enter" || name == "esc") update { it.copy(keyboardText = "") }
     }
 
     override fun onCleared() {
@@ -569,7 +584,20 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         super.onCleared()
     }
 
-    private inline fun update(block: (UiState) -> UiState) {
-        _state.value = block(_state.value)
+    /**
+     * Apply [block] atomically.
+     *
+     * This was `_state.value = block(_state.value)` — a read-modify-write, and not
+     * every caller is on the main thread: Discovery's NSD callbacks arrive on a
+     * binder thread, so a discovery update could read a snapshot taken before a
+     * keystroke's write and then put it back, silently reverting the newer field.
+     * compare-and-set retries instead of losing the race.
+     */
+    private fun update(block: (UiState) -> UiState) {
+        while (true) {
+            // Not named `current` — that's the connected-Device member field.
+            val snapshot = _state.value
+            if (_state.compareAndSet(snapshot, block(snapshot))) return
+        }
     }
 }

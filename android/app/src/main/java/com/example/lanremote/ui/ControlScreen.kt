@@ -109,6 +109,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -146,7 +148,7 @@ class ControlActions(
     val onVolume: (Float) -> Unit,
     val onBrightness: (Float) -> Unit,
     val onMedia: (String) -> Unit,
-    val onKeyboardInput: (String) -> Unit,
+    val onKeyboardInput: (String, String) -> Unit,   // (previous text, new text) → send the delta
     val onSpecialKey: (String) -> Unit,
     val onCombo: (String) -> Unit,
     val onSystem: (String) -> Unit,
@@ -288,8 +290,10 @@ private fun ControlsPanel(state: UiState, a: ControlActions) {
             transitionSpec = { fadeIn() togetherWith fadeOut() },
             label = "panel",
         ) { which ->
+            // KeyboardPanel takes no UiState on purpose — it owns its own text, so
+            // nothing an unrelated state change does can disturb the IME session.
             if (which == 0) MediaPanel(state, a)
-            else KeyboardPanel(state, a)
+            else KeyboardPanel(a)
         }
     }
 }
@@ -447,12 +451,69 @@ private fun PressIconButton(
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun KeyboardPanel(state: UiState, a: ControlActions) {
-    fun special(name: String) { a.onButtonTap(); a.onSpecialKey(name) }
-    fun combo(c: String) { a.onButtonTap(); a.onCombo(c) }
+private fun KeyboardPanel(a: ControlActions) {
+    // The text field owns its editing state, as a TextFieldValue rather than a String.
+    //
+    // This is the fix for text vanishing from the phone while the laptop kept it.
+    // The value used to come from the shared UiState, which the health loop rewrites
+    // every 1.5-4s for volume/brightness sync. A plain String can't carry selection
+    // or the IME's *composing region*, so each of those unrelated recompositions
+    // re-fed the field and Gboard's uncommitted (underlined) text was discarded —
+    // while onKeyboardInput had already put those characters on the wire.
+    //
+    // Keeping the state local and typed means recomposition is now a no-op for the
+    // field: it re-reads the same object, so the IME session is left untouched.
+    var buffer by rememberSaveable(stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(""))
+    }
+
+    /** Replace the buffer, keeping the caret at the end. */
+    fun setBuffer(text: String) {
+        buffer = TextFieldValue(text, selection = TextRange(text.length))
+    }
+
+    // The buffer is a staging copy of what we've sent since the last commit, so the
+    // diff in onKeyboardInput always has a truthful `old`. Keys that can be
+    // represented as text edit it; keys that can't (enter/tab/esc/newline move focus
+    // or commit) reset it, because after those the laptop's caret is somewhere the
+    // buffer can no longer describe. Previously none of these touched it at all, so
+    // the buffer drifted and the next keystroke diffed against a stale string —
+    // firing a spurious backspace-and-retype burst.
+    fun backspace() {
+        a.onButtonTap()
+        // Always send, even when our buffer is already empty: after an Enter the
+        // buffer is cleared but the laptop still has text the user may want to delete.
+        a.onSpecialKey("backspace")
+        if (buffer.text.isNotEmpty()) setBuffer(buffer.text.dropLast(1))
+    }
+
+    fun space() {
+        a.onButtonTap()
+        a.onSpecialKey("space")
+        setBuffer(buffer.text + " ")
+    }
+
+    fun commitKey(name: String) {
+        a.onButtonTap()
+        a.onSpecialKey(name)
+        setBuffer("")
+    }
+
+    fun commitCombo(spec: String) {
+        a.onButtonTap()
+        a.onCombo(spec)
+        setBuffer("")
+    }
+
     SectionCard {
         OutlinedTextField(
-            value = state.keyboardText, onValueChange = a.onKeyboardInput,
+            value = buffer,
+            onValueChange = { next ->
+                // Send the delta first, then adopt the new value verbatim so
+                // selection and composition are preserved exactly as the IME set them.
+                a.onKeyboardInput(buffer.text, next.text)
+                buffer = next
+            },
             label = { Text("Type on laptop") }, singleLine = true,
             keyboardOptions = KeyboardOptions(autoCorrectEnabled = false),
             modifier = Modifier.fillMaxWidth(),
@@ -466,30 +527,30 @@ private fun KeyboardPanel(state: UiState, a: ControlActions) {
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            FilledTonalButton(onClick = { special("backspace") }, shapes = ButtonDefaults.shapes(),
+            FilledTonalButton(onClick = { backspace() }, shapes = ButtonDefaults.shapes(),
                 contentPadding = keyPad, modifier = Modifier.weight(1f)) {
                 Icon(Icons.AutoMirrored.Outlined.Backspace, contentDescription = "Backspace",
                     modifier = Modifier.size(20.dp))
             }
-            FilledTonalButton(onClick = { special("space") }, shapes = ButtonDefaults.shapes(),
+            FilledTonalButton(onClick = { space() }, shapes = ButtonDefaults.shapes(),
                 contentPadding = keyPad, modifier = Modifier.weight(1f)) {
                 Text("Space", maxLines = 1)
             }
-            FilledTonalButton(onClick = { special("tab") }, shapes = ButtonDefaults.shapes(),
+            FilledTonalButton(onClick = { commitKey("tab") }, shapes = ButtonDefaults.shapes(),
                 contentPadding = keyPad, modifier = Modifier.weight(1f)) {
                 Text("Tab", maxLines = 1)
             }
-            FilledTonalButton(onClick = { special("esc") }, shapes = ButtonDefaults.shapes(),
+            FilledTonalButton(onClick = { commitKey("esc") }, shapes = ButtonDefaults.shapes(),
                 contentPadding = keyPad, modifier = Modifier.weight(1f)) {
                 Text("Esc", maxLines = 1)
             }
-            FilledTonalButton(onClick = { special("enter") }, shapes = ButtonDefaults.shapes(),
+            FilledTonalButton(onClick = { commitKey("enter") }, shapes = ButtonDefaults.shapes(),
                 contentPadding = keyPad, modifier = Modifier.weight(1f)) {
                 Text("Enter", maxLines = 1)
             }
             // Shift+Enter: soft newline without submitting — near-universal (chat apps,
             // editors), unlike Alt+Enter which varies by app. Shown as the return glyph.
-            FilledTonalButton(onClick = { combo("shift enter") }, shapes = ButtonDefaults.shapes(),
+            FilledTonalButton(onClick = { commitCombo("shift enter") }, shapes = ButtonDefaults.shapes(),
                 contentPadding = keyPad, modifier = Modifier.weight(1f)) {
                 Icon(Icons.AutoMirrored.Filled.KeyboardReturn,
                     contentDescription = "New line (Shift+Enter)", modifier = Modifier.size(20.dp))
