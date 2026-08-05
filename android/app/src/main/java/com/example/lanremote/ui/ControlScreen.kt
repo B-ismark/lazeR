@@ -10,8 +10,8 @@ import androidx.compose.foundation.background
 import androidx.compose.animation.core.animate
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.offset
-import androidx.compose.material.icons.filled.FastForward
-import androidx.compose.material.icons.filled.FastRewind
+import androidx.compose.material.icons.filled.KeyboardDoubleArrowLeft
+import androidx.compose.material.icons.filled.KeyboardDoubleArrowRight
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.draw.drawBehind
@@ -51,12 +51,10 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardReturn
-import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.automirrored.outlined.Backspace
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.BrightnessHigh
-import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Headphones
@@ -368,12 +366,16 @@ private fun MediaPanel(state: UiState, a: ControlActions) {
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                // Rewind / fast-forward send Left / Right arrow — the focused app decides
-                // the step (YouTube ~5s, Netflix/VLC/Disney+ ~10s). Generic chevrons, no
-                // seconds label that would be wrong half the time. Each button morphs its
-                // corner (rounded → circle) on press — the M3 Expressive icon-button feel.
+                // Seek back / forward send Left / Right arrow — the focused app decides
+                // the step (YouTube ~5s, Netflix/VLC/Disney+ ~10s), so no seconds label:
+                // a "10" would be wrong half the time. Double CHEVRONS, not the filled
+                // FastRewind/FastForward triangles these used to be — those read as almost
+                // the same shape as the SkipPrevious/SkipNext triangles beside them, and
+                // people kept hitting seek when they meant next track. Each button morphs
+                // its corner (rounded → circle) on press — the M3 Expressive feel.
                 PressIconButton(onClick = { seek("left") }, size = 44.dp, shape = RoundedCornerShape(16.dp)) {
-                    Icon(Icons.Filled.FastRewind, "Rewind", modifier = Modifier.size(24.dp))
+                    Icon(Icons.Filled.KeyboardDoubleArrowLeft, "Seek back",
+                        modifier = Modifier.size(26.dp))
                 }
                 PressIconButton(onClick = { fire("prev") }, size = 50.dp, shape = RoundedCornerShape(18.dp)) {
                     Icon(Icons.Filled.SkipPrevious, "Previous", modifier = Modifier.size(26.dp))
@@ -385,7 +387,8 @@ private fun MediaPanel(state: UiState, a: ControlActions) {
                     Icon(Icons.Filled.SkipNext, "Next", modifier = Modifier.size(26.dp))
                 }
                 PressIconButton(onClick = { seek("right") }, size = 44.dp, shape = RoundedCornerShape(16.dp)) {
-                    Icon(Icons.Filled.FastForward, "Fast forward", modifier = Modifier.size(24.dp))
+                    Icon(Icons.Filled.KeyboardDoubleArrowRight, "Seek forward",
+                        modifier = Modifier.size(26.dp))
                 }
             }
         }
@@ -902,8 +905,6 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
     ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Unit) {
-    var paste by rememberSaveable { mutableStateOf("") }
-
     @Composable
     fun chip(label: String, action: () -> Unit) = ChipBtn(label) { a.onButtonTap(); action() }
 
@@ -924,56 +925,18 @@ private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
                 Spacer(Modifier.height(20.dp))
             }
 
-            // Clipboard — the paste-to-laptop field alongside the copy/cut/paste combos,
-            // since they're all clipboard actions.
-            SheetTitle("Clipboard")
-            // Sends the text to the laptop clipboard and pastes it in one shot —
-            // far faster than per-character typing for URLs, snippets, passwords.
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = paste, onValueChange = { paste = it },
-                    label = { Text("Text to paste on laptop") },
-                    leadingIcon = { Icon(Icons.Filled.ContentPaste, contentDescription = null) },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(autoCorrectEnabled = false),
-                    modifier = Modifier.weight(1f),
-                )
-                Spacer(Modifier.width(8.dp))
-                PressIconButton(
-                    onClick = {
-                        if (paste.isNotEmpty()) { a.onButtonTap(); a.onPaste(paste); paste = "" }
-                    },
-                    size = 52.dp,
-                    shape = RoundedCornerShape(18.dp),
-                    filled = true,
-                ) { Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send paste") }
-            }
-            Spacer(Modifier.height(10.dp))
+            // Editing — clipboard and history combos. The paste-to-laptop TEXT FIELD that
+            // used to head this group is gone: a text field inside a ModalBottomSheet
+            // fights the sheet over the IME insets, so focusing it made the sheet jitter
+            // up and down. Nothing here needs typing, so the whole group is chips now and
+            // the sheet has no text field at all to fight over.
+            SheetTitle("Editing")
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 chip("Copy") { a.onCombo("ctrl c") }
                 chip("Cut") { a.onCombo("ctrl x") }
                 chip("Paste") { a.onCombo("ctrl v") }
-            }
-
-            // Editing — history actions, separated from clipboard so each group is one idea.
-            Spacer(Modifier.height(20.dp))
-            SheetTitle("Editing")
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 chip("Undo") { a.onCombo("ctrl z") }
                 chip("Redo") { a.onCombo("ctrl y") }
-            }
-
-            // Slides. The PRES verb has been implemented on the server, documented
-            // in PROTOCOL.md and wired through ControlActions since the first commit,
-            // but nothing ever called it — the feature was complete and unreachable.
-            Spacer(Modifier.height(20.dp))
-            SheetTitle("Slides")
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                chip("Start") { a.onPresentation("start") }
-                chip("Prev") { a.onPresentation("prev") }
-                chip("Next") { a.onPresentation("next") }
-                chip("Blank") { a.onPresentation("blank") }
-                chip("End") { a.onPresentation("end") }
             }
 
             Spacer(Modifier.height(20.dp))
