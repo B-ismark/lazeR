@@ -59,12 +59,9 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
             state = state,
             a = ControlActions(
                 onMove = vm::move,
-                // Scroll now streams fine-grained wheel units, many per gesture frame, so
-                // it can't drive haptics any more — that would be a continuous buzz. The
-                // UI reports detent crossings separately and those keep the old feel.
-                onScroll = vm::scroll,
-                onScrollDetent = {
+                onScroll = { dx, dy ->
                     if (state.settings.haptics) haptics.scrollTick()
+                    vm.scroll(dx, dy)
                 },
                 onZoom = { steps ->
                     if (state.settings.haptics) haptics.scrollTick()

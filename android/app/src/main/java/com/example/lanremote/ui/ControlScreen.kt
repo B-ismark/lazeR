@@ -113,76 +113,28 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.lanremote.UiState
-import com.example.lanremote.WHEEL_UNITS_PER_DETENT
-import androidx.compose.ui.input.pointer.PointerId
 import kotlin.math.abs
 import kotlin.math.hypot
-import kotlin.math.max
-import kotlin.math.min
-import kotlin.math.sqrt
 
-private const val SCROLL_STEP_PX = 16f   // finger travel per detent — sets scroll gain + haptic cadence
-// Gesture travel is measured in wheel units, not detents, so a frame's motion can be sent
-// at its true resolution instead of being rounded to the nearest 120-unit hop. Same overall
-// gain as before (SCROLL_STEP_PX of travel is still one detent), just no longer quantised.
-private const val WHEEL_UNITS_PER_PX = WHEEL_UNITS_PER_DETENT / SCROLL_STEP_PX
+private const val SCROLL_STEP_PX = 16f   // smaller = finer scroll + more haptic detents
 private const val SWIPE_APP_PX = 120f    // three-finger horizontal travel per app switch — short hop, fits small screens
 private const val ZOOM_STEP_PX = 22f     // two-finger spread change per ctrl+wheel zoom notch (finer = smoother zoom)
-
-// ── zoom-vs-pan ───────────────────────────────────────────────────────────────
-// Every earlier version of this ran a MAGNITUDE RACE: change in finger separation
-// (`dGap`) versus centroid travel, whoever's bigger wins. That is unfixable, and the
-// reason is geometric. Two fingers rest side by side, so the gap vector is ~(G, 0):
-// a horizontal speed difference between the fingers feeds `dGap` at 1:1, while a
-// vertical one feeds it at only d²/2G — for G=200px, d=3px that is 3.0px vs 0.02px,
-// a 133x asymmetry. A hand sliding sideways pivots at the wrist and the fingers
-// genuinely splay, so a *pure horizontal pan* produces a large, sustained, REAL gap
-// change. Captured from this app's own trackpad (adb getevent, 14 deliberate
-// side-drags): gap moved 295->329px over one 360px pan, mean |dGap| 3-6px/frame,
-// peaks past 18px. No deadzone can filter that — it isn't noise, it's the gesture.
-// The magnitude race then loses at the END of a swipe: the fingers decelerate, so
-// centroid travel collapses while the splay persists, the ratio inverts, and the
-// gesture flips to zoom. Measured: 2 of those 14 pans mis-fired zoom (10 frames), and
-// because a flip also clears the pan accumulator, each flip silently ate up to a full
-// SCROLL_STEP_PX of travel plus every frame it stayed flipped — the "stutter".
-//
-// The fix is a different QUESTION, not a better threshold. For per-finger motion
-// vectors v0/v1, with common c=(v0+v1)/2 and differential d=(v1-v0)/2:
-//     v0 · v1 = |c|² - |d|²
-// so dot(v0,v1) > 0 means translation dominates — a pan — no matter how much the gap
-// changed. Normalised, that dot is the cosine between the fingers' paths, which is
-// scale-free and needs no per-speed tuning. Measured on the same captures: real
-// pinches sit at cos ≈ -0.99, pans at cos > 0. Clean separation, so the verdict can
-// be LATCHED for the gesture (no mid-drag flips, hence no dropped pan travel) rather
-// than re-derived every frame from a decaying window.
-// Validated against the captures: 0/14 pans mis-read as pinch, 3/3 real pinches
-// caught. This is ChromeOS's touchpad approach (ImmediateInterpreter::FingersAngle +
-// ZoomFingersAreConsistent); Android's ScaleGestureDetector has no pan guard at all.
-// Thresholds are finger physiology, so they are physical sizes (dp ~ 1/160in), not px.
-private val PINCH_MIN_TRAVEL = 13.dp     // a finger must travel this far before its direction is trustworthy (~2mm)
-private val PINCH_MIN_SEP = 45.dp        // below this the finger axis is too short to split zoom from twist (~7mm)
-private const val PINCH_MAX_COS = -0.4f  // pinch needs the fingers >=114 deg apart...
-private const val PAN_MIN_COS = -0.2f    // ...and anything above this is definitely a pan; between = undecided
-private const val PINCH_MOV_RATIO = 0.4f // the slower finger must travel >=40% as far as the faster
-private const val PINCH_FRAMES = 3       // consecutive opposing frames before zoom engages
-// Deliberately NO decision deadline. Undecided already pans (see below), so waiting costs
-// nothing — while settling early permanently kills a slow pinch: two fingers resting a
-// moment before pinching, or a pinch pivoting around one near-stationary finger, which the
-// captures show taking ~15 frames to prove itself. A 100ms deadline here measurably lost
-// one of the three recorded pinches. Real pans don't need it: they all latch on dot>0
-// within 3-8 frames anyway.
-
-/** Latched verdict for a two-finger gesture. Pan is the safe default: a stray scroll is
- *  far less jarring than a stray zoom, and it keeps panning responsive from frame one. */
-private const val MODE_UNDECIDED = 0
-private const val MODE_PAN = 1
-private const val MODE_PINCH = 2
+// Zoom-vs-pan is re-decided every frame from a DECAYING evidence window, not a one-shot
+// permanent latch — the old one-shot version could mis-read one wobbly frame as a pinch
+// and stay wrong for the rest of the gesture. Each frame folds in the new spread/pan
+// delta and forgets old evidence (EVIDENCE_DECAY), so a stale wobble fades out instead of
+// being banked forever. Entering zoom needs spread to clearly dominate (ZOOM_ENTER_BIAS);
+// once in, sustained pan alone is enough to fall back out (looser ZOOM_EXIT_BIAS) — real
+// two-finger scrolling never gets stuck zoomed for the rest of the gesture.
+private const val PINCH_LATCH_PX = 14f    // decayed |gap change| that can read as zoom
+private const val EVIDENCE_DECAY = 0.85f  // per-frame retention of prior spread/pan evidence
+private const val ZOOM_ENTER_BIAS = 1.4f  // spread must beat pan by this factor to start a pinch
+private const val ZOOM_EXIT_BIAS = 1.0f   // ...but only needs to tie pan to fall back to a pan
 
 /** All the actions the control screen can fire. Bundled to keep the signature sane. */
 class ControlActions(
     val onMove: (Float, Float) -> Unit,
-    val onScroll: (Int, Int) -> Unit,   // dx, dy in wheel units (120 = one detent)
-    val onScrollDetent: () -> Unit,     // crossed a detent boundary — for haptics only
+    val onScroll: (Int, Int) -> Unit,   // dx, dy steps
     val onZoom: (Int) -> Unit,          // two-finger pinch: +1 = zoom in (spread), -1 = zoom out (pinch)
     val onClick: () -> Unit,
     val onRightClick: () -> Unit,
@@ -643,8 +595,7 @@ private fun HoldDragButton(
  *  separate detectTapGestures) so a two-finger tap can't also fire a stray left-click. */
 private fun Modifier.trackpadInput(
     onMove: (Float, Float) -> Unit,
-    onScroll: (Int, Int) -> Unit,        // wheel units (120 = one detent)
-    onScrollDetent: () -> Unit,          // detent boundary crossed — haptics only
+    onScroll: (Int, Int) -> Unit,
     onZoom: (Int) -> Unit,
     onClick: () -> Unit,
     onRightClick: () -> Unit,
@@ -654,8 +605,7 @@ private fun Modifier.trackpadInput(
 ): Modifier = this.pointerInput(Unit) {
     val slop = viewConfiguration.touchSlop
     val tapMs = viewConfiguration.longPressTimeoutMillis
-    val acc = floatArrayOf(0f, 0f)  // pan x, y accumulators, in wheel units
-    var detentAcc = 0f              // units since the last haptic tick
+    val acc = floatArrayOf(0f, 0f)  // pan x, y accumulators
     var swipeAcc = 0f               // three-finger horizontal travel since last notch
     var zoomAcc = 0f                // two-finger spread change since last zoom notch
     var switching = false           // Alt-Tab session open on the laptop
@@ -666,21 +616,10 @@ private fun Modifier.trackpadInput(
     var travel = 0f                 // total finger travel this sequence
     var moved = false               // dragged past slop ⇒ not a tap
     var twoHold = 0                 // consecutive 2-finger frames (flicker guard)
-    var oneHold = 0                 // consecutive 1-finger frames (flicker guard)
-    var threeHold = 0               // consecutive 3-finger frames (flicker guard)
-    // Two-finger classifier state. The verdict is measured against where the two fingers
-    // STARTED, not frame to frame: the cosine of two ~1px-quantised per-frame deltas is
-    // mostly digitiser noise, while displacement-from-start grows into a clean signal.
-    val minTravelSq = (PINCH_MIN_TRAVEL.toPx()).let { it * it }
-    val minSepPx = PINCH_MIN_SEP.toPx()
-    var mode = MODE_UNDECIDED       // latched pan/pinch verdict for the current finger pair
-    var pinchFrames = 0             // consecutive frames the fingers have clearly opposed
-    var id0 = PointerId(-1L)        // the pair being tracked — a change means a new gesture
-    var id1 = PointerId(-1L)
-    var b0x = 0f; var b0y = 0f      // baseline position of finger 0...
-    var b1x = 0f; var b1y = 0f      // ...and finger 1
-    var axUx = 0f; var axUy = 0f    // unit vector along the finger-to-finger axis at baseline
-    var startSep = 0f               // finger separation at baseline
+    var isZoom = false              // current 2-finger read: pinch (true) vs pan (false)
+    var evGap = 0f                  // decaying evidence: net spread (gap) change
+    var evPanX = 0f                 // decaying evidence: net centroid x-travel
+    var evPanY = 0f                 // decaying evidence: net centroid y-travel
     awaitPointerEventScope {
         while (true) {
             val event = awaitPointerEvent()
@@ -689,42 +628,30 @@ private fun Modifier.trackpadInput(
             if (n > 0 && !active) {                 // sequence starts
                 active = true
                 downMs = event.changes.first().uptimeMillis
-                maxFingers = 0; travel = 0f; moved = false
-                twoHold = 0; oneHold = 0; threeHold = 0
-                mode = MODE_UNDECIDED; pinchFrames = 0
-                id0 = PointerId(-1L); id1 = PointerId(-1L)
-                acc[0] = 0f; acc[1] = 0f; swipeAcc = 0f; zoomAcc = 0f; detentAcc = 0f
+                maxFingers = 0; travel = 0f; moved = false; twoHold = 0; isZoom = false
+                evGap = 0f; evPanX = 0f; evPanY = 0f
+                acc[0] = 0f; acc[1] = 0f; swipeAcc = 0f; zoomAcc = 0f
             }
             if (n > maxFingers) maxFingers = n
             when {
                 // Three fingers cycle apps; hold through finger-count flicker until every
                 // finger lifts. Only the all-up branch commits (releases Alt).
                 n == 3 || (switching && n > 0) -> {
-                    threeHold++
-                    // Same flicker guard the 2-finger branch gets. A sideways two-finger drag
-                    // rotates the hand, so the pad picks up stray third contacts — and without
-                    // this, one such frame wiped the pan accumulators mid-pan (losing up to a
-                    // full step of travel) and fed its dx into swipeAcc, which can latch
-                    // Alt-Tab for the rest of the gesture. Hold for a second frame first.
-                    if (threeHold < 2 && !switching) {
-                        pressed.forEach { it.consume() }
-                    } else {
-                        moved = true
-                        if (n == 3) {
-                            val three = pressed.take(3)
-                            val dx = three.sumOf {
-                                (it.position.x - it.previousPosition.x).toDouble()
-                            }.toFloat() / 3f
-                            swipeAcc += dx
-                            while (swipeAcc >= SWIPE_APP_PX) { onSwitchStep(true); switching = true; swipeAcc -= SWIPE_APP_PX }
-                            while (swipeAcc <= -SWIPE_APP_PX) { onSwitchStep(false); switching = true; swipeAcc += SWIPE_APP_PX }
-                        }
-                        acc[0] = 0f; acc[1] = 0f; zoomAcc = 0f; twoHold = 0
-                        pressed.forEach { it.consume() }
+                    moved = true
+                    if (n == 3) {
+                        val three = pressed.take(3)
+                        val dx = three.sumOf {
+                            (it.position.x - it.previousPosition.x).toDouble()
+                        }.toFloat() / 3f
+                        swipeAcc += dx
+                        while (swipeAcc >= SWIPE_APP_PX) { onSwitchStep(true); switching = true; swipeAcc -= SWIPE_APP_PX }
+                        while (swipeAcc <= -SWIPE_APP_PX) { onSwitchStep(false); switching = true; swipeAcc += SWIPE_APP_PX }
                     }
+                    acc[0] = 0f; acc[1] = 0f; zoomAcc = 0f; twoHold = 0
+                    pressed.forEach { it.consume() }
                 }
                 n == 2 -> {
-                    twoHold++; oneHold = 0; threeHold = 0
+                    twoHold++
                     // Swallow the FIRST 2-finger frame: filters the 1↔2 flicker capacitive
                     // screens throw mid-drag, so a stray blip can't jerk a scroll or break a move.
                     if (twoHold < 2) {
@@ -742,67 +669,22 @@ private fun Modifier.trackpadInput(
                         travel += abs(dx) + abs(dy)
                         if (travel > slop) moved = true   // past slop ⇒ a drag, not a tap
 
-                        // (Re)baseline when the tracked pair changes — a finger lifting and
-                        // landing again is a new gesture and must get a fresh verdict.
-                        if (a0.id != id0 || a1.id != id1) {
-                            id0 = a0.id; id1 = a1.id
-                            b0x = a0.position.x; b0y = a0.position.y
-                            b1x = a1.position.x; b1y = a1.position.y
-                            startSep = hypot((b1x - b0x).toDouble(), (b1y - b0y).toDouble()).toFloat()
-                            axUx = if (startSep > 1e-3f) (b1x - b0x) / startSep else 0f
-                            axUy = if (startSep > 1e-3f) (b1y - b0y) / startSep else 0f
-                            mode = MODE_UNDECIDED; pinchFrames = 0
-                        }
+                        // Re-read zoom-vs-pan every frame off a decaying evidence window (see
+                        // constants above) instead of committing once and staying there — that
+                        // one-shot version is what let a wobbly moment mid-scroll lock the whole
+                        // gesture into zoom.
+                        evGap = evGap * EVIDENCE_DECAY + dGap
+                        evPanX = evPanX * EVIDENCE_DECAY + dx
+                        evPanY = evPanY * EVIDENCE_DECAY + dy
+                        val spread = abs(evGap)
+                        val pan = hypot(evPanX.toDouble(), evPanY.toDouble()).toFloat()
+                        val bias = if (isZoom) ZOOM_EXIT_BIAS else ZOOM_ENTER_BIAS
+                        val wasZoom = isZoom
+                        isZoom = spread >= PINCH_LATCH_PX && spread > pan * bias
+                        if (isZoom && !wasZoom) { acc[0] = 0f; acc[1] = 0f }  // entering pinch: drop stale pan carry
+                        if (!isZoom && wasZoom) { zoomAcc = 0f }              // leaving pinch: drop stale zoom carry
 
-                        // Classify off displacement from the baseline (see the constants block).
-                        // Nothing here re-litigates a settled verdict — that is what stops the
-                        // mid-drag flips that were eating pan travel.
-                        if (mode == MODE_UNDECIDED) {
-                            val d0x = a0.position.x - b0x; val d0y = a0.position.y - b0y
-                            val d1x = a1.position.x - b1x; val d1y = a1.position.y - b1y
-                            val m0 = d0x * d0x + d0y * d0y
-                            val m1 = d1x * d1x + d1y * d1y
-                            if (max(m0, m1) < minTravelSq) {
-                                // Too little travel to read intent — keep waiting (and panning).
-                            } else {
-                                val dot = d0x * d1x + d0y * d1y
-                                if (dot > 0f) {
-                                    mode = MODE_PAN   // |common| > |differential| ⇒ pan, decisively
-                                } else if (min(m0, m1) < minTravelSq) {
-                                    // Opposing, but the slower finger hasn't moved far enough to
-                                    // trust. WAIT rather than settle — calling pan here is what
-                                    // breaks pinches, since one finger always crosses first.
-                                } else {
-                                    val cos = dot / sqrt((m0.toDouble() * m1.toDouble())).toFloat()
-                                    val lo = min(m0, m1); val hi = max(m0, m1)
-                                    // Rotation moves the fingers oppositely too, but TANGENTIALLY;
-                                    // only motion along the finger axis is a zoom.
-                                    var radialOk = true
-                                    if (startSep > minSepPx) {
-                                        val rx = d1x - d0x; val ry = d1y - d0y
-                                        val radial = rx * axUx + ry * axUy
-                                        val tangential = hypot((rx - radial * axUx).toDouble(),
-                                            (ry - radial * axUy).toDouble()).toFloat()
-                                        radialOk = abs(radial) >= tangential
-                                    }
-                                    if (cos >= PAN_MIN_COS || !radialOk) {
-                                        mode = MODE_PAN
-                                    } else if (cos <= PINCH_MAX_COS &&
-                                        lo > hi * PINCH_MOV_RATIO * PINCH_MOV_RATIO) {
-                                        if (++pinchFrames >= PINCH_FRAMES) {
-                                            mode = MODE_PINCH
-                                            acc[0] = 0f; acc[1] = 0f   // drop pan carry from the undecided frames
-                                        }
-                                    } else {
-                                        pinchFrames = 0                // in the dead band, or one finger idling
-                                    }
-                                }
-                            }
-                        }
-
-                        // Undecided pans immediately: scrolling stays responsive from frame one,
-                        // and the worst case is a few px of scroll leaking into a pinch's opening.
-                        if (mode == MODE_PINCH) {
+                        if (isZoom) {
                             zoomAcc += dGap
                             while (zoomAcc >= ZOOM_STEP_PX) { onZoom(1); zoomAcc -= ZOOM_STEP_PX }    // spread → zoom in
                             while (zoomAcc <= -ZOOM_STEP_PX) { onZoom(-1); zoomAcc += ZOOM_STEP_PX }  // pinch → zoom out
@@ -811,65 +693,27 @@ private fun Modifier.trackpadInput(
                             // what scroll means (Figma pans the canvas, browsers scroll or swipe-
                             // navigate, most everything else just scrolls).
                             // m = -1 makes content follow the fingers (natural); +1 = reverse.
-                            // Mind the wheel sign conventions, which differ per axis: a POSITIVE
-                            // vertical step is the wheel rolling forward = scroll up = content
-                            // moves down, but a POSITIVE horizontal step tilts right = viewport
-                            // moves right = content moves LEFT. So the two axes need opposite
-                            // signs to agree on "content follows the fingers". The horizontal
-                            // pair used to mirror the vertical one, which left it inverted — it
-                            // panned against the drag and ignored the natural-scroll setting.
                             val m = if (naturalScroll()) -1 else 1
-                            // ONE packet per frame carrying the frame's exact travel, rather
-                            // than a burst of whole-detent notches. Quantising here was the
-                            // other half of the "jitter": a detent is 120 wheel units, so a
-                            // normal drag fired ~31 discrete 120-unit hops a second, and the
-                            // count per frame alternated (1,1,2,1,1,2...) as the accumulator
-                            // crossed the boundary — uneven cadence even though the total
-                            // distance was right. Sub-detent units make it a smooth stream,
-                            // and per-frame batching means FEWER packets than before, not more.
-                            // Fractional remainders carry, so no travel is lost or invented.
-                            acc[0] += dx * WHEEL_UNITS_PER_PX * m
-                            acc[1] += dy * WHEEL_UNITS_PER_PX * -m
-                            val ux = acc[0].toInt()   // toward zero; remainder stays banked
-                            val uy = acc[1].toInt()
-                            if (ux != 0 || uy != 0) {
-                                acc[0] -= ux
-                                acc[1] -= uy
-                                onScroll(ux, uy)
-                                // Detents are now only a haptic concept: tick once per
-                                // boundary crossed so the pad keeps its old feel.
-                                detentAcc += abs(ux) + abs(uy)
-                                while (detentAcc >= WHEEL_UNITS_PER_DETENT) {
-                                    onScrollDetent()
-                                    detentAcc -= WHEEL_UNITS_PER_DETENT
-                                }
-                            }
+                            acc[0] += dx
+                            acc[1] += dy
+                            while (acc[0] <= -SCROLL_STEP_PX) { onScroll(m, 0); acc[0] += SCROLL_STEP_PX }
+                            while (acc[0] >= SCROLL_STEP_PX) { onScroll(-m, 0); acc[0] -= SCROLL_STEP_PX }
+                            while (acc[1] <= -SCROLL_STEP_PX) { onScroll(0, m); acc[1] += SCROLL_STEP_PX }
+                            while (acc[1] >= SCROLL_STEP_PX) { onScroll(0, -m); acc[1] -= SCROLL_STEP_PX }
                         }
                         pressed.forEach { it.consume() }
                     }
                 }
                 n == 1 -> {
-                    oneHold++; threeHold = 0
-                    // A one-frame drop to a single contact in the middle of a two-finger pan is
-                    // flicker, not intent. Treating it as a cursor move jerked the pointer
-                    // mid-pan, and zeroing twoHold made the pan swallow ANOTHER frame on the way
-                    // back in (so every blip cost two frames of travel). Hold both off until the
-                    // single finger has actually persisted. A genuine one-finger drag is
-                    // unaffected: maxFingers is 1, so it still moves from the first frame.
-                    val settled = maxFingers < 2 || oneHold >= 2
-                    if (settled) twoHold = 0
+                    twoHold = 0
                     val ch = pressed[0]
                     val dx = ch.position.x - ch.previousPosition.x
                     val dy = ch.position.y - ch.previousPosition.y
-                    if (!settled) {
+                    travel += abs(dx) + abs(dy)
+                    if (dx != 0f || dy != 0f) {
+                        onMove(dx, dy)
+                        if (travel > slop) moved = true   // past slop ⇒ a drag, not a tap
                         ch.consume()
-                    } else {
-                        travel += abs(dx) + abs(dy)
-                        if (dx != 0f || dy != 0f) {
-                            onMove(dx, dy)
-                            if (travel > slop) moved = true   // past slop ⇒ a drag, not a tap
-                            ch.consume()
-                        }
                     }
                 }
                 else -> {
@@ -884,9 +728,8 @@ private fun Modifier.trackpadInput(
                         active = false
                     }
                     acc[0] = 0f; acc[1] = 0f; swipeAcc = 0f; zoomAcc = 0f
-                    twoHold = 0; oneHold = 0; threeHold = 0
-                    mode = MODE_UNDECIDED; pinchFrames = 0
-                    id0 = PointerId(-1L); id1 = PointerId(-1L)
+                    twoHold = 0; isZoom = false
+                    evGap = 0f; evPanX = 0f; evPanY = 0f
                 }
             }
         }
@@ -931,11 +774,11 @@ private fun TrackpadCard(modifier: Modifier, a: ControlActions, natural: Boolean
                     .clip(RoundedCornerShape(22.dp))
                     .background(MaterialTheme.colorScheme.surface)
                     .hexDots(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.22f))
-                    .trackpadInput(a.onMove, a.onScroll, a.onScrollDetent, a.onZoom, a.onClick, a.onRightClick,
+                    .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
                         a.onSwitchStep, a.onSwitchEnd, { natural }),
             )
             Spacer(Modifier.width(14.dp))
-            ScrollStrip(a.onScroll, a.onScrollDetent)
+            ScrollStrip(a.onScroll)
         }
     }
 }
@@ -944,9 +787,8 @@ private fun TrackpadCard(modifier: Modifier, a: ControlActions, natural: Boolean
  *  springs back to centre on release. It's a RATE scroller (the laptop's scroll
  *  position is unknown), so the thumb is a relative grip, not a document map. */
 @Composable
-private fun ScrollStrip(onScroll: (Int, Int) -> Unit, onDetent: () -> Unit) {
+private fun ScrollStrip(onScroll: (Int, Int) -> Unit) {
     val acc = remember { floatArrayOf(0f) }
-    val detentAcc = remember { floatArrayOf(0f) }
     val scope = rememberCoroutineScope()
     val density = LocalDensity.current
     val thumbHalfPx = with(density) { 30.dp.toPx() }   // half the 60dp thumb
@@ -968,20 +810,10 @@ private fun ScrollStrip(onScroll: (Int, Int) -> Unit, onDetent: () -> Unit) {
                     onDragCancel = { scope.launch { animate(thumbOff, 0f) { v, _ -> thumbOff = v } } },
                 ) { change, dy ->
                     change.consume()
-                    // Inverted: drag down = scroll up, drag up = scroll down. Same
-                    // wheel-unit stream as the trackpad (see WHEEL_UNITS_PER_PX) so the
-                    // strip scrolls just as smoothly; detents survive only as haptics.
-                    acc[0] += dy * WHEEL_UNITS_PER_PX
-                    val u = acc[0].toInt()
-                    if (u != 0) {
-                        acc[0] -= u
-                        onScroll(0, u)
-                        detentAcc[0] += abs(u)
-                        while (detentAcc[0] >= WHEEL_UNITS_PER_DETENT) {
-                            onDetent()
-                            detentAcc[0] -= WHEEL_UNITS_PER_DETENT
-                        }
-                    }
+                    acc[0] += dy
+                    // Inverted: drag down = scroll up, drag up = scroll down.
+                    while (acc[0] <= -SCROLL_STEP_PX) { onScroll(0, -1); acc[0] += SCROLL_STEP_PX }
+                    while (acc[0] >= SCROLL_STEP_PX) { onScroll(0, 1); acc[0] -= SCROLL_STEP_PX }
                     // Thumb rides the finger within the track, clamped to the groove.
                     val max = (boxH / 2f - thumbHalfPx - padPx).coerceAtLeast(0f)
                     thumbOff = (thumbOff + dy).coerceIn(-max, max)
@@ -1044,11 +876,11 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
                     .clip(RoundedCornerShape(24.dp))
                     .background(MaterialTheme.colorScheme.surface)
                     .hexDots(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.22f))
-                    .trackpadInput(a.onMove, a.onScroll, a.onScrollDetent, a.onZoom, a.onClick, a.onRightClick,
+                    .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
                         a.onSwitchStep, a.onSwitchEnd, { state.settings.naturalScroll }),
             )
             Spacer(Modifier.width(14.dp))
-            ScrollStrip(a.onScroll, a.onScrollDetent)
+            ScrollStrip(a.onScroll)
         }
         // Same click bar as the home page — the connected Left/Middle/Right group +
         // hold-drag — reused in the dead space below the pad instead of a bespoke
