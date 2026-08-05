@@ -8,6 +8,21 @@ Two dialects share that wire: `L3` (`sid(8)|counter(4)`, current) and `L2`
 (`sid(4)|counter(8)`, accepted for one release then removed).
 See [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md) for the full picture.
 
+## Update checks — the only internet access
+
+Both halves check GitHub's public releases API for a newer tag and show a
+notice (server: a "Version" pill in Details; phone: a card on the connect
+screen). **Notify-only** — never downloads or installs. Anonymous GET, no token,
+silent on any failure. Off via `--no-update-check` / **Advanced → Updates**.
+
+`APP_VERSION` in `remote_server.py` **must match** `versionName` in
+`android/app/build.gradle.kts` — a test asserts it, since a stale value would
+either nag forever or never nag. Bump both when you bump either.
+
+This is the ONLY outbound internet request in the product; everything else is
+LAN-only. Keep it that way — if a feature needs the internet, that's a design
+discussion, not an implementation detail.
+
 ## Releases — IMPORTANT POLICY
 
 **Only publish a new GitHub Release for MAJOR releases.** Routine changes (bug

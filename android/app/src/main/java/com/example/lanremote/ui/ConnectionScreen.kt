@@ -20,12 +20,14 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -72,6 +74,7 @@ fun ConnectionScreen(
     onDeleteDevice: (Device) -> Unit,
     onScanQr: () -> Unit,
     onRescan: () -> Unit,
+    onOpenRelease: () -> Unit,
 ) {
     val connecting = state.conn == ConnState.Connecting
 
@@ -100,6 +103,10 @@ fun ConnectionScreen(
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.primary,
             )
+
+            // Below the title, above everything actionable: seen on the way to
+            // connecting without standing between the user and the QR button.
+            state.updateTag?.let { UpdateCard(it, onOpenRelease) }
 
             // Saved devices — the fast path, kept visible when present.
             if (state.savedDevices.isNotEmpty()) {
@@ -301,6 +308,59 @@ private fun ExpandHeader(
             contentDescription = if (expanded) "Collapse" else "Expand",
             tint = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+    }
+}
+
+/**
+ * "Update available" banner. Same Card shape and container role as the rest of the
+ * screen's rows, one step up in emphasis (secondaryContainer) so it reads as
+ * information rather than a problem — a pending update is not an error, and the
+ * error slot on this screen already belongs to failed connections.
+ *
+ * Tapping opens the release page in a browser. Deliberately not a download: see
+ * [com.example.lanremote.data.UpdateChecker]. Dismissible for the session, because
+ * a banner you cannot silence on the app's home screen is a nag.
+ */
+@Composable
+private fun UpdateCard(tag: String, onOpen: () -> Unit) {
+    var dismissed by rememberSaveable(tag) { mutableStateOf(false) }
+    if (dismissed) return
+    Spacer(Modifier.height(16.dp))
+    Card(
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer),
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen),
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Filled.SystemUpdate, contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.size(22.dp),
+            )
+            Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                Text(
+                    "LazeR $tag is available",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+                Text(
+                    "Tap to open the release page. Update the laptop app too — " +
+                        "they ship together.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+            }
+            IconButton(onClick = { dismissed = true }) {
+                Icon(
+                    Icons.Filled.Close, contentDescription = "Dismiss",
+                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+            }
+        }
     }
 }
 

@@ -1,5 +1,7 @@
 package com.example.lanremote
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -104,6 +106,7 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
                 onNaturalScroll = vm::setNaturalScroll,
                 onHaptics = vm::setHaptics,
                 onAcceleration = vm::setAcceleration,
+                onUpdateCheck = vm::setUpdateCheck,
                 onButtonTap = { if (state.settings.haptics) haptics.tap() },
                 onDisconnect = vm::disconnect,
             ),
@@ -130,6 +133,18 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
                 )
             },
             onRescan = vm::rescan,
+            onOpenRelease = {
+                // Hand off to the browser; we never fetch or install the APK
+                // ourselves. A device with no browser at all would throw, so the
+                // failure is reported rather than crashing the app.
+                try {
+                    context.startActivity(
+                        Intent(Intent.ACTION_VIEW, Uri.parse(vm.releasesUrl()))
+                    )
+                } catch (e: Exception) {
+                    vm.reportError("Couldn't open the browser to show the release.")
+                }
+            },
         )
     }
 }

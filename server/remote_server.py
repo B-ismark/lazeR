@@ -29,6 +29,14 @@ from pynput.keyboard import Key, Controller as KeyboardController
 # ── constants ─────────────────────────────────────────────────────────────────
 HOST = "0.0.0.0"
 PORT = 50505
+# Keep in step with android/app/build.gradle.kts versionName — publish_release.ps1
+# asserts the git tag matches THAT, and the update check below compares against
+# whatever tag the newest GitHub release carries, so a stale value here would
+# either nag forever or never nag at all.
+APP_VERSION = "2.0.0"
+RELEASES_API = "https://api.github.com/repos/B-ismark/lazeR/releases/latest"
+RELEASES_PAGE = "https://github.com/B-ismark/lazeR/releases/latest"
+UPDATE_TIMEOUT_S = 6      # a slow/blocked network must never delay the server
 SINGLETON_PORT = 50506  # loopback-only: a 2nd launch uses it to surface the running window
 TOKEN_LEN = 6
 RESUME_GAP_S = 8        # recv-loop tick gap larger than this ⇒ the laptop slept; recover net
@@ -1272,6 +1280,87 @@ def lan_ip():
     return probe or "127.0.0.1"
 
 
+# ── update check ──────────────────────────────────────────────────────────────
+# The ONLY outbound internet request LazeR ever makes. Everything else is LAN-only
+# by design (v2.0 removed the off-LAN path entirely), so this is deliberately:
+#   * opt-out           (--no-update-check, and the GUI reflects when it's off)
+#   * notify-only       (never downloads or installs — it links to the release page)
+#   * unauthenticated   (public API, no token; we send no identifying data)
+#   * non-blocking      (runs on a daemon thread; a hung request can't stall serving)
+# It asks GitHub for the newest release tag and compares it with APP_VERSION.
+def parse_version(text):
+    """'v2.1.0' / '2.1' → (2, 1, 0). None if it isn't a numeric dotted version.
+
+    Compared as a TUPLE OF INTS, never as strings: lexically "2.0.10" sorts below
+    "2.0.9", which would silently stop offering updates after the ninth patch.
+    Short versions are padded so 2.1 == 2.1.0 rather than comparing unequal."""
+    if not text:
+        return None
+    s = str(text).strip()
+    if s[:1] in ("v", "V"):
+        s = s[1:]
+    # Drop any pre-release/build suffix ("2.1.0-rc1", "2.1.0+win") before parsing.
+    for sep in ("-", "+", " "):
+        s = s.split(sep, 1)[0]
+    parts = s.split(".")
+    if not parts or len(parts) > 4:
+        return None
+    out = []
+    for p in parts:
+        if not p.isdigit():
+            return None
+        out.append(int(p))
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+
+def is_newer_version(latest, current):
+    """True iff [latest] is a strictly newer release than [current]. Unparseable
+    input answers False — a garbled tag must never be reported as an update."""
+    a, b = parse_version(latest), parse_version(current)
+    if a is None or b is None:
+        return False
+    return a > b
+
+
+def fetch_latest_release(url=RELEASES_API, timeout=UPDATE_TIMEOUT_S):
+    """The newest release's tag name, or None on any failure.
+
+    Never raises: no network, DNS down, rate limited, GitHub 5xx and malformed JSON
+    all mean the same thing here — we simply don't know, so say nothing. A failed
+    update check must be invisible, not an error the user has to think about."""
+    import json
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                # GitHub rejects requests with no User-Agent outright (403).
+                "User-Agent": f"LazeR/{APP_VERSION}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            if getattr(r, "status", 200) != 200:
+                return None
+            # Cap the read: we only need one short field, and an unbounded read from
+            # a host we don't control is how a hung transfer becomes a memory bug.
+            data = json.loads(r.read(64_000).decode("utf-8", "ignore"))
+    except Exception:
+        return None
+    tag = data.get("tag_name") if isinstance(data, dict) else None
+    return tag if isinstance(tag, str) and tag.strip() else None
+
+
+def check_for_update(url=RELEASES_API, timeout=UPDATE_TIMEOUT_S):
+    """(tag, is_newer) for the newest release, or (None, False) if unknown."""
+    tag = fetch_latest_release(url, timeout)
+    if tag is None:
+        return None, False
+    return tag, is_newer_version(tag, APP_VERSION)
+
+
 def open_socket():
     """Fresh bound UDP socket. Recreated after resume — a socket bound before the
     laptop slept can stop receiving once the NIC cycles, so we rebind to recover."""
@@ -1929,7 +2018,7 @@ _C = {
 
 
 class LazeRWindow:
-    def __init__(self, ip, port, wire, event_q, require_secure):
+    def __init__(self, ip, port, wire, event_q, require_secure, update_check=True):
         import tkinter as tk
         from tkinter import font as tkf
 
@@ -1938,6 +2027,8 @@ class LazeRWindow:
         self._wire = wire
         self._token = wire.token
         self._require_secure = require_secure
+        self._update_check = update_check
+        self._update_tag = None      # newest release tag once known
         self._hostname = socket.gethostname()
         uri = build_uri(ip, wire.token, self._hostname, wire.key)
         token = wire.token
@@ -1996,6 +2087,7 @@ class LazeRWindow:
         self._log("Server started", "ok")
         self._poll()
         self._check_firewall()   # surface the Allow banner if inbound is blocked
+        self._check_update()     # no-op unless enabled; never blocks the UI thread
         self._center()
 
     # ── system tray ───────────────────────────────────────────────────────────
@@ -2260,6 +2352,59 @@ class LazeRWindow:
         else:
             self._log("Firewall rule not added — admin prompt declined?", "warn")
 
+    # ── update check ──────────────────────────────────────────────────────────
+    def _check_update(self):
+        """Ask GitHub for the newest release tag, off the UI thread.
+
+        Runs once per launch. The server is normally left running for days, but a
+        laptop that stays up that long is also one nobody is looking at, so a
+        periodic re-check would spend requests to update a window no one reads —
+        the next launch catches it."""
+        if not self._update_check:
+            self._set_update_pill("off — started with --no-update-check", "faint")
+            return
+
+        def work():
+            tag, newer = check_for_update()
+            self._root.after(0, lambda: self._on_update_result(tag, newer))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_update_result(self, tag, newer):
+        if tag is None:
+            # Offline, rate limited, or GitHub had a bad day. Not an error worth
+            # anyone's attention — just say we don't know.
+            self._set_update_pill("couldn't check — no internet?", "faint")
+            return
+        if not newer:
+            self._set_update_pill(f"up to date (v{APP_VERSION})", "ok")
+            return
+        self._update_tag = tag
+        self._set_update_pill(f"{tag} available — click to open", "warn", link=True)
+        self._log(f"Update available: {tag} (running v{APP_VERSION})", "info")
+
+    def _set_update_pill(self, text, colour, link=False):
+        pill = getattr(self, "_upd_pill", None)
+        if pill is None:
+            return
+        dot, val = pill
+        dot.config(fg=_C[colour])
+        val.config(text=text)
+        if link:
+            # Only clickable once there IS something to open, so a dead pointer
+            # cursor never invites a click that does nothing.
+            val.config(fg=_C["accent"], cursor="hand2")
+            val.bind("<Button-1>", lambda e: self._open_releases())
+        else:
+            val.config(fg=_C["faint"], cursor="")
+            val.unbind("<Button-1>")
+
+    def _open_releases(self):
+        import webbrowser
+        try:
+            webbrowser.open(RELEASES_PAGE)
+        except Exception as e:
+            self._log(f"Couldn't open the releases page ({type(e).__name__})", "warn")
+
     def _update_fw_pill(self):
         pill = getattr(self, "_fw_pill", None)
         if pill is None:
@@ -2490,6 +2635,8 @@ class LazeRWindow:
                    else "unavailable — pip install cryptography", _HAVE_CRYPTO)
         if sys.platform.startswith("win"):
             self._fw_pill = self._mutable_pill(pad, "Firewall", "checking…")
+        self._upd_pill = self._mutable_pill(
+            pad, "Version", f"v{APP_VERSION} — checking for updates…")
 
         self._build_security_controls(pad)
 
@@ -2745,7 +2892,7 @@ class LazeRWindow:
 
 
 # ── terminal mode ─────────────────────────────────────────────────────────────
-def run_terminal(token, key, ip, require_secure):
+def run_terminal(token, key, ip, require_secure, update_check=True):
     hostname = socket.gethostname()
     uri = build_uri(ip, token, hostname, key)
     zc, mdns_info = start_mdns(ip, hostname)
@@ -2766,6 +2913,19 @@ def run_terminal(token, key, ip, require_secure):
     show_qr(uri)
     print()
     print("  ...or auto-discover, or enter IP + token manually. Ctrl+C to quit.\n")
+
+    # Update check: notify-only, and the one outbound internet request LazeR makes.
+    # Done inline here rather than on a thread — terminal mode has no UI to keep
+    # responsive, and printing from a background thread would interleave with the
+    # activity log below. Bounded by UPDATE_TIMEOUT_S.
+    if update_check:
+        tag, newer = check_for_update()
+        if newer:
+            print(f"  [update] {tag} is available (running v{APP_VERSION}):")
+            print(f"           {RELEASES_PAGE}\n")
+        elif tag is None:
+            print("  [update] couldn't check for updates (offline?). "
+                  "--no-update-check silences this.\n")
 
     # Inbound UDP must be allowed or phones silently time out (loopback bypasses
     # the firewall, so the server looks fine here). If we're admin this adds the
@@ -2858,6 +3018,10 @@ def main():
     ap.add_argument("--secure-only", action="store_true",
                     help="(now the default) reject plaintext v1 clients; kept so "
                          "existing scripts and shortcuts keep working")
+    ap.add_argument("--no-update-check", action="store_true",
+                    help="never contact GitHub to see if a newer release exists. "
+                         "This is the only outbound internet request LazeR makes; "
+                         "everything else is LAN-only")
     ap.add_argument("--allow-plaintext", action="store_true",
                     help="permit manual-code (plaintext v1) pairing. Trusted LANs "
                          "only — v1 offers no confidentiality and is replayable")
@@ -2962,7 +3126,8 @@ def main():
             t.start()
 
             try:
-                LazeRWindow(ip, PORT, wire, eq, require_secure).run()
+                LazeRWindow(ip, PORT, wire, eq, require_secure,
+                            update_check=not args.no_update_check).run()
             except KeyboardInterrupt:
                 pass
             finally:
@@ -2977,7 +3142,8 @@ def main():
                 print("Server stopped.")
             return
 
-    run_terminal(token, key, ip, require_secure)
+    run_terminal(token, key, ip, require_secure,
+                 update_check=not args.no_update_check)
 
 
 if __name__ == "__main__":

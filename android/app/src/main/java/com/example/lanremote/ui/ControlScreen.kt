@@ -157,6 +157,7 @@ class ControlActions(
     val onNaturalScroll: (Boolean) -> Unit,
     val onHaptics: (Boolean) -> Unit,
     val onAcceleration: (Boolean) -> Unit,
+    val onUpdateCheck: (Boolean) -> Unit,
     val onButtonTap: () -> Unit,        // light haptic for generic button presses
     val onDisconnect: () -> Unit,
 )
@@ -1018,6 +1019,18 @@ private fun SettingsSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
             SheetTitle("Feedback")
             ToggleRow("Haptic feedback", "Vibrate on clicks and scroll",
                 state.settings.haptics, a.onHaptics)
+
+            // Called out as the internet setting on purpose: LazeR is otherwise
+            // entirely LAN-only, so this is the one thing that leaves the network.
+            Spacer(Modifier.height(20.dp))
+            SheetTitle("Updates")
+            ToggleRow(
+                "Check for new versions",
+                "Asks GitHub once a day whether a newer release exists — the only " +
+                    "time LazeR uses the internet. Never downloads or installs " +
+                    "anything; it just shows a link.",
+                state.settings.updateCheck, a.onUpdateCheck,
+            )
         }
     }
 }

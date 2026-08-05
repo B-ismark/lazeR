@@ -147,3 +147,29 @@ in Play Services. No volume-button hooks.
   Domain** profiles only, so it won't open the port on a network Windows has
   classified Public. Treat plaintext mode as untrusted there; prefer QR pairing,
   which is the default.
+- **Control traffic never leaves the LAN.** There is exactly one outbound internet
+  request in the whole product, and it isn't control-related — see below.
+
+### The one internet request: update checks
+
+LazeR is LAN-only; v2.0 removed off-LAN access entirely. The single exception is an
+update check, because a sideloaded app has no store to notify you and would
+otherwise sit on a stale version indefinitely.
+
+- **What it does:** one HTTPS `GET` to
+  `api.github.com/repos/B-ismark/lazeR/releases/latest`, reads the release tag, and
+  compares it with the running version.
+- **Anonymous:** a plain GET with no token, cookie or device identifier. The only
+  header is the `User-Agent` GitHub requires. Nothing about you or your laptop is
+  sent — GitHub sees a request, as it would for any public URL.
+- **Notify-only:** it never downloads or installs anything. It shows a link to the
+  release page; you download as usual. Self-updating would mean the app fetching and
+  installing a binary it can't verify, which is a much larger trust ask.
+- **Silent on failure:** offline, rate-limited or GitHub down all mean "don't know",
+  which shows nothing rather than an error.
+- **Frequency:** server, once per launch. Phone, at most once a day.
+- **Turning it off:** server — `--no-update-check`. Phone — **Advanced → Updates →
+  Check for new versions**. Off means the code is never called at all.
+
+Both halves check independently and show their own notice, since the `.exe` and the
+`.apk` are installed separately and can drift apart.
