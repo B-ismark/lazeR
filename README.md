@@ -1,8 +1,8 @@
 # LazeR
 
 Phone-as-trackpad. Android (Kotlin + Jetpack Compose, **Material 3 Expressive**) client
-+ Python laptop server. Mouse move/click/scroll, pinch-zoom, system volume, display
-brightness, media keys, keyboard typing and app-switch gestures.
++ Python laptop server. Mouse move/click/scroll, system volume, display brightness, media
+keys, keyboard typing, app-switch and browser gestures.
 
 Direct UDP on `50505` over the local network. Secure pairing (QR) is AES-256-GCM
 with a replay-proof handshake.
@@ -24,12 +24,9 @@ PROTOCOL.md  wire format shared by both
   `BRIGHT 0-100` (both two-way synced). Media buttons → `MEDIA play_pause|next|prev`.
 - Keyboard panel types text (`KEY`); the Advanced sheet fires shortcuts
   (`COMBO ctrl c`, …) for copy/cut/paste and undo/redo.
-- Two fingers → scroll/pan on **both** axes, like a real trackpad: the app at the far
-  end decides what that means (canvas pan in Figma, scroll in most things, swipe-nav in
-  a browser). Pinch → zoom. Three fingers left/right → cycle apps (`ASW next` / `prev`,
-  Alt held the whole gesture).
-- Scrolling is sub-detent where the laptop supports it (`SCRU`, negotiated per session),
-  so a drag is a smooth stream rather than a train of whole wheel clicks.
+- Two fingers vertical → scroll. Two fingers horizontal swipe → browser back/forward
+  (`COMBO alt left` / `alt right`), like a Windows touchpad. Three fingers left/right →
+  cycle apps (`ASW next` / `prev`, Alt held the whole gesture).
 - Haptic feedback on taps/keys, and gentle battery use — the phone polls briskly
   while you're interacting and backs off when idle.
 

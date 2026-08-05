@@ -48,42 +48,6 @@ matters; the script resolves everything it touches from its own location.
 It prompts for confirmation (major-only policy) unless `-Yes`, and needs `gh`
 authenticated (`gh auth login`). It re-runs `--clobber` if the tag already exists.
 
-## Zoom-vs-pan: never a magnitude race (don't break this)
-
-`trackpadInput` decides pinch-vs-pan from the **normalised cosine between the two
-fingers' displacement since the gesture started**, latched once per gesture. Do NOT
-"simplify" it back to comparing *how much the finger gap changed* against *how far the
-centroid travelled* — that shape of test cannot work, and it was rewritten three times
-before measurement showed why.
-
-Fingers rest side by side, so the gap vector is ~`(G, 0)`: a horizontal speed difference
-between them feeds gap-change at **1:1**, a vertical one at only `d²/2G` (133x less for
-G=200px, d=3px). So the same hand skew is invisible on a vertical scroll and
-full-strength on a horizontal one — only side-drags break, which is a very misleading
-symptom. And the skew is **real, not noise**: a hand sliding sideways pivots at the wrist
-and the fingers splay ~30px over a 360px pan (measured). No deadzone can filter it out,
-because it is the gesture. The race then inverts at the *end* of a swipe, where the
-fingers decelerate and travel collapses while the splay persists.
-
-The cosine works because `v0·v1 = |common|² − |differential|²`, so `dot > 0` means
-translation dominates regardless of gap change. Same approach as ChromeOS's touchpad
-driver (`ImmediateInterpreter`); Android's `ScaleGestureDetector` has **no** pan guard.
-
-If you touch this, re-measure instead of eyeballing it — capture real touches with
-`adb shell getevent -l /dev/input/<touchscreen>`, replay them through the classifier, and
-check both directions (pure side-drags must never zoom; pinches must still zoom, including
-one pivoting around a near-stationary finger, which is the case naive guards break).
-
-## Wire capabilities — additive only
-
-Optional wire features are negotiated with `CAPS`, per session, never by version number.
-The rule that keeps it safe both ways: **an unknown verb draws no reply**, so a new phone
-asking an old laptop times out and falls back, and an old phone never asks.
-
-Do **not** advertise capabilities by extending the handshake's `OK` reply — shipped
-clients compare it for exact equality (`d == "OK"`), so appending breaks every phone in
-the wild. Add a new verb instead. See `SERVER_CAPS` and `PROTOCOL.md`.
-
 ## Build artifacts
 
 - **Windows server exe:** `tools/build_exe.ps1` → `dist/LazeR.exe` (PyInstaller
@@ -132,18 +96,6 @@ great RSSI/rate. Acquiring a WifiLock **requires `android.permission.WAKE_LOCK`*
     `./gradlew assembleRelease --init-script <init.gradle> --project-cache-dir <tmp>`
     where the init sets `allprojects { layout.buildDirectory.set(...) }` to a temp path.
   The APK then lands under `%TEMP%\lazeR-build\app\outputs\apk\release\`, not `android/app/build/`.
-- **Source server ≠ exe pairing.** Credentials live next to the *running* binary
-  (`_APP_DIR`), so `server/.lazer_token|key` and `dist/.lazer_token|key` are two
-  different identities. Swapping between `python remote_server.py` and `dist/LazeR.exe`
-  therefore invalidates the phone's saved pairing, and the phone reports it as a plain
-  connect failure — indistinguishable from a firewall or network problem. To test from
-  source against an already-paired phone, copy `dist/.lazer_*` into `server/` (back up
-  first) rather than re-pairing. Note `.gitignore` matches those two names **exactly**,
-  so a backup like `.lazer_token.bak` is NOT ignored — keep copies outside the repo.
-- **Server logs vanish when redirected.** Python block-buffers stdout to a pipe/file, so
-  `remote_server.py --no-gui > log` shows the startup QR and then nothing for a long
-  while. Use `python -u` (or `PYTHONUNBUFFERED=1`) when you need to watch the activity
-  log live.
 - **Python:** use the uv-managed venv at `server/.venv` (bare `python` is the broken
   MS Store stub). Create/refresh: `cd server && uv venv && uv pip install -r requirements.txt`.
 - **PowerShell 5.1 + native tools:** don't run build CLIs under
