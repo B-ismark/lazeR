@@ -13,6 +13,7 @@ import com.example.lanremote.data.DiscoveredHost
 import com.example.lanremote.data.Discovery
 import com.example.lanremote.data.Settings
 import com.example.lanremote.data.SettingsStore
+import com.example.lanremote.data.UpdateChecker
 import com.example.lanremote.net.RemoteClient
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -70,6 +71,11 @@ data class UiState(
     val savedDevices: List<Device> = emptyList(),
     val discovered: List<DiscoveredHost> = emptyList(),
     val settings: Settings = Settings(),
+    // Tag of a newer release, or null when we're current / haven't found out / the
+    // check is switched off. One nullable field rather than a status enum: "up to
+    // date" and "couldn't reach GitHub" both render as nothing at all, so the UI
+    // has no reason to tell them apart.
+    val updateTag: String? = null,
 )
 
 class RemoteViewModel(app: Application) : AndroidViewModel(app) {
@@ -130,6 +136,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // Silently re-try the last device on launch, if any.
         val lastId = settingsStore.lastDeviceId
         store.load().firstOrNull { it.id == lastId }?.let { connectSaved(it) }
+        checkForUpdate()   // no-op when switched off or inside the throttle window
     }
 
     /** Restart mDNS discovery — clears the list and looks again for laptops. */
@@ -142,6 +149,55 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun setNaturalScroll(v: Boolean) = updateSettings { it.copy(naturalScroll = v) }
     fun setHaptics(v: Boolean) = updateSettings { it.copy(haptics = v) }
     fun setAcceleration(v: Boolean) = updateSettings { it.copy(acceleration = v) }
+
+    /** Turning the check off also clears any banner already on screen — leaving it
+     *  up would look like the setting hadn't taken. Turning it on re-checks now
+     *  rather than waiting out the throttle, so the toggle gives visible feedback. */
+    fun setUpdateCheck(v: Boolean) {
+        updateSettings { it.copy(updateCheck = v) }
+        if (v) checkForUpdate(force = true) else update { it.copy(updateTag = null) }
+    }
+
+    /** The app's own versionName, read from the installed package.
+     *
+     *  Deliberately not BuildConfig.VERSION_NAME: that needs `buildFeatures {
+     *  buildConfig = true }`, and build.gradle.kts is version-locked around the M3
+     *  Expressive alphas (see CLAUDE.md), so this avoids touching it at all. */
+    private fun installedVersion(): String? = try {
+        val ctx = getApplication<Application>()
+        ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName
+    } catch (e: Exception) {
+        null
+    }
+
+    /**
+     * Check GitHub for a newer release, if enabled and the throttle allows.
+     *
+     * Shows the cached answer first so a known update appears immediately on launch
+     * instead of only after a network round trip. Failures are silent by design —
+     * see [UpdateChecker].
+     */
+    private fun checkForUpdate(force: Boolean = false) {
+        if (!_state.value.settings.updateCheck) return
+        val mine = installedVersion() ?: return
+        // Cached result: instant, offline-safe, and re-validated below if due.
+        settingsStore.lastKnownTag?.let { cached ->
+            if (UpdateChecker.isNewer(cached, mine)) update { it.copy(updateTag = cached) }
+        }
+        val now = System.currentTimeMillis()
+        if (!force && !settingsStore.updateCheckDue(now)) return
+        viewModelScope.launch {
+            val tag = UpdateChecker.latestTag() ?: return@launch   // silent on failure
+            settingsStore.lastUpdateCheckMs = System.currentTimeMillis()
+            settingsStore.lastKnownTag = tag
+            // Recompute rather than trusting the cache: this also CLEARS the banner
+            // once the user has actually updated, which is the only way it goes away.
+            update { it.copy(updateTag = if (UpdateChecker.isNewer(tag, mine)) tag else null) }
+        }
+    }
+
+    /** Open the releases page. Notify-only: we never download or install an APK. */
+    fun releasesUrl(): String = UpdateChecker.RELEASES_PAGE
 
     private inline fun updateSettings(block: (Settings) -> Settings) {
         val s = block(_state.value.settings)

@@ -22,6 +22,7 @@ crash-safety of the code that runs on the single UDP thread.
 
 import base64
 import os
+import re
 import socket
 import sys
 import threading
@@ -1123,6 +1124,162 @@ class UriAndToken(unittest.TestCase):
         self.assertNotIn("+", b64)
         self.assertNotIn("/", b64)
         self.assertEqual(base64.urlsafe_b64decode(b64 + "==="), KEY)
+
+
+# ── update check ─────────────────────────────────────────────────────────────
+class UpdateCheck(unittest.TestCase):
+    """The only outbound internet request in the product. Nothing here touches the
+    network: fetch_latest_release is driven through a stubbed urlopen, so the suite
+    stays hermetic and runs the same offline and in CI."""
+
+    def test_version_parsing_handles_the_shapes_a_tag_can_take(self):
+        for text, want in (
+            ("v2.0.0", (2, 0, 0)),
+            ("2.0.0", (2, 0, 0)),
+            ("V2.1", (2, 1, 0)),          # short form pads, so 2.1 == 2.1.0
+            ("2", (2, 0, 0)),
+            ("2.1.0-rc1", (2, 1, 0)),     # pre-release suffix dropped
+            ("2.1.0+win", (2, 1, 0)),
+            ("1.2.3.4", (1, 2, 3, 4)),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(rs.parse_version(text), want)
+
+    def test_unparseable_versions_are_rejected_not_guessed(self):
+        for text in ("", None, "latest", "v", "2.x", "2..0", "abc", "1.2.3.4.5", "-1"):
+            with self.subTest(text=text):
+                self.assertIsNone(rs.parse_version(text))
+
+    def test_versions_compare_numerically_not_lexically(self):
+        # The bug this pins: as strings "2.0.10" < "2.0.9", so a lexical compare
+        # would stop offering updates after the ninth patch of any minor.
+        self.assertTrue(rs.is_newer_version("2.0.10", "2.0.9"))
+        self.assertFalse(rs.is_newer_version("2.0.9", "2.0.10"))
+        self.assertTrue(rs.is_newer_version("v2.1.0", "2.0.99"))
+        self.assertTrue(rs.is_newer_version("3.0.0", "2.9.9"))
+
+    def test_same_version_is_not_an_update(self):
+        self.assertFalse(rs.is_newer_version("2.0.0", "2.0.0"))
+        self.assertFalse(rs.is_newer_version("v2.0.0", "2.0.0"))
+        self.assertFalse(rs.is_newer_version("2.0", "2.0.0"))     # padded equal
+
+    def test_older_release_is_never_reported_as_an_update(self):
+        # Guards against a rollback/mis-tag on the repo nagging every user forever.
+        self.assertFalse(rs.is_newer_version("1.5.1", "2.0.0"))
+
+    def test_garbled_tag_is_never_reported_as_an_update(self):
+        for tag in ("latest", "", None, "release-two"):
+            with self.subTest(tag=tag):
+                self.assertFalse(rs.is_newer_version(tag, "2.0.0"))
+
+    # --- fetch, with urlopen stubbed -----------------------------------------
+    def _stub_urlopen(self, *, body=None, status=200, raises=None):
+        """Replace urllib.request.urlopen for one test. Returns a list that records
+        the Request objects passed in, so header/URL assertions are possible."""
+        import urllib.request
+        seen = []
+
+        class _Resp:
+            status = None
+
+            def __init__(self, payload):
+                self._payload = payload
+                self.status = status
+
+            def read(self, n=None):
+                return self._payload if n is None else self._payload[:n]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake(req, timeout=None):
+            seen.append(req)
+            if raises is not None:
+                raise raises
+            return _Resp(body if isinstance(body, bytes) else str(body).encode())
+
+        real = urllib.request.urlopen
+        urllib.request.urlopen = fake
+        self.addCleanup(lambda: setattr(urllib.request, "urlopen", real))
+        return seen
+
+    def test_fetch_returns_the_tag_name(self):
+        self._stub_urlopen(body=b'{"tag_name": "v2.3.0", "name": "LazeR v2.3"}')
+        self.assertEqual(rs.fetch_latest_release(), "v2.3.0")
+
+    def test_fetch_sends_a_user_agent_because_github_403s_without_one(self):
+        seen = self._stub_urlopen(body=b'{"tag_name": "v2.0.0"}')
+        rs.fetch_latest_release()
+        self.assertEqual(len(seen), 1)
+        ua = seen[0].get_header("User-agent")
+        self.assertTrue(ua and ua.startswith("LazeR/"), f"missing User-Agent: {ua!r}")
+
+    def test_fetch_sends_no_credentials_or_identifying_data(self):
+        # The request must stay anonymous: no token, no cookie, no device id.
+        seen = self._stub_urlopen(body=b'{"tag_name": "v2.0.0"}')
+        rs.fetch_latest_release()
+        headers = {k.lower() for k in seen[0].headers}
+        for banned in ("authorization", "cookie", "x-api-key"):
+            self.assertNotIn(banned, headers)
+        self.assertIsNone(seen[0].data, "update check must be a GET, not a POST")
+
+    def test_every_failure_mode_is_silent_and_returns_none(self):
+        # Offline, DNS failure, rate limit, 5xx, HTML error page, truncated JSON —
+        # all mean "we don't know", which must never surface as an error.
+        for label, kw in (
+            ("connection error", {"raises": OSError("unreachable")}),
+            ("timeout", {"raises": TimeoutError()}),
+            ("non-200", {"body": b'{"tag_name": "v9.9.9"}', "status": 403}),
+            ("html body", {"body": b"<html>rate limited</html>"}),
+            ("truncated json", {"body": b'{"tag_name": '}),
+            ("json but not an object", {"body": b'["v2.0.0"]'}),
+            ("object without tag_name", {"body": b'{"name": "LazeR v2.3"}'}),
+            ("tag_name not a string", {"body": b'{"tag_name": 23}'}),
+            ("blank tag_name", {"body": b'{"tag_name": "   "}'}),
+        ):
+            with self.subTest(label):
+                self._stub_urlopen(**kw)
+                self.assertIsNone(rs.fetch_latest_release())
+
+    def test_read_is_capped_so_a_hostile_body_cannot_exhaust_memory(self):
+        # We only need one short field from a host we don't control.
+        huge = b'{"tag_name": "v2.1.0", "body": "' + b"A" * 500_000 + b'"}'
+        self._stub_urlopen(body=huge)
+        # Truncated at 64k mid-string ⇒ invalid JSON ⇒ None, rather than a 500kB read.
+        self.assertIsNone(rs.fetch_latest_release())
+
+    def test_check_for_update_pairs_the_tag_with_the_verdict(self):
+        self._stub_urlopen(body=b'{"tag_name": "v99.0.0"}')
+        self.assertEqual(rs.check_for_update(), ("v99.0.0", True))
+        self._stub_urlopen(body=f'{{"tag_name": "v{rs.APP_VERSION}"}}'.encode())
+        self.assertEqual(rs.check_for_update(), (f"v{rs.APP_VERSION}", False))
+        self._stub_urlopen(raises=OSError("offline"))
+        self.assertEqual(rs.check_for_update(), (None, False))
+
+    def test_app_version_is_parseable_and_matches_the_apk(self):
+        # A stale APP_VERSION would either nag forever or never nag. The APK's
+        # versionName is the value publish_release.ps1 asserts the git tag against,
+        # so the two must agree or the server compares against the wrong baseline.
+        self.assertIsNotNone(rs.parse_version(rs.APP_VERSION))
+        gradle = os.path.join(os.path.dirname(__file__), "..", "..",
+                             "android", "app", "build.gradle.kts")
+        if not os.path.exists(gradle):
+            self.skipTest("android module not present")
+        with open(gradle, "r", encoding="utf-8") as f:
+            m = re.search(r'versionName\s*=\s*"([^"]+)"', f.read())
+        self.assertIsNotNone(m, "couldn't read versionName from build.gradle.kts")
+        self.assertEqual(rs.APP_VERSION, m.group(1),
+                         "server APP_VERSION and APK versionName have drifted")
+
+    def test_the_releases_url_is_the_official_repo_over_https(self):
+        # A typo'd or http:// endpoint would send the request somewhere else.
+        for url in (rs.RELEASES_API, rs.RELEASES_PAGE):
+            self.assertTrue(url.startswith("https://"), url)
+        self.assertIn("B-ismark/lazeR", rs.RELEASES_API)
+        self.assertIn("B-ismark/lazeR", rs.RELEASES_PAGE)
 
 
 if __name__ == "__main__":
