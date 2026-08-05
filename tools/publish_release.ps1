@@ -35,6 +35,25 @@ if (-not $Yes) {
     if ($ans -notmatch '^[Yy]') { Write-Host "Aborted."; exit 0 }
 }
 
+# --- tag must match the APK's versionName ------------------------------------
+# These drifted for six releases: versionCode/versionName sat at 1/"1.0" while tags
+# marched to v1.5.1, so every published APK self-reported the same version. Fail loudly
+# rather than shipping a mislabelled artifact.
+$gradleFile = Join-Path $root "android\app\build.gradle.kts"
+$vnMatch = Select-String -Path $gradleFile -Pattern 'versionName\s*=\s*"([^"]+)"' |
+           Select-Object -First 1
+if (-not $vnMatch) {
+    Write-Host "Could not read versionName from $gradleFile." -ForegroundColor Red; exit 1
+}
+$versionName = $vnMatch.Matches[0].Groups[1].Value
+$tagVersion  = $Tag.TrimStart('v')
+if ($tagVersion -ne $versionName) {
+    Write-Host "Tag '$Tag' does not match versionName '$versionName' in build.gradle.kts." -ForegroundColor Red
+    Write-Host "Bump versionName/versionCode, or pass -Tag v$versionName." -ForegroundColor Yellow
+    exit 1
+}
+Write-Host "Version check: $Tag matches versionName $versionName" -ForegroundColor Green
+
 # --- gh must be authenticated -------------------------------------------------
 $gh = (Get-Command gh -ErrorAction SilentlyContinue).Source
 if (-not $gh) { Write-Host "gh CLI not installed (winget install GitHub.cli)." -ForegroundColor Red; exit 1 }

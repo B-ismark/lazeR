@@ -57,15 +57,18 @@ class RemoteClient {
             // HELLO → (encrypted CHAL → AUTH) → OK on the secure wire; plain HELLO →
             // OK on v1.
             val ok = handshakeWithFallback(sock, addr, port, timeoutMs, rawKey)
-            sock.soTimeout = 0
             if (ok) {
                 // The server answers OK to every retried HELLO/AUTH, so drain the
                 // duplicates before the first PING/VGET can misread one.
                 drainStale(sock)
                 sender = Executors.newSingleThreadExecutor()
-            } else {
-                close()
             }
+            // AFTER the drain, not before: drainStale sets a 60ms read timeout and
+            // doesn't restore it, so clearing first would leave the live socket with
+            // that timeout instead of blocking. Harmless today (awaitReply always
+            // sets its own) but a trap for the next blocking read added here.
+            sock.soTimeout = 0
+            if (!ok) close()
             ok
         } catch (e: Exception) {
             close()
@@ -137,7 +140,10 @@ class RemoteClient {
         sock: DatagramSocket, addr: InetAddress, port: Int, budgetMs: Long, stepMs: Int = 250,
     ): Boolean {
         val ch = channel
-        val buf = ByteArray(64)
+        // Generously sized: a sealed CHAL is already 57 bytes, and DatagramPacket
+        // TRUNCATES silently rather than erroring, so a reply that outgrew the buffer
+        // would fail to decrypt with no diagnostic at all.
+        val buf = ByteArray(256)
         sock.soTimeout = stepMs
         val deadline = System.currentTimeMillis() + budgetMs
         var nonce: String? = null
@@ -226,7 +232,7 @@ class RemoteClient {
     private fun awaitReply(prefix: String, timeoutMs: Int): List<String>? {
         val sock = socket ?: return null
         val deadline = System.currentTimeMillis() + timeoutMs
-        val buf = ByteArray(64)
+        val buf = ByteArray(256)   // see doHandshake: silent truncation, so leave room
         while (true) {
             val remaining = (deadline - System.currentTimeMillis()).toInt()
             if (remaining <= 0) return null

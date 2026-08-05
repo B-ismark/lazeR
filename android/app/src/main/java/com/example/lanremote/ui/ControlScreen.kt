@@ -95,6 +95,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.toShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -173,6 +174,18 @@ fun ControlScreen(state: UiState, a: ControlActions) {
 
     // Immersive while the trackpad is expanded.
     val view = LocalView.current
+    // Leaving the screen entirely never flipped `fullscreen` back, so a link that
+    // dropped while expanded (the health loop declaring the laptop dead) left the
+    // connection screen rendering underneath hidden system bars.
+    DisposableEffect(Unit) {
+        onDispose {
+            val window = (view.context as? Activity)?.window
+            if (window != null) {
+                WindowCompat.getInsetsController(window, view)
+                    .show(WindowInsetsCompat.Type.systemBars())
+            }
+        }
+    }
     LaunchedEffect(fullscreen) {
         val window = (view.context as? Activity)?.window ?: return@LaunchedEffect
         val controller = WindowCompat.getInsetsController(window, view)
@@ -947,6 +960,19 @@ private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 chip("Undo") { a.onCombo("ctrl z") }
                 chip("Redo") { a.onCombo("ctrl y") }
+            }
+
+            // Slides. The PRES verb has been implemented on the server, documented
+            // in PROTOCOL.md and wired through ControlActions since the first commit,
+            // but nothing ever called it — the feature was complete and unreachable.
+            Spacer(Modifier.height(20.dp))
+            SheetTitle("Slides")
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                chip("Start") { a.onPresentation("start") }
+                chip("Prev") { a.onPresentation("prev") }
+                chip("Next") { a.onPresentation("next") }
+                chip("Blank") { a.onPresentation("blank") }
+                chip("End") { a.onPresentation("end") }
             }
 
             Spacer(Modifier.height(20.dp))

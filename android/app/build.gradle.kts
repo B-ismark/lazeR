@@ -14,8 +14,12 @@ android {
         applicationId = "com.example.lanremote"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        // Bumped for v2.0: off-LAN access removed and the wire gained the L3
+        // dialect. These were left at 1/"1.0" through six tagged releases, so every
+        // shipped APK claimed the same version and users couldn't tell builds apart.
+        // publish_release.ps1 now asserts -Tag matches versionName.
+        versionCode = 20000
+        versionName = "2.0.0"
     }
 
     signingConfigs {

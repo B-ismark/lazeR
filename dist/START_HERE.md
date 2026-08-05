@@ -63,7 +63,8 @@ Phone and laptop on the **same Wi-Fi**. Open **LazeR**, then either:
 Saved laptops show on the start screen — tap one to reconnect instantly (the server's
 token is persistent, so it keeps working across restarts).
 
-- **Trackpad** (bottom): drag = move, tap = left-click, **hold = right-click**.
+- **Trackpad** (bottom): drag = move, tap = left-click, **two-finger tap =
+  right-click**. Holding does nothing on purpose, so a resting hand never clicks.
 - **Two fingers**: vertical = scroll · **horizontal swipe = browser back / forward**
   (like a Windows touchpad). **Three fingers** left/right = switch apps.
 - **Scroll strip** on the trackpad's right edge.
