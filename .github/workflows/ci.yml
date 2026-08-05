@@ -1,0 +1,72 @@
+name: CI
+
+# The v2 secure wire is implemented twice (Python `Wire` + Kotlin `SecureChannel`)
+# and must agree byte for byte. Both suites assert the SAME golden packet, so this
+# workflow is what stops the two drifting apart.
+on:
+  push:
+    branches: [main, 'claude/**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  server:
+    name: server — wire tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Only cryptography is needed: the tests stub pynput, so no input backend
+      # and no X11 display are required (that's why they run headless in CI at all).
+      - name: Install test dependencies
+        run: python -m pip install --quiet --disable-pip-version-check cryptography
+
+      - name: Syntax-check both servers
+        run: python -m py_compile server/remote_server.py rendezvous/rendezvous_server.py
+
+      # -t is the tests dir itself so discovery imports test_wire directly and the
+      # repo needs no __init__.py packages.
+      - name: Wire + dispatch tests
+        run: python -m unittest discover -s server/tests -t server/tests -v
+
+  android:
+    name: android — unit tests + debug build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      # Pinned toolchain — see android/EXPRESSIVE_MIGRATION.md. material3 is held
+      # at 1.5.0-alpha12, which keeps compileSdk 35 / AGP 8.7.3 / Gradle 8.9.
+      - name: Install SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # Debug only: assembleRelease signs with the local ~/.android/debug.keystore
+      # "sideload" config, which doesn't exist on a runner.
+      - name: Unit tests
+        working-directory: android
+        run: ./gradlew :app:testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Debug build
+        working-directory: android
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Upload test report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-report
+          path: android/app/build/reports/tests/
+          if-no-files-found: ignore

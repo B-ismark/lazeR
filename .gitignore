@@ -10,6 +10,8 @@ android/local.properties
 # --- Python ---
 __pycache__/
 *.pyc
+# The uv-managed venv CLAUDE.md tells you to create (server/.venv) — machine-local.
+.venv/
 
 # --- PyInstaller / native build output ---
 /build/
