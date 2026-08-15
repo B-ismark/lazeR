@@ -83,6 +83,34 @@ great RSSI/rate. Acquiring a WifiLock **requires `android.permission.WAKE_LOCK`*
 `CHANGE_WIFI_STATE`, the common wrong guess); without it `acquire()` throws a swallowed
 `SecurityException` and the lock silently never engages. **Keep WAKE_LOCK.**
 
+### Sleep / resume recovery (don't reintroduce these)
+
+Recovering from a laptop sleep must need **no restart and no re-tap**. Four rules
+keep that true:
+
+- **Nothing on the UDP thread may raise.** `serve_loop` is the only thread serving
+  the phone; anything escaping it left the laptop deaf with the window still green.
+  `serve_forever` restarts it as a backstop, but new code above the handler guard
+  (the HELLO/AUTH/PING/VGET/BGET branches) must handle its own errors. The original
+  offender was `get_volume()`: a pycaw `IAudioEndpointVolume` captured once at import
+  goes stale on resume or an output-device change, and VGET is the phone's liveness
+  probe — so the first poll after every sleep killed the loop. It's re-acquired on
+  demand now, and may return `None`.
+- **Never publish `lan_ip()` directly.** It falls back to `127.0.0.1` so the GUI
+  always renders; publishing that into mDNS or the QR poisons discovery until a
+  restart. Use `usable_lan_ip()`, which returns `None` instead, and announce via
+  `announce_network()`.
+- **Re-read the address on a timer, not only after a sleep gap.** Roaming and DHCP
+  changes move us with no gap at all (`NET_WATCH_S`).
+- **The phone's reconnect loop has no give-up.** It backs off but never stops, since
+  every bounded window is shorter than a real sleep. `kickReconnect()` short-circuits
+  the backoff on app-foreground and network-available.
+
+Windows low-level hooks are revoked across a wake/lock and their key-UPs are never
+delivered, so `LocalInputGuard.rearm()` re-installs them and clears the held-key set —
+without that, stale modifiers made an innocent `L` trigger the panic latch, which
+silently stops all remote input on a session that still looks connected.
+
 ## Environment gotchas (Windows)
 
 - **This repo lives under OneDrive**, which locks `build/` mid-compile and fails

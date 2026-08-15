@@ -2,6 +2,8 @@ package com.example.lanremote
 
 import android.app.Application
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -16,7 +18,9 @@ import com.example.lanremote.data.SettingsStore
 import com.example.lanremote.data.UpdateChecker
 import com.example.lanremote.net.RemoteClient
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -39,13 +43,18 @@ private fun ipv4ToInt(s: String): Int? {
 private const val ACCEL_REF_PX = 12f
 private const val ACCEL_MAX = 2.2f
 private const val MOVE_GAP_RESET_MS = 120L   // idle gap ⇒ treat the next move as a fresh gesture
-// How long beginReconnect keeps auto-retrying before it gives up and shows an
-// actionable error instead of an endless spinner. Generous enough to ride out a
-// laptop sleep/resume or a full reboot hands-free, but bounded so a permanently
-// failing handshake (e.g. the laptop was re-paired and now has a different key —
-// which can NEVER succeed with the stored key) doesn't strand the user on the
-// "Reconnecting" screen forever.
-private const val RECONNECT_GIVEUP_MS = 90_000L
+// How long beginReconnect retries at its fast cadence before it (a) explains what's
+// probably wrong and (b) drops to RETRY_MAX_MS. It no longer STOPS at this point —
+// it used to, and that was the bug behind "I have to reconnect after every sleep":
+// the laptop is unreachable for far longer than any bounded window while it's
+// asleep, so the phone had always given up by the time it woke. A permanently
+// failing handshake (a re-paired laptop, whose new key the stored one can never
+// match) is handled by showing the message, not by abandoning the retry.
+private const val RECONNECT_EXPLAIN_MS = 90_000L
+// Retry cadence once an outage is clearly not a blip. Slow enough to be free on
+// battery overnight, brisk enough that a laptop waking up is picked up promptly —
+// and the foreground/network hints in kickReconnect short-circuit the wait anyway.
+private const val RETRY_MAX_MS = 15_000L
 // Speed-adaptive delta smoothing (one-euro style): near-still input is low-pass
 // filtered to kill capacitive jitter; fast flicks pass straight through so the cursor
 // never lags. Blend ramps from SMOOTH_FLOOR (slow) to 1.0 (fast).
@@ -90,6 +99,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var lastUserBrightnessMs: Long = 0
     private var lastInteractionMs: Long = 0   // drives adaptive health-poll backoff
     private var current: Device? = null   // device we're connected to / reconnecting
+    // "Try again now" signal into the reconnect loop's wait. CONFLATED because these
+    // are hints, not a queue — several arriving at once should cost one extra attempt,
+    // not one per sender.
+    private val reconnectKick = Channel<Unit>(Channel.CONFLATED)
 
     // Held for the duration of a live session. Trackpad packets are tiny, frequent UDP
     // datagrams; when the phone's Wi-Fi radio drops into power-save between beacons (how
@@ -129,9 +142,28 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
 
+    // Wakes the retry the moment Wi-Fi is usable again, instead of leaving it to the
+    // backoff. The two halves go down together far more often than either goes down
+    // alone — the phone roams, the router reboots, the laptop sleeps and the phone
+    // drops to mobile data — so "a network just became available" is the single best
+    // signal that another attempt is worth making right now.
+    private val connectivity: ConnectivityManager? =
+        app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+
+    private val netCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            viewModelScope.launch { kickReconnect() }
+        }
+    }
+
     init {
         discovery.start { hosts ->
             update { it.copy(discovered = hosts) }
+        }
+        try {
+            connectivity?.registerDefaultNetworkCallback(netCallback)
+        } catch (_: Exception) {
+            // Callback registration is best-effort — the timed retry still runs.
         }
         // Silently re-try the last device on launch, if any.
         val lastId = settingsStore.lastDeviceId
@@ -263,6 +295,14 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             ip = ip, port = port, token = token, key = key)
         current = dev
         reconnectJob?.cancel()
+        // Cancel the watchdog too — this used to cancel only the reconnect job, and a
+        // health loop left alive shares ONE DatagramSocket with the handshake below.
+        // awaitReply discards any reply that isn't the prefix it wants, so a lingering
+        // queryVolume would swallow the CHAL or the OK the handshake was waiting for,
+        // and the connect timed out for no visible reason. Tapping the device again
+        // just re-ran the same race. It could also declare the link dead mid-connect
+        // and drag us into beginReconnect on top of the attempt in flight.
+        healthJob?.cancel()
         update { it.copy(conn = ConnState.Connecting, error = null) }
         viewModelScope.launch {
             val connected = connectResolving(dev, 2000)
@@ -329,6 +369,16 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** True if [ip] is an address a laptop could plausibly be reachable at from here.
+     *  Rejects loopback and link-local; anything we can't parse is left alone so a
+     *  hostname or IPv6 literal still gets its chance. */
+    private fun usableHost(ip: String): Boolean {
+        val v4 = ipv4ToInt(ip) ?: return true
+        val a = (v4 ushr 24) and 0xFF
+        val b = (v4 ushr 16) and 0xFF
+        return a != 127 && a != 0 && !(a == 169 && b == 254)
+    }
+
     private fun localIPv4s(): List<LocalV4> = try {
         java.net.NetworkInterface.getNetworkInterfaces().asSequence()
             .filter { it.isUp && !it.isLoopback }
@@ -352,6 +402,12 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         if (client.connect(dev.ip, dev.port, dev.token, dev.key, timeoutMs)) return dev
         val candidates = _state.value.discovered
             .filterNot { it.ip == dev.ip && it.port == dev.port }
+            // Drop addresses that can't be a laptop on this LAN. A server that
+            // re-announced itself while its Wi-Fi was still coming up used to publish
+            // the 127.0.0.1 fallback, and dialing that means dialing this phone —
+            // which burns a full handshake timeout per attempt for an address that
+            // can never answer. Cheap to skip, and it also filters link-local junk.
+            .filter { usableHost(it.ip) }
         for (h in candidates) {
             if (client.connect(h.ip, h.port, dev.token, dev.key, timeoutMs)) {
                 return dev.copy(ip = h.ip, port = h.port)
@@ -427,21 +483,33 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Keep retrying the current device until it answers, the user backs out, or the
-     *  give-up window elapses. mDNS runs during reconnect so a laptop that came back on
-     *  a new IP can still be found and re-pinned (the saved address is refreshed on
-     *  success). After RECONNECT_GIVEUP_MS of continuous failure we stop and drop to
-     *  Disconnected with an actionable message rather than spinning forever — the old
-     *  loop had no exit, so a re-paired laptop (new key, handshake can never complete)
-     *  or a laptop that stays unreachable left the app stuck on "Reconnecting". */
+    /** Keep retrying the current device until it answers or the user backs out.
+     *
+     *  mDNS runs during reconnect so a laptop that came back on a new IP can still be
+     *  found and re-pinned (the saved address is refreshed on success).
+     *
+     *  This used to STOP after 90s and drop to the connect screen. The reasoning was
+     *  sound — a re-paired laptop can never complete the handshake, so an endless
+     *  spinner with no explanation is worse than an error — but the window is far
+     *  shorter than the outage it has to survive. A laptop asleep over lunch,
+     *  overnight, or through a reboot is unreachable for far longer than 90s, so the
+     *  phone had always given up by the time it came back, and every single sleep
+     *  ended in a manual reconnect.
+     *
+     *  So the retry no longer ends: it slows down (2s while it's plausibly a blip, out
+     *  to RETRY_MAX_MS once the outage is clearly long) and surfaces the actionable
+     *  message on the reconnect screen instead of navigating away. The user keeps the
+     *  Cancel button either way, which is the deliberate exit; what's gone is the
+     *  automatic one that fired exactly when the laptop was still asleep. */
     private fun beginReconnect() {
         healthJob?.cancel()
         val dev = current ?: return disconnect()
-        update { it.copy(conn = ConnState.Reconnecting) }
+        update { it.copy(conn = ConnState.Reconnecting, error = null) }
         reconnectJob?.cancel()
         discovery.start { hosts -> update { it.copy(discovered = hosts) } }
         reconnectJob = viewModelScope.launch {
             val startMs = System.currentTimeMillis()
+            var explained = false
             while (isActive) {
                 val c = connectResolving(dev, 1200)
                 if (c != null) {
@@ -456,22 +524,43 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     startHealthLoop()
                     return@launch
                 }
-                if (System.currentTimeMillis() - startMs > RECONNECT_GIVEUP_MS) {
-                    // Give up the auto-retry. Keep `current` and lastDeviceId intact so
-                    // a tap (or next launch) can retry without re-adding the device, but
-                    // release the radio lock and tell the user what to try next.
-                    holdWifi(false)
+                val elapsed = System.currentTimeMillis() - startMs
+                if (elapsed > RECONNECT_EXPLAIN_MS && !explained) {
+                    // Long enough that this isn't a blip: say what's likely wrong and
+                    // what would fix it — while STILL retrying underneath, so a laptop
+                    // that wakes up an hour later reconnects with nothing to tap.
+                    explained = true
                     update {
-                        it.copy(conn = ConnState.Disconnected,
-                            error = "Couldn't reconnect to ${dev.name}. " +
-                                connectFailureMessage(dev) +
-                                " If you re-paired the laptop, scan its new QR.")
+                        it.copy(error = connectFailureMessage(dev) +
+                            " If you re-paired the laptop, scan its new QR.")
                     }
-                    return@launch
+                    // Stop pinning the radio awake once we're in the long tail —
+                    // holding a low-latency Wi-Fi lock through a multi-hour outage
+                    // costs real battery for a link that isn't there.
+                    holdWifi(false)
                 }
-                delay(2000)
+                // Fast while it's likely transient, then ease off. Same shape as the
+                // health loop's backoff, and it keeps a long outage from polling the
+                // radio every 2s all night. A kick (app foregrounded, network back)
+                // cuts the wait short so the retry lands at the moment it's most
+                // likely to succeed instead of up to RETRY_MAX_MS later.
+                val wait = if (elapsed > RECONNECT_EXPLAIN_MS) RETRY_MAX_MS else 2000L
+                withTimeoutOrNull(wait) { reconnectKick.receive() }
             }
         }
+    }
+
+    /** The app came back to the foreground, or the phone rejoined a network.
+     *
+     *  Either is a strong hint that the thing we've been failing to reach may be
+     *  reachable NOW, and waiting out the backoff wastes the one moment the user is
+     *  actually looking at the screen. Nudges the running retry to try again
+     *  immediately — deliberately NOT a restart of the loop, which would reset the
+     *  elapsed clock and so keep re-arming the Wi-Fi lock and re-suppressing the
+     *  diagnosis every time the app was reopened. A no-op unless we're reconnecting. */
+    fun kickReconnect() {
+        if (_state.value.conn != ConnState.Reconnecting) return
+        reconnectKick.trySend(Unit)
     }
 
     fun deleteDevice(device: Device) {
@@ -644,6 +733,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         discovery.stop()
         client.disconnect()
         holdWifi(false)   // safety net: never leak the Wi-Fi lock if the VM dies mid-session
+        try {
+            connectivity?.unregisterNetworkCallback(netCallback)
+        } catch (_: Exception) {
+            // never registered, or already gone
+        }
         super.onCleared()
     }
 

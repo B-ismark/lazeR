@@ -6,6 +6,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.viewModels
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -35,16 +36,36 @@ import com.example.lanremote.util.Haptics
 import com.example.lanremote.util.startQrScan
 
 class MainActivity : ComponentActivity() {
+
+    // Held here rather than only inside the composable so onResume can reach it. Same
+    // instance either way — both resolve against this activity's ViewModelStore.
+    private val vm: RemoteViewModel by viewModels()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         setContent {
             LanRemoteTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    RemoteApp()
+                    RemoteApp(vm)
                 }
             }
         }
+    }
+
+    /**
+     * Coming back to the app is the moment to retry, not a moment to wait.
+     *
+     * The usual sequence is: laptop sleeps, phone goes in a pocket, both come back
+     * minutes or hours later. The reconnect loop is still running by then (it no
+     * longer gives up), but it's on its slow cadence, and Android may have been
+     * holding its sockets down while the app was backgrounded. Picking the phone up
+     * is the user saying "now" — so retry immediately instead of making them watch a
+     * spinner tick down, or tap a device they never meant to disconnect from.
+     */
+    override fun onResume() {
+        super.onResume()
+        vm.kickReconnect()
     }
 }
 
@@ -107,6 +128,7 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
         )
         ConnState.Reconnecting -> ReconnectingScreen(
             name = state.name.ifBlank { state.ip },
+            hint = state.error,
             onCancel = vm::disconnect,
         )
         else -> ConnectionScreen(
@@ -143,9 +165,15 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
     }
 }
 
+/**
+ * [hint] is the diagnosis the reconnect loop reaches once an outage has gone on long
+ * enough to be worth explaining. It replaces the generic line rather than joining it,
+ * and it does NOT mean the retry has stopped — the loop keeps going underneath, so a
+ * laptop that wakes up later reconnects on its own with nothing to tap.
+ */
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun ReconnectingScreen(name: String, onCancel: () -> Unit) {
+private fun ReconnectingScreen(name: String, hint: String?, onCancel: () -> Unit) {
     Column(
         modifier = Modifier.fillMaxSize().padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -160,12 +188,21 @@ private fun ReconnectingScreen(name: String, onCancel: () -> Unit) {
             modifier = Modifier.padding(top = 20.dp),
         )
         Text(
-            "Connection dropped. Make sure the laptop and Wi-Fi are still on.",
+            hint ?: "Connection dropped. Make sure the laptop and Wi-Fi are still on.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
             modifier = Modifier.padding(top = 8.dp),
         )
+        if (hint != null) {
+            Text(
+                "Still trying — it will reconnect by itself once the laptop is back.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 12.dp),
+            )
+        }
         OutlinedButton(onClick = onCancel, modifier = Modifier.padding(top = 24.dp)) {
             Text("Cancel")
         }
