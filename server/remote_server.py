@@ -1155,6 +1155,92 @@ def _clamp_int(tok, limit):
     return max(-limit, min(limit, int(tok)))
 
 
+# Verbs that move or press the pointer, and so should make it visible first.
+# Deliberately NOT every verb: PING/VGET are the phone's idle polling, and waking
+# the pointer on those would keep the laptop out of idle sleep forever.
+POINTER_VERBS = frozenset({
+    "MOVE", "SCROLL", "ZOOM", "CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP",
+})
+
+
+def make_pointer_waker():
+    """Return a callable that un-hides the mouse pointer, or None off Windows.
+
+    Windows only draws the pointer while it believes the most recent input came
+    from a mouse. pynput moves the cursor with SetCursorPos, and SetCursorPos does
+    NOT register as input — measured on Windows 11: it never advances
+    GetLastInputInfo, while a SendInput mouse event does, every time.
+
+    So remote movement drove an invisible pointer. Hover states lit up and clicks
+    landed exactly where they should; the user simply couldn't see where "there"
+    was, and only touching the physical mouse brought it back. It showed up after
+    a resume and on a fresh connect — any moment the system's last input wasn't a
+    real mouse.
+
+    The fix is a zero-delta SendInput: a genuine mouse event that moves nothing,
+    so the pointer reappears without being displaced and without Windows' pointer
+    ballistics touching our carefully-tuned deltas (which is why the movement
+    itself stays on SetCursorPos rather than switching wholesale to SendInput).
+
+    Only fired when the pointer is actually hidden, so the normal path costs one
+    cheap GetCursorInfo and nothing else. CURSOR_SUPPRESSED matters as much as a
+    clear CURSOR_SHOWING: that's the specific state Windows 8+ puts the pointer in
+    after touch input, which is how a touchscreen laptop lands here mid-session."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+
+        class CURSORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                        ("hCursor", wintypes.HANDLE),
+                        ("ptScreenPos", wintypes.POINT)]
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                        ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("mi", MOUSEINPUT)]
+
+        INPUT_MOUSE = 0
+        MOUSEEVENTF_MOVE = 0x0001
+        CURSOR_SHOWING, CURSOR_SUPPRESSED = 0x0001, 0x0002
+
+        nudge = INPUT(type=INPUT_MOUSE,
+                      mi=MOUSEINPUT(dx=0, dy=0, mouseData=0,
+                                    dwFlags=MOUSEEVENTF_MOVE, time=0,
+                                    dwExtraInfo=None))
+        info = CURSORINFO()
+        info.cbSize = ctypes.sizeof(CURSORINFO)
+        size = ctypes.sizeof(INPUT)
+
+        def wake():
+            # Never let this break a MOVE. It is a cosmetic assist, and it runs on
+            # the single receive thread, where the cost of a raise is the whole
+            # session.
+            try:
+                if not user32.GetCursorInfo(ctypes.byref(info)):
+                    return
+                if (info.flags & CURSOR_SHOWING) and not (info.flags & CURSOR_SUPPRESSED):
+                    return                      # already visible; nothing to do
+                user32.SendInput(1, ctypes.byref(nudge), size)
+            except Exception:
+                pass
+
+        return wake
+    except Exception:
+        return None
+
+
+wake_pointer = make_pointer_waker()
+
+
 def handle_packet(verb, rest):
     """Drive the machine for one authenticated verb.
 
@@ -1164,6 +1250,9 @@ def handle_packet(verb, rest):
     PLAINTEXT straight to the socket; they were dead code (serve_loop intercepts
     both first) but would have leaked in clear the moment dispatch order changed.
     Removing the parameters means a future handler can't reintroduce that."""
+    if wake_pointer is not None and verb in POINTER_VERBS:
+        wake_pointer()
+
     if verb == "MOVE":
         try:
             a, b = rest.split()

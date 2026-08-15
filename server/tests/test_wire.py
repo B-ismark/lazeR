@@ -1439,6 +1439,65 @@ class InputGuardRearm(unittest.TestCase):
         guard.rearm()
 
 
+class PointerVisibility(unittest.TestCase):
+    """Windows only draws the pointer while it thinks the last input was a mouse.
+
+    pynput moves it with SetCursorPos, which does not register as input — measured
+    on Windows 11: SetCursorPos never advances GetLastInputInfo, SendInput always
+    does. So remote movement drove an INVISIBLE pointer: hover states lit up and
+    clicks landed, but the user could not see where, and only touching the real
+    mouse brought it back. A zero-delta SendInput fixes it without moving the
+    pointer or putting Windows' pointer ballistics on our deltas."""
+
+    def setUp(self):
+        self._saved = (rs.mouse, rs.keyboard)
+        rs.mouse, rs.keyboard = _Recorder(), _Recorder()
+        self.addCleanup(lambda: setattr(rs, "mouse", self._saved[0]))
+        self.addCleanup(lambda: setattr(rs, "keyboard", self._saved[1]))
+
+    def test_pointer_verbs_wake_the_cursor(self):
+        woke = []
+        with mock.patch.object(rs, "wake_pointer", lambda: woke.append(1)):
+            rs.handle_packet("MOVE", "3 -4")
+        self.assertEqual(len(woke), 1, "a MOVE left the pointer hidden")
+        self.assertIn(("move", 3, -4), rs.mouse.calls, "the move itself was lost")
+
+    def test_every_pointer_verb_is_covered(self):
+        for verb, rest in [("MOVE", "1 1"), ("SCROLL", "0 1"), ("ZOOM", "1"),
+                           ("CLICK", ""), ("RCLICK", ""), ("MCLICK", ""),
+                           ("MDOWN", ""), ("MUP", "")]:
+            with self.subTest(verb=verb):
+                woke = []
+                with mock.patch.object(rs, "wake_pointer", lambda: woke.append(1)):
+                    rs.handle_packet(verb, rest)
+                self.assertEqual(len(woke), 1, f"{verb} did not wake the pointer")
+
+    def test_typing_does_not_touch_the_pointer(self):
+        # Keyboard verbs have no business un-hiding a pointer the user is not
+        # driving — Windows hides it while typing on purpose.
+        woke = []
+        with mock.patch.object(rs, "wake_pointer", lambda: woke.append(1)):
+            rs.handle_packet("KEYSP", "enter")
+            rs.handle_packet("COMBO", "ctrl c")
+        self.assertEqual(woke, [])
+
+    def test_idle_polling_is_not_a_pointer_verb(self):
+        # The phone polls PING/VGET/BGET every 1.5-4s forever. Waking the pointer
+        # on those would register input around the clock and keep the laptop out
+        # of idle sleep for as long as the app was open.
+        self.assertFalse({"PING", "VGET", "BGET", "BYE"} & rs.POINTER_VERBS)
+
+    def test_a_missing_waker_is_not_fatal(self):
+        # Off Windows make_pointer_waker returns None and the call is skipped.
+        with mock.patch.object(rs, "wake_pointer", None):
+            rs.handle_packet("MOVE", "2 2")
+        self.assertIn(("move", 2, 2), rs.mouse.calls)
+
+    def test_no_waker_is_built_off_windows(self):
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertIsNone(rs.make_pointer_waker())
+
+
 class LoopSupervision(unittest.TestCase):
     """serve_forever is the backstop for everything not yet found.
 
