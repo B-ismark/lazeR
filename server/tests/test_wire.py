@@ -1328,6 +1328,117 @@ class ServeLoopResilience(unittest.TestCase):
         self.assertNotIn(("click", "<Key.left>", 1), rs.mouse.calls)
 
 
+class _FakeEndpoint:
+    """Stands in for an IAudioEndpointVolume. [dead] mimics the invalidation
+    Windows performs on resume or an output-device change: every call raises."""
+
+    def __init__(self, level=0.56, dead=False):
+        self.level = level
+        self.dead = dead
+
+    def GetMasterVolumeLevelScalar(self):
+        if self.dead:
+            raise OSError("AUDCLNT_E_DEVICE_INVALIDATED")
+        return self.level
+
+    def SetMasterVolumeLevelScalar(self, scalar, _guid):
+        if self.dead:
+            raise OSError("AUDCLNT_E_DEVICE_INVALIDATED")
+        self.level = scalar
+
+
+class WindowsVolumeBackend(unittest.TestCase):
+    """The Windows getter must survive its endpoint going stale.
+
+    This is the bug that made a laptop sleep unrecoverable: the endpoint was
+    captured once at import, the getter had no error handling, and serve_loop
+    calls it inline to answer VGET — above the guard — so the first volume poll
+    after a wake killed the only receive thread. Portable: sys.platform and the
+    pycaw/comtypes imports are stubbed, so it runs on any OS."""
+
+    def _make(self, endpoints):
+        """Build the Windows backend over a queue of endpoints, newest last.
+        Returns (get, set, label, speaker_calls)."""
+        calls = []
+
+        class FakeAudioUtilities:
+            @staticmethod
+            def GetSpeakers():
+                calls.append(1)
+                # Later re-acquisitions get the next endpoint, mimicking Windows
+                # handing back a working one after the device settled.
+                ep = endpoints[min(len(calls), len(endpoints)) - 1]
+                return types.SimpleNamespace(EndpointVolume=ep)
+
+        pycaw_pkg = types.ModuleType("pycaw")
+        pycaw_mod = types.ModuleType("pycaw.pycaw")
+        pycaw_mod.AudioUtilities = FakeAudioUtilities
+        pycaw_mod.IAudioEndpointVolume = object
+        pycaw_pkg.pycaw = pycaw_mod
+
+        with mock.patch.dict(sys.modules, {"pycaw": pycaw_pkg,
+                                           "pycaw.pycaw": pycaw_mod}), \
+                mock.patch.object(sys, "platform", "win32"):
+            get_fn, set_fn, label = rs.make_volume()
+        return get_fn, set_fn, label, calls
+
+    def test_a_healthy_endpoint_is_acquired_once_and_reused(self):
+        get_fn, _set, label, calls = self._make([_FakeEndpoint(0.42)])
+        self.assertEqual(label, "pycaw")
+        self.assertEqual([get_fn() for _ in range(4)], [42, 42, 42, 42])
+        # One lookup at startup (the fail-fast probe); the cached pointer serves
+        # the rest. Re-resolving per call would be a COM round trip per poll.
+        self.assertEqual(len(calls), 1, f"endpoint re-resolved needlessly: {calls}")
+
+    def test_a_stale_endpoint_is_re_acquired_instead_of_raising(self):
+        stale, fresh = _FakeEndpoint(0.42), _FakeEndpoint(0.77)
+        get_fn, _set, _label, calls = self._make([stale, fresh])
+        self.assertEqual(get_fn(), 42)
+
+        stale.dead = True               # the wake / device change happens here
+        before = len(calls)
+        self.assertEqual(get_fn(), 77, "did not recover onto a fresh endpoint")
+        self.assertGreater(len(calls), before, "never re-resolved the endpoint")
+        # And it stays recovered — the new pointer is now the cached one.
+        self.assertEqual(get_fn(), 77)
+
+    def test_a_permanently_dead_backend_degrades_to_none(self):
+        dead_a, dead_b = _FakeEndpoint(dead=True), _FakeEndpoint(dead=True)
+        # The startup probe resolves an endpoint but never calls it, so a backend
+        # whose device dies immediately still constructs — and then answers None.
+        get_fn, set_fn, _label, _calls = self._make([dead_a, dead_b])
+        self.assertIsNone(get_fn(), "a dead device must yield None, not raise")
+        set_fn(50)                      # must also swallow, not raise
+
+    def test_the_setter_recovers_the_same_way(self):
+        stale, fresh = _FakeEndpoint(0.42), _FakeEndpoint(0.10)
+        _get, set_fn, _label, _calls = self._make([stale, fresh])
+        stale.dead = True
+        set_fn(90)
+        self.assertAlmostEqual(fresh.level, 0.90, places=6)
+
+
+class InputGuardRearm(unittest.TestCase):
+    """Key-UPs are not delivered to low-level hooks across a lock screen, so the
+    held-key set keeps whatever was down when the screen locked. With ctrl, alt
+    and shift stuck in it, the next literal 'L' matched the panic chord and
+    latched remote input OFF on a session that still looked connected."""
+
+    def test_rearm_forgets_keys_the_hook_never_saw_released(self):
+        guard = rs.LocalInputGuard(on_physical=lambda: None, on_panic=lambda: None)
+        guard._down.update(rs.LocalInputGuard.PANIC_VKS)
+        self.assertTrue(rs.LocalInputGuard.PANIC_VKS.issubset(guard._down))
+        guard.rearm()                   # no thread started: the clear still runs
+        self.assertEqual(guard._down, set())
+
+    def test_rearm_is_safe_before_the_hook_thread_exists(self):
+        # serve_loop calls this on every wake, including one that lands before the
+        # guard thread has published its id. It must not raise there.
+        guard = rs.LocalInputGuard(on_physical=lambda: None, on_panic=lambda: None)
+        self.assertIsNone(guard._tid)
+        guard.rearm()
+
+
 class LoopSupervision(unittest.TestCase):
     """serve_forever is the backstop for everything not yet found.
 
