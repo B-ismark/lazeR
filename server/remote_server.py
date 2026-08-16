@@ -1240,6 +1240,58 @@ def make_pointer_waker():
 
 wake_pointer = make_pointer_waker()
 
+# Monotonic time of the last remote control verb, and how long after one we keep
+# telling Windows the machine is in use. Sized to outlast a pause for thought
+# mid-task without pinning the display awake once the phone is merely idling.
+_last_remote_ts = [0.0]
+REMOTE_AWAKE_S = 90
+
+
+def make_idle_suppressor():
+    """Return a callable(bool) that holds the machine awake, or None off Windows.
+
+    Remote control did not count as activity, for the same root reason the pointer
+    stayed invisible: SetCursorPos never advances the system's last-input time. So
+    a session driven entirely from the phone let the idle timer run to completion
+    underneath it — the display would blank, and a lock-on-wake policy would lock
+    the machine, while the user was actively using it.
+
+    The tempting fix is to make every move inject a real mouse event. That works,
+    but it works by lying: it fabricates input to move a clock, which also means
+    the phone's idle polling would have to be carefully excluded forever or the
+    laptop could never sleep again. SetThreadExecutionState is the API that exists
+    for exactly this, is what media players use, and says what it means.
+
+    Per-THREAD state, so every call must come from the one that serves the phone —
+    which is why serve_loop owns the transitions rather than the packet handler."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ES_DISPLAY_REQUIRED = 0x00000002
+
+        def hold(active):
+            try:
+                # ES_CONTINUOUS alone RESETS to the machine's normal policy; it
+                # does not "keep it awake with no display". Dropping the other two
+                # flags is how the hold is released.
+                kernel32.SetThreadExecutionState(
+                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+                    if active else ES_CONTINUOUS)
+            except Exception:
+                pass
+
+        return hold
+    except Exception:
+        return None
+
+
+hold_awake = make_idle_suppressor()
+
 
 def handle_packet(verb, rest):
     """Drive the machine for one authenticated verb.
@@ -1250,6 +1302,12 @@ def handle_packet(verb, rest):
     PLAINTEXT straight to the socket; they were dead code (serve_loop intercepts
     both first) but would have leaked in clear the moment dispatch order changed.
     Removing the parameters means a future handler can't reintroduce that."""
+    if verb in CONTROL_VERBS:
+        # Any verb that drives the machine is the user being present, whether or
+        # not it moves the pointer — a phone used purely as a presenter clicker
+        # counts. serve_loop turns this into the actual wake hold.
+        _last_remote_ts[0] = time.monotonic()
+
     if wake_pointer is not None and verb in POINTER_VERBS:
         wake_pointer()
 
@@ -1974,7 +2032,13 @@ def serve_loop(wire, emit, net, hostname):
     blocked_seen = set()     # addresses turned away while a phone is already paired
     plaintext_hinted = False  # explained a secure-only refusal this window
     _client_connected.clear()
+    # Normalize the wake hold. This is per-thread state and serve_forever restarts
+    # us on the SAME thread, so a loop that died mid-session would otherwise leave
+    # the display pinned awake, with awake_held=False here and nothing to release it.
+    if hold_awake is not None:
+        hold_awake(False)
 
+    awake_held = False        # are we currently telling Windows the machine is in use
     net_checked = last_tick   # wall-clock of the last own-address check
     net_pending = False       # our published address is known-stale; keep trying
     net_pending_since = 0.0   # when that became true, to bound the post-wake wait
@@ -2120,6 +2184,22 @@ def serve_loop(wire, emit, net, hostname):
             _remote_paused.clear()
             emit("resumed")
 
+        # Hold the machine awake while the phone is actively driving it, and let go
+        # once it goes quiet. Remote control never counted as activity — the moves
+        # go through SetCursorPos, which does not advance the system's idle timer —
+        # so a session run entirely from the phone would blank the display and, with
+        # a lock-on-wake policy, lock the laptop out from under the user. Only the
+        # transitions are pushed, so a steady session costs one call, not one a
+        # second; and releasing on quiet means an idle phone still lets the laptop
+        # sleep normally. See make_idle_suppressor for why this is a wake hold
+        # rather than fabricated mouse input.
+        if hold_awake is not None:
+            want_awake = (client is not None
+                          and (mono - _last_remote_ts[0]) < REMOTE_AWAKE_S)
+            if want_awake != awake_held:
+                hold_awake(want_awake)
+                awake_held = want_awake
+
         sock.settimeout(1.0)   # 1/s idle wake-ups drive the resume/idle/rate checks
 
         try:
@@ -2255,6 +2335,12 @@ def serve_loop(wire, emit, net, hostname):
                 emit("warn", f"{verb} failed and was ignored "
                              f"({type(e).__name__}: {e})")
 
+    # Drop the wake hold on the way out — shutdown, or a crash the supervisor is
+    # about to restart us from. It is thread state, so a restarted loop starts on a
+    # fresh thread with none of it; leaking it here would pin the display awake for
+    # the life of the process with nothing left to release it.
+    if hold_awake is not None and awake_held:
+        hold_awake(False)
     try:
         sock.close()
     except OSError:

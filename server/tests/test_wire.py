@@ -1498,6 +1498,70 @@ class PointerVisibility(unittest.TestCase):
             self.assertIsNone(rs.make_pointer_waker())
 
 
+class IdleSuppression(unittest.TestCase):
+    """Remote control never counted as activity, for the same root cause as the
+    invisible pointer: SetCursorPos does not advance the system idle timer. So a
+    session driven entirely from the phone let the display blank and, under a
+    lock-on-wake policy, lock the laptop out from under the user."""
+
+    def setUp(self):
+        self._saved = (rs.mouse, rs.keyboard, rs._last_remote_ts[0])
+        rs.mouse, rs.keyboard = _Recorder(), _Recorder()
+
+        def restore():
+            rs.mouse, rs.keyboard = self._saved[0], self._saved[1]
+            rs._last_remote_ts[0] = self._saved[2]
+        self.addCleanup(restore)
+
+    def test_control_verbs_mark_the_user_present(self):
+        rs._last_remote_ts[0] = 0.0
+        rs.handle_packet("MOVE", "1 1")
+        self.assertGreater(rs._last_remote_ts[0], 0.0)
+
+    def test_a_clicker_press_counts_even_though_it_moves_nothing(self):
+        # A phone used as a presenter remote sends no pointer verbs at all. It is
+        # still someone standing there using the machine.
+        rs._last_remote_ts[0] = 0.0
+        rs.handle_packet("KEYSP", "right")
+        self.assertGreater(rs._last_remote_ts[0], 0.0,
+                           "keyboard-only use would let the display blank")
+
+    def test_the_hold_is_released_when_nothing_holds_it(self):
+        # ES_CONTINUOUS on its own resets to the machine's normal power policy.
+        # Getting this backwards would pin the display awake forever.
+        calls = []
+        with mock.patch.object(sys, "platform", "win32"):
+            fake = types.SimpleNamespace(
+                windll=types.SimpleNamespace(
+                    kernel32=types.SimpleNamespace(
+                        SetThreadExecutionState=lambda f: calls.append(f))))
+            with mock.patch.dict(sys.modules, {"ctypes": fake}):
+                hold = rs.make_idle_suppressor()
+        self.assertIsNotNone(hold)
+        hold(True)
+        hold(False)
+        ES_CONTINUOUS, ES_SYSTEM, ES_DISPLAY = 0x80000000, 0x1, 0x2
+        self.assertEqual(calls[0], ES_CONTINUOUS | ES_SYSTEM | ES_DISPLAY)
+        self.assertEqual(calls[1], ES_CONTINUOUS)
+
+    def test_no_suppressor_off_windows(self):
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertIsNone(rs.make_idle_suppressor())
+
+    def test_a_broken_suppressor_never_reaches_the_loop(self):
+        # It runs on the single receive thread; a raise here is the whole session.
+        with mock.patch.object(sys, "platform", "win32"):
+            def boom(_flags):
+                raise OSError("SetThreadExecutionState failed")
+            fake = types.SimpleNamespace(
+                windll=types.SimpleNamespace(
+                    kernel32=types.SimpleNamespace(SetThreadExecutionState=boom)))
+            with mock.patch.dict(sys.modules, {"ctypes": fake}):
+                hold = rs.make_idle_suppressor()
+        hold(True)      # must not raise
+        hold(False)
+
+
 class LoopSupervision(unittest.TestCase):
     """serve_forever is the backstop for everything not yet found.
 
