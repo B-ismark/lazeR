@@ -151,9 +151,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         app.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
 
     private val netCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) {
-            viewModelScope.launch { kickReconnect() }
-        }
+        // Called directly, not dispatched onto viewModelScope: kickReconnect only
+        // reads a StateFlow and calls Channel.trySend, both thread-safe and
+        // non-blocking. Hopping to the main thread would just delay the very
+        // "try again right now" signal this callback exists to deliver.
+        override fun onAvailable(network: Network) = kickReconnect()
     }
 
     init {
@@ -524,6 +526,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     startHealthLoop()
                     return@launch
                 }
+                // The attempt is over; don't leave the scan running through the
+                // wait. In the long tail it is restarted just before the next one.
+                if (explained) discovery.stop()
                 val elapsed = System.currentTimeMillis() - startMs
                 if (elapsed > RECONNECT_EXPLAIN_MS && !explained) {
                     // Long enough that this isn't a blip: say what's likely wrong and
@@ -536,8 +541,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     }
                     // Stop pinning the radio awake once we're in the long tail —
                     // holding a low-latency Wi-Fi lock through a multi-hour outage
-                    // costs real battery for a link that isn't there.
+                    // costs real battery for a link that isn't there. Stop the mDNS
+                    // scan for the same reason: leaving it running for hours would
+                    // undo exactly the saving the line above is making. It gets
+                    // restarted around each attempt below, so a laptop that comes
+                    // back at a new address is still found.
                     holdWifi(false)
+                    discovery.stop()
                 }
                 // Fast while it's likely transient, then ease off. Same shape as the
                 // health loop's backoff, and it keeps a long outage from polling the
@@ -546,6 +556,14 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 // likely to succeed instead of up to RETRY_MAX_MS later.
                 val wait = if (elapsed > RECONNECT_EXPLAIN_MS) RETRY_MAX_MS else 2000L
                 withTimeoutOrNull(wait) { reconnectKick.receive() }
+                if (explained) {
+                    // Scan only around the attempt itself. Results arrive
+                    // asynchronously, so this attempt uses what the previous
+                    // window found and the next one benefits from this window —
+                    // which converges within a couple of retries while leaving the
+                    // radio alone for the ~15s in between.
+                    discovery.start { hosts -> update { it.copy(discovered = hosts) } }
+                }
             }
         }
     }
@@ -577,7 +595,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         current = null
         client.disconnect()
         holdWifi(false)                     // let the radio power-save again
-        update { it.copy(conn = ConnState.Disconnected) }
+        // Clear the error too. The reconnect loop now writes its diagnosis into
+        // that slot while STAYING on the reconnect screen, so leaving it set here
+        // would drop the user onto the device list with a red banner about a
+        // device they deliberately left — and it would survive a rescan.
+        update { it.copy(conn = ConnState.Disconnected, error = null) }
         discovery.start { hosts -> update { it.copy(discovered = hosts) } }   // scan again for the connection screen
     }
 

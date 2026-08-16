@@ -1418,18 +1418,44 @@ class WindowsVolumeBackend(unittest.TestCase):
         self.assertAlmostEqual(fresh.level, 0.90, places=6)
 
 
-class InputGuardRearm(unittest.TestCase):
-    """Key-UPs are not delivered to low-level hooks across a lock screen, so the
-    held-key set keeps whatever was down when the screen locked. With ctrl, alt
-    and shift stuck in it, the next literal 'L' matched the panic chord and
-    latched remote input OFF on a session that still looked connected."""
+class PanicChord(unittest.TestCase):
+    """The panic hotkey is matched against the OS keyboard state, not against the
+    codes the hook reports.
 
-    def test_rearm_forgets_keys_the_hook_never_saw_released(self):
+    It used to test a frozenset of the GENERIC modifier codes
+    {VK_SHIFT, VK_CONTROL, VK_MENU, L} for being a subset of what a
+    WH_KEYBOARD_LL hook had recorded. Low-level hooks report the SIDE-SPECIFIC
+    codes — VK_LSHIFT (0xA0), VK_LCONTROL (0xA2), VK_LMENU (0xA4) — so that subset
+    test could not match for any keypress on any keyboard, and Ctrl+Alt+Shift+L
+    had never once fired despite being documented in START_HERE.md and shown in
+    the GUI."""
+
+    def test_the_modifiers_are_the_generic_codes_getasynckeystate_answers_for(self):
+        self.assertEqual(rs.LocalInputGuard.PANIC_MODIFIERS, (0x10, 0x11, 0x12))
+        self.assertEqual(rs.LocalInputGuard.PANIC_KEY, 0x4C)
+
+    def test_no_side_specific_modifier_is_matched_against_hook_output(self):
+        # The regression guard: if anyone reintroduces a set of modifier codes to
+        # compare against hook-reported vkCodes, the side-specific values are what
+        # would actually arrive, and the generic ones would never match them.
+        generic = set(rs.LocalInputGuard.PANIC_MODIFIERS)
+        side_specific = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
+        self.assertEqual(generic & side_specific, set(),
+                         "generic modifier codes cannot match a low-level hook's "
+                         "side-specific report — read the OS state instead")
+
+    def test_the_guard_keeps_no_held_key_state(self):
+        # There is nothing left to go stale across a lock screen: the modifiers are
+        # read back from the OS at the moment L is pressed.
         guard = rs.LocalInputGuard(on_physical=lambda: None, on_panic=lambda: None)
-        guard._down.update(rs.LocalInputGuard.PANIC_VKS)
-        self.assertTrue(rs.LocalInputGuard.PANIC_VKS.issubset(guard._down))
-        guard.rearm()                   # no thread started: the clear still runs
-        self.assertEqual(guard._down, set())
+        self.assertFalse(hasattr(guard, "_down"),
+                         "held-key state is what went stale across a lock; it "
+                         "should no longer exist")
+
+
+class InputGuardRearm(unittest.TestCase):
+    """Windows silently revokes low-level hooks across a wake or a session switch,
+    and reports nothing — the guard just stops noticing physical input."""
 
     def test_rearm_is_safe_before_the_hook_thread_exists(self):
         # serve_loop calls this on every wake, including one that lands before the
@@ -1512,6 +1538,20 @@ class IdleSuppression(unittest.TestCase):
             rs.mouse, rs.keyboard = self._saved[0], self._saved[1]
             rs._last_remote_ts[0] = self._saved[2]
         self.addCleanup(restore)
+
+    def test_pointer_verbs_are_a_subset_of_control_verbs(self):
+        # Derived, not a second hand-written copy: a new gesture verb added to one
+        # list and missed in the other would silently stop waking the cursor.
+        self.assertTrue(rs.POINTER_VERBS < rs.CONTROL_VERBS)
+
+    def test_no_wake_hold_before_any_remote_activity(self):
+        # time.monotonic() counts from boot, so a 0.0 sentinel reads as "90s ago"
+        # for the first 90s of uptime — with the server on autostart and a phone
+        # auto-reconnecting at launch, that asserted the hold at boot for nothing.
+        rs._last_remote_ts[0] = None
+        last = rs._last_remote_ts[0]
+        self.assertIsNone(last, "the sentinel must be distinguishable from a real "
+                                "timestamp near boot")
 
     def test_control_verbs_mark_the_user_present(self):
         rs._last_remote_ts[0] = 0.0
@@ -1620,9 +1660,40 @@ class PublishableAddress(unittest.TestCase):
         with mock.patch.object(rs, "lan_ip", lambda: "0.0.0.0"):
             self.assertIsNone(rs.usable_lan_ip())
 
+    def test_link_local_is_not_publishable(self):
+        # The likeliest bad address right after a wake: Wi-Fi has associated but
+        # DHCP has not answered, so Windows self-assigns 169.254.x.y. Publishing it
+        # puts an unreachable address in mDNS and the QR — and the Android side
+        # already refuses to dial 169.254, so accepting it here would leave the two
+        # halves disagreeing.
+        with mock.patch.object(rs, "lan_ip", lambda: "169.254.11.7"):
+            self.assertIsNone(rs.usable_lan_ip())
+
     def test_a_real_lan_address_is_publishable(self):
         with mock.patch.object(rs, "lan_ip", lambda: "192.168.1.42"):
             self.assertEqual(rs.usable_lan_ip(), "192.168.1.42")
+
+    def test_a_failed_registration_closes_the_engine_it_built(self):
+        # start_mdns constructs a Zeroconf before registering. The network watch
+        # now retries a failed registration on a timer, so returning without
+        # closing would leak an event-loop thread and multicast sockets per
+        # attempt, for as long as the failure lasted.
+        closed = []
+
+        class FakeZc:
+            def register_service(self, info):
+                raise OSError("no multicast route")
+
+            def close(self):
+                closed.append(True)
+
+        fake = types.ModuleType("zeroconf")
+        fake.Zeroconf = FakeZc
+        fake.ServiceInfo = lambda *a, **kw: object()
+        with mock.patch.dict(sys.modules, {"zeroconf": fake}):
+            zc, info = rs.start_mdns("192.168.1.42", "host")
+        self.assertEqual((zc, info), (None, None))
+        self.assertEqual(closed, [True], "the Zeroconf engine was leaked")
 
     def test_announce_reports_whether_the_record_is_live(self):
         # A failed registration must be reported as failure so the caller retries.
@@ -1673,6 +1744,29 @@ class SessionTeardown(unittest.TestCase):
         self.assertFalse(wire.secure_client)
         self.assertEqual(wire._chal, {})
         self.assertIsNone(wire._pending)
+
+    def test_unpin_leaves_other_addresses_challenges_alone(self):
+        # The reconnecting phone comes back on a NEW source port, so the idle drop
+        # for its OLD address routinely fires while its fresh HELLO is already
+        # outstanding. Clearing the whole challenge table there would delete the
+        # nonce it is about to echo, dead-ending the handshake until its next retry.
+        wire = rs.Wire(TOKEN, KEY, True)
+        sock = FakeSock()
+        handshake(wire, sock)                      # pins CLIENT
+
+        newport = ("127.0.0.1", 60001)             # the same phone, rebuilt
+        fc = FakeClient(KEY, sid=b"\x77" * 8)
+        pkt, _ = fc.seal("HELLO")
+        self.assertEqual(wire.parse(pkt, newport, CLIENT)[0], "HELLO")
+        wire.issue_challenge(sock, newport, 100.0)
+        nonce = unseal(KEY, sock.last()).split(" ", 1)[1]
+
+        wire.unpin_client()                        # the old address times out
+
+        pkt, _ = fc.seal(f"AUTH {nonce}")
+        verb, rest, secure = wire.parse(pkt, newport, None)
+        self.assertTrue(wire.verify_challenge(newport, rest, 100.0),
+                        "the in-flight challenge was wiped by the unpin")
 
     def test_a_new_phone_can_pair_after_an_unpin(self):
         # The point of clearing it: the next handshake starts from a clean slate

@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
@@ -130,6 +131,13 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
             name = state.name.ifBlank { state.ip },
             hint = state.error,
             onCancel = vm::disconnect,
+            onScanQr = {
+                startQrScan(
+                    context = context,
+                    onResult = vm::applyScannedUri,
+                    onError = vm::reportError,
+                )
+            },
         )
         else -> ConnectionScreen(
             state = state,
@@ -170,10 +178,21 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
  * enough to be worth explaining. It replaces the generic line rather than joining it,
  * and it does NOT mean the retry has stopped — the loop keeps going underneath, so a
  * laptop that wakes up later reconnects on its own with nothing to tap.
+ *
+ * The hint appears together with a Scan QR action, because one of the cases it
+ * describes — the laptop was re-paired, so its new key can never match the stored
+ * one — is the case retrying can never fix. Without that action the advice ("scan
+ * its new QR") named something the screen could not do, and the only way out was
+ * Cancel.
  */
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun ReconnectingScreen(name: String, hint: String?, onCancel: () -> Unit) {
+private fun ReconnectingScreen(
+    name: String,
+    hint: String?,
+    onCancel: () -> Unit,
+    onScanQr: () -> Unit,
+) {
     Column(
         modifier = Modifier.fillMaxSize().padding(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -202,8 +221,14 @@ private fun ReconnectingScreen(name: String, hint: String?, onCancel: () -> Unit
                 textAlign = TextAlign.Center,
                 modifier = Modifier.padding(top = 12.dp),
             )
+            Button(onClick = onScanQr, modifier = Modifier.padding(top = 20.dp)) {
+                Text("Scan QR")
+            }
         }
-        OutlinedButton(onClick = onCancel, modifier = Modifier.padding(top = 24.dp)) {
+        OutlinedButton(
+            onClick = onCancel,
+            modifier = Modifier.padding(top = if (hint != null) 8.dp else 24.dp),
+        ) {
             Text("Cancel")
         }
     }

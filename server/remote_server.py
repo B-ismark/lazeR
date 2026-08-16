@@ -33,7 +33,7 @@ PORT = 50505
 # asserts the git tag matches THAT, and the update check below compares against
 # whatever tag the newest GitHub release carries, so a stale value here would
 # either nag forever or never nag at all.
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 RELEASES_API = "https://api.github.com/repos/B-ismark/lazeR/releases/latest"
 RELEASES_PAGE = "https://github.com/B-ismark/lazeR/releases/latest"
 UPDATE_TIMEOUT_S = 6      # a slow/blocked network must never delay the server
@@ -42,10 +42,13 @@ TOKEN_LEN = 6
 RESUME_GAP_S = 8        # recv-loop tick gap larger than this ⇒ the laptop slept; recover net
 CLIENT_IDLE_S = 12      # no packet from the pinned phone this long ⇒ it left (phone polls 1.5–4s when idle)
 # How long a phone that was pinned before we slept has to speak up after the wake
-# before we report it gone. Comfortably longer than its 1.5–4s idle poll, far shorter
-# than CLIENT_IDLE_S — which is what the wake used to grant, leaving the window
-# claiming a phone was connected for 12s after every resume.
-POST_WAKE_GRACE_S = 5
+# before we report it gone. Far shorter than CLIENT_IDLE_S — which is what the wake
+# used to grant, leaving the window claiming a phone was connected for 12s after
+# every resume — but it has to clear the phone's worst-case idle gap or we would
+# drop a phone that genuinely survived the sleep. That gap is not the 4s poll
+# interval alone: an idle tick is queryVolume(400ms) + ping(500ms) + delay(4000ms),
+# so ~4.9s before jitter or Android doze stretches it further.
+POST_WAKE_GRACE_S = 8
 # How often to re-check our own LAN address. Sleep/resume is NOT the only way it
 # moves — roaming to another SSID, a DHCP lease change, or docking all change it
 # with no tick gap at all, and the resume path was the only thing that ever
@@ -87,10 +90,18 @@ CHAL_MAX = 256              # bound the pending-challenge table (anti-flood)
 # handful at most (handshake retries from one or two source ports).
 CHAL_PER_IP = 8
 
+# Verbs that move or press the pointer. Listed separately because Windows needs a
+# nudge to make the pointer visible before one lands (see make_pointer_waker), and
+# defined FIRST so CONTROL_VERBS can be built from it — two hand-maintained copies
+# of the same eight strings would drift the moment a gesture verb was added to one
+# and not the other, silently bringing the invisible-pointer bug back for it.
+POINTER_VERBS = frozenset({
+    "MOVE", "SCROLL", "ZOOM", "CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP",
+})
+
 # Verbs that actually drive the machine. While the user has taken over locally
 # (or after a panic), these are dropped; PING/VGET/HELLO/BYE still flow.
-CONTROL_VERBS = {
-    "MOVE", "SCROLL", "ZOOM", "CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP",
+CONTROL_VERBS = POINTER_VERBS | {
     "COMBO", "ASW", "SYS", "VOL", "MEDIA", "KEY", "KEYSP",
     "BRIGHT",
 }
@@ -149,6 +160,22 @@ def make_volume():
 
         def _endpoint():
             if _ep[0] is None:
+                # COM is per-thread, and comtypes only initializes the thread that
+                # imports it — the main one. Re-acquisition happens on the UDP
+                # receive thread, where GetSpeakers() otherwise fails every time
+                # with "CoInitialize has not been called" (measured). That would
+                # have made this whole recovery path a no-op: the first stale
+                # endpoint would leave volume dead until a restart, which is the
+                # symptom it exists to remove. Idempotent, so calling it on each
+                # re-acquire is free after the first.
+                import comtypes
+                try:
+                    comtypes.CoInitialize()
+                except OSError:
+                    # RPC_E_CHANGED_MODE: this thread already has an apartment of
+                    # the other kind. That is fine — it has one, which is all we
+                    # need. Anything else surfaces on the GetSpeakers call below.
+                    pass
                 devices = AudioUtilities.GetSpeakers()
                 vol = getattr(devices, "EndpointVolume", None)
                 if vol is None:
@@ -921,11 +948,18 @@ class Wire:
         counter watermark and secure_client stayed behind, so replies could still be
         sealed for a session that no longer exists and a stale `_pending` could be
         committed by a later AUTH. Called wherever the phone is genuinely gone (idle
-        timeout, BYE, resume) so the next handshake starts from a clean slate."""
+        timeout, BYE, resume) so the next handshake starts from a clean slate.
+
+        Deliberately leaves the challenge table alone. Clearing it looks tidy and
+        is a bug: `_chal` is keyed by address and the departing client is not the
+        only one in it. The reconnecting phone comes back on a NEW source port, so
+        the idle drop for its OLD address routinely fires while its fresh HELLO is
+        already outstanding — wiping the table there would delete the nonce it is
+        about to echo, dead-ending the handshake until its next retry. Unanswered
+        challenges expire on their own via sweep_challenges."""
         self.cli_magic, self.cli_sid, self.cli_ctr = None, None, -1
         self.secure_client = False
         self._pending = None
-        self._chal.clear()
 
     def _srv_session(self, magic):
         """This dialect's [sid, counter], created on first use. Never re-drawn on a
@@ -991,14 +1025,25 @@ class LocalInputGuard:
     user's real mouse/keyboard always wins: touching it pauses the remote, and a
     panic chord (Ctrl+Alt+Shift+L) latches the pause until they resume."""
 
-    PANIC_VKS = frozenset({0x10, 0x11, 0x12, 0x4C})  # shift, ctrl, alt, L
+    # The panic chord is Ctrl+Alt+Shift+L. Only the L is matched from the hook's
+    # own report; the three modifiers are read back from the OS in chord_held().
+    #
+    # That split is not a style choice. A WH_KEYBOARD_LL hook reports SIDE-SPECIFIC
+    # virtual keys — VK_LSHIFT (0xA0), VK_LCONTROL (0xA2), VK_LMENU (0xA4) — never
+    # the generic VK_SHIFT/CONTROL/MENU (0x10/0x11/0x12). This used to test a set of
+    # the generic codes against what the hook had recorded, which could not match
+    # for any keypress on any keyboard, so the panic hotkey had never once fired
+    # despite being documented in START_HERE.md and shown in the GUI. Asking
+    # GetAsyncKeyState instead fixes that AND is side-agnostic: the generic codes
+    # are exactly what it answers for, whichever Shift you press.
+    PANIC_KEY = 0x4C                                 # L
+    PANIC_MODIFIERS = (0x10, 0x11, 0x12)             # shift, ctrl, alt (generic)
 
     WM_REARM = 0x8000 + 1        # WM_APP+1: our private "re-install the hooks" ping
 
     def __init__(self, on_physical, on_panic):
         self._on_physical = on_physical
         self._on_panic = on_panic
-        self._down = set()
         self._thread = None
         self._tid = None
 
@@ -1011,22 +1056,17 @@ class LocalInputGuard:
         return True
 
     def rearm(self):
-        """Re-install the hooks and forget which keys we think are held.
+        """Re-install the hooks after a wake or a lock/unlock.
 
-        Both halves matter after a wake or a lock/unlock:
+        Windows silently drops a low-level hook whose callback ever overran
+        LowLevelHooksTimeout, and a session switch (lock screen, UAC secure
+        desktop) can take them out too. Nothing reports it — the guard simply
+        stops noticing physical input, so the remote no longer yields to the
+        laptop's own mouse and the panic key goes dead, on a session that looks
+        entirely healthy.
 
-        * Windows silently drops a low-level hook whose callback ever overran
-          LowLevelHooksTimeout, and a session switch (lock screen / UAC secure
-          desktop) can take them out too. Nothing reports it — the guard just
-          stops noticing physical input, so the remote no longer yields to the
-          laptop's own mouse.
-        * Key-UP events are NOT delivered to hooks across a lock, so `_down` keeps
-          whatever was held when the screen locked. With ctrl+alt+shift stuck in
-          there, the next literal 'L' typed anywhere matched the panic chord and
-          latched the remote OFF — the phone stays connected, the cursor stops
-          moving, and nothing on either screen says why.
-        """
-        self._down.clear()
+        Handled on the hook thread, since that is the thread the hooks belong to;
+        see _run for why the new pair is installed before the old one is dropped."""
         tid = self._tid
         if tid is None or not sys.platform.startswith("win"):
             return
@@ -1034,7 +1074,7 @@ class LocalInputGuard:
             import ctypes
             ctypes.windll.user32.PostThreadMessageW(tid, self.WM_REARM, 0, 0)
         except Exception:
-            pass                          # best effort — the stale-key clear still ran
+            pass                          # best effort; the next wake tries again
 
     def _run(self):
         import ctypes
@@ -1072,17 +1112,17 @@ class LocalInputGuard:
                         ("dwExtraInfo", ctypes.c_void_p)]
 
         def chord_held():
-            """True iff the panic modifiers are *physically* down at this instant.
+            """True iff the panic modifiers are physically down at this instant.
 
-            `self._down` alone is not trustworthy: hooks miss key-UP events across a
-            lock screen / UAC prompt / session switch, so a modifier can stay in the
-            set long after the user let go, and then an innocent 'L' latches the
-            remote off. GetAsyncKeyState asks the OS for the real state, so a stale
-            set can no longer manufacture the chord. Cheap enough for a hook callback
-            (three register reads), and the set is still what detects the L keypress
-            itself."""
+            Asked of the OS rather than read from `self._down`, for two reasons.
+            The set holds side-specific codes the generic constants never match
+            (see PANIC_KEY), and it is not trustworthy anyway: hooks miss key-UP
+            events across a lock screen / UAC prompt / session switch, so a
+            modifier can linger in it long after the user let go. GetAsyncKeyState
+            answers for the real keyboard, and for either Shift. Three register
+            reads, cheap enough for a hook callback."""
             return all(user32.GetAsyncKeyState(vk) & 0x8000
-                       for vk in (0x10, 0x11, 0x12))      # shift, ctrl, alt
+                       for vk in self.PANIC_MODIFIERS)
 
         def kb_proc(nCode, wParam, lParam):
             if nCode == 0:
@@ -1090,13 +1130,10 @@ class LocalInputGuard:
                 if not (kb.flags & LLKHF_INJECTED):       # physical only
                     vk = kb.vkCode
                     if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                        self._down.add(vk)
-                        if self.PANIC_VKS.issubset(self._down) and chord_held():
+                        if vk == self.PANIC_KEY and chord_held():
                             self._on_panic()
                         else:
                             self._on_physical()
-                    elif wParam in (WM_KEYUP, WM_SYSKEYUP):
-                        self._down.discard(vk)
             return user32.CallNextHookEx(0, nCode, wParam, lParam)
 
         def ms_proc(nCode, wParam, lParam):
@@ -1125,11 +1162,27 @@ class LocalInputGuard:
                 break
             if msg.message == self.WM_REARM:
                 # A thread-message has no window, so it is never dispatched — handle
-                # it here. Unhooking a handle Windows already revoked is harmless, so
-                # this is safe whether the hooks died or not.
-                user32.UnhookWindowsHookEx(kb_hook)
-                user32.UnhookWindowsHookEx(ms_hook)
-                kb_hook, ms_hook = install()
+                # it here.
+                #
+                # Install FIRST, and only drop the old handles once the new pair is
+                # real. Unhooking up front is the obvious order and the wrong one:
+                # SetWindowsHookExW can fail during a session or desktop transition,
+                # which is exactly the wake-and-unlock moment this runs at, and that
+                # would have thrown away two working hooks for nothing. The guard
+                # would go quiet with no error anywhere — physical input would stop
+                # pausing the remote, and the panic key would stop working, for the
+                # rest of the session. A duplicate LL hook from one thread is legal,
+                # so the brief overlap costs nothing.
+                new_kb, new_ms = install()
+                if new_kb and new_ms:
+                    user32.UnhookWindowsHookEx(kb_hook)
+                    user32.UnhookWindowsHookEx(ms_hook)
+                    kb_hook, ms_hook = new_kb, new_ms
+                else:                       # keep what still works
+                    if new_kb:
+                        user32.UnhookWindowsHookEx(new_kb)
+                    if new_ms:
+                        user32.UnhookWindowsHookEx(new_ms)
                 continue
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
@@ -1153,14 +1206,6 @@ def _clamp_int(tok, limit):
     """Parse a signed int argument and clamp it to ±[limit]. Raises ValueError on
     junk so the caller can drop the packet."""
     return max(-limit, min(limit, int(tok)))
-
-
-# Verbs that move or press the pointer, and so should make it visible first.
-# Deliberately NOT every verb: PING/VGET are the phone's idle polling, and waking
-# the pointer on those would keep the laptop out of idle sleep forever.
-POINTER_VERBS = frozenset({
-    "MOVE", "SCROLL", "ZOOM", "CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP",
-})
 
 
 def make_pointer_waker():
@@ -1243,7 +1288,12 @@ wake_pointer = make_pointer_waker()
 # Monotonic time of the last remote control verb, and how long after one we keep
 # telling Windows the machine is in use. Sized to outlast a pause for thought
 # mid-task without pinning the display awake once the phone is merely idling.
-_last_remote_ts = [0.0]
+#
+# None, not 0.0: time.monotonic() counts from boot, so a 0.0 sentinel reads as
+# "90 seconds ago" for the first 90 seconds of uptime. With the server on autostart
+# and a phone auto-reconnecting at launch, that meant asserting the wake hold at
+# boot with no remote activity at all.
+_last_remote_ts = [None]
 REMOTE_AWAKE_S = 90
 
 
@@ -1693,7 +1743,18 @@ def start_mdns(ip, hostname):
             server=f"{safe}.local.",
         )
         zc = Zeroconf()
-        zc.register_service(info)
+        try:
+            zc.register_service(info)
+        except Exception:
+            # Close the engine we just built before giving up. It owns an event
+            # loop thread and multicast sockets, and the network watch now retries
+            # this on a timer — so leaking one per failed attempt would pile up
+            # threads and sockets for as long as the failure persisted.
+            try:
+                zc.close()
+            except Exception:
+                pass
+            raise
         return zc, info
     except Exception as e:
         print(f"[discovery] mDNS failed ({e}); QR + manual still work.")
@@ -1713,7 +1774,16 @@ def usable_lan_ip():
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return None
-    return None if (addr.is_loopback or addr.is_unspecified) else ip
+    # Link-local (169.254/16) matters as much as loopback here, and is the likelier
+    # of the two right after a wake: Wi-Fi associates, DHCP has not answered yet,
+    # and Windows self-assigns an APIPA address. candidate_ips() filters those out,
+    # so lan_ip() falls through to the default-route probe and hands one back —
+    # publishing it would put an address no phone on the real subnet can reach into
+    # mDNS and the QR. The Android side already rejects 169.254 when picking a host
+    # to dial, so accepting it here would have the two halves disagreeing.
+    if addr.is_loopback or addr.is_unspecified or addr.is_link_local:
+        return None
+    return ip
 
 
 def announce_network(net, hostname, wire, emit, ip):
@@ -2039,6 +2109,31 @@ def serve_loop(wire, emit, net, hostname):
         hold_awake(False)
 
     awake_held = False        # are we currently telling Windows the machine is in use
+    # zeroconf's register/unregister are synchronous and take on the order of a
+    # second (probe + repeated announcements). Running them inline would stall the
+    # ONE thread serving the phone for that long, and the watch now fires them on
+    # every wake and every roam — precisely when the phone is mid-handshake. Five
+    # missed replies at 500ms is all its watchdog needs to declare the link dead,
+    # so a stall here would manufacture the very reconnect this change prevents.
+    # Hand the work to a thread and let the loop keep answering.
+    announce_busy = threading.Event()
+
+    def announce_async(ip):
+        if announce_busy.is_set():
+            return                      # one in flight; the watch will re-check
+        announce_busy.set()
+
+        def work():
+            try:
+                if announce_network(net, hostname, wire, emit, ip):
+                    emit("log", f"Reachable at {ip}")
+            except Exception as e:
+                emit("warn", f"Could not re-announce on the network ({e})")
+            finally:
+                announce_busy.clear()
+
+        threading.Thread(target=work, daemon=True).start()
+
     net_checked = last_tick   # wall-clock of the last own-address check
     net_pending = False       # our published address is known-stale; keep trying
     net_pending_since = 0.0   # when that became true, to bound the post-wake wait
@@ -2134,7 +2229,8 @@ def serve_loop(wire, emit, net, hostname):
         # record and QR would otherwise keep pointing at the old address for the rest
         # of the process. [net_pending] also drives the post-wake retry — we may need
         # several passes before the NIC hands us a usable address.
-        if net is not None and (net_pending or now - net_checked > NET_WATCH_S):
+        if (net is not None and not announce_busy.is_set()
+                and (net_pending or now - net_checked > NET_WATCH_S)):
             net_checked = now
             ip_now = usable_lan_ip()
             if ip_now is None:
@@ -2156,13 +2252,11 @@ def serve_loop(wire, emit, net, hostname):
                 # and never look again, silently losing discovery for good. A machine
                 # with no zeroconf installed is a different thing entirely and must
                 # NOT be retried: it would reprint the notice every few seconds.
-                ok = announce_network(net, hostname, wire, emit, ip_now)
-                # Either way we stop the fast retry and fall back to the normal
-                # NET_WATCH_S cadence — the clause above re-tries a failed
-                # registration on the next pass without spinning on this one.
+                # Stop the fast retry and fall back to the normal NET_WATCH_S
+                # cadence — the clause above re-tries a failed registration on the
+                # next pass without spinning on this one.
                 net_pending = False
-                if ok:
-                    emit("log", f"Reachable at {ip_now}")
+                announce_async(ip_now)
 
         # The phone pings ~every 1.5s; prolonged silence means it left without a
         # BYE (app killed, Wi-Fi dropped). Reflect that instead of showing it
@@ -2194,8 +2288,9 @@ def serve_loop(wire, emit, net, hostname):
         # sleep normally. See make_idle_suppressor for why this is a wake hold
         # rather than fabricated mouse input.
         if hold_awake is not None:
-            want_awake = (client is not None
-                          and (mono - _last_remote_ts[0]) < REMOTE_AWAKE_S)
+            last = _last_remote_ts[0]
+            want_awake = (client is not None and last is not None
+                          and (mono - last) < REMOTE_AWAKE_S)
             if want_awake != awake_held:
                 hold_awake(want_awake)
                 awake_held = want_awake

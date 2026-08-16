@@ -106,10 +106,30 @@ keep that true:
   every bounded window is shorter than a real sleep. `kickReconnect()` short-circuits
   the backoff on app-foreground and network-available.
 
-Windows low-level hooks are revoked across a wake/lock and their key-UPs are never
-delivered, so `LocalInputGuard.rearm()` re-installs them and clears the held-key set —
-without that, stale modifiers made an innocent `L` trigger the panic latch, which
-silently stops all remote input on a session that still looks connected.
+Windows low-level hooks are revoked across a wake/lock and report nothing when they
+are, so `LocalInputGuard.rearm()` re-installs them on every wake — installing the new
+pair *before* dropping the old, since a failed re-install would otherwise throw away
+two working hooks and silently kill local-takeover detection for the session.
+
+### Two Win32 traps this codebase has already paid for
+
+- **`SetCursorPos` is not input.** It moves the pointer without advancing
+  `GetLastInputInfo`, so Windows keeps the pointer image hidden (it only draws it
+  when it believes a mouse is in use) and the idle timer keeps running. pynput moves
+  via `SetCursorPos`, so remote control drove an *invisible* cursor and let the
+  display blank mid-session. Fixed with a zero-delta `SendInput` when the pointer is
+  hidden (`make_pointer_waker`) and `SetThreadExecutionState` while the phone is
+  driving (`make_idle_suppressor`) — not by switching movement to `SendInput`, which
+  would put Windows' pointer ballistics on top of our own tuned deltas.
+- **A `WH_KEYBOARD_LL` hook reports side-specific modifier codes** — `VK_LSHIFT`
+  (0xA0), not `VK_SHIFT` (0x10). The panic chord matched generic codes against hook
+  output for its whole life and therefore never fired once. Modifiers are now read
+  with `GetAsyncKeyState`, which answers for the generic codes and is side-agnostic.
+
+**COM is per-thread.** comtypes initializes only the importing thread, so anything
+touching pycaw from the UDP thread must `CoInitialize()` first or it fails every time
+with `CoInitialize has not been called` — which silently turned the volume-endpoint
+recovery above into a no-op until it was caught.
 
 ## Environment gotchas (Windows)
 
