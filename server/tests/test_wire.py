@@ -1057,12 +1057,12 @@ class ServeLoopResilience(unittest.TestCase):
         rs._stop.clear()
         _client_connected_clear()
 
-    def _start(self, require_secure=True):
+    def _start(self, require_secure=True, net=None):
         self.wire = rs.Wire(TOKEN, KEY, require_secure)
         self.thread = threading.Thread(
             target=rs.serve_loop,
             args=(self.wire, lambda kind, *a: self.events.append((kind,) + a),
-                  None, "testhost"),
+                  net, "testhost"),
             daemon=True)
         self.thread.start()
         return self.wire
@@ -1151,6 +1151,160 @@ class ServeLoopResilience(unittest.TestCase):
         self.assertEqual([e for e in self.events if e[0] == "warn"], [])
         self.assertIn(("move", rs.MOVE_MAX_PX, 0), rs.mouse.calls)
 
+    def test_a_broken_volume_backend_cannot_kill_the_loop(self):
+        # The bug behind "after the laptop sleeps I have to restart the app".
+        # VGET is answered by calling get_volume() inline, ABOVE the handler guard.
+        # On Windows that reaches an IAudioEndpointVolume captured once at import,
+        # which Windows invalidates on resume (or when the output device changes) —
+        # every later call raises. The raise escaped serve_loop and killed the only
+        # receive thread, while the window still showed a healthy green server. VGET
+        # is the phone's own liveness probe, so this fired on the first poll after
+        # every sleep.
+        self._start()
+        fc = self._pair_secure()
+
+        def boom():
+            raise OSError("audio endpoint invalidated")
+
+        with mock.patch.object(rs, "get_volume", boom):
+            pkt, _ = fc.seal("VGET")
+            self.cli.sendto(pkt, self.srv)
+            # No VOL comes back — that's fine, one poll is cheap. What must survive
+            # is the loop itself.
+            pkt, _ = fc.seal("PING")
+            self.cli.sendto(pkt, self.srv)
+            self.assertEqual(self._recv_secure(), "PONG")
+        self.assertTrue(self.thread.is_alive(), "a volume failure killed the loop")
+
+    def test_an_absent_output_device_is_answered_with_silence_not_a_crash(self):
+        # The re-acquiring Windows getter returns None when there is no output
+        # device at all. "VOL None" would reach the phone as an unparseable reply,
+        # so the branch must send nothing and leave the session intact.
+        self._start()
+        fc = self._pair_secure()
+        with mock.patch.object(rs, "get_volume", lambda: None):
+            pkt, _ = fc.seal("VGET")
+            self.cli.sendto(pkt, self.srv)
+            pkt, _ = fc.seal("PING")
+            self.cli.sendto(pkt, self.srv)
+            self.assertEqual(self._recv_secure(), "PONG")
+
+    def test_a_phone_that_rebuilt_its_session_can_re_pair_from_a_new_port(self):
+        # What actually happens across a laptop sleep: the phone's watchdog gives up
+        # after ~2.5s of silence and rebuilds from scratch — new socket (so a new
+        # source port), new session id, counter back to 0 — while the server may
+        # still be holding the OLD address as its pinned client. The handshake has
+        # to land anyway, or the phone can never get back in on its own.
+        self._start()
+        self._pair_secure()
+        self._await_event(lambda e: e[0] == "connected", "the first pairing")
+
+        fresh = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        fresh.settimeout(2.0)
+        self.addCleanup(fresh.close)
+        fc = FakeClient(KEY, sid=b"\x99" * 8)
+        for _ in range(25):
+            pkt, _ = fc.seal("HELLO")
+            fresh.sendto(pkt, self.srv)
+            try:
+                reply = unseal(KEY, fresh.recvfrom(2048)[0])
+            except Exception:
+                continue
+            if reply.startswith("CHAL "):
+                pkt, _ = fc.seal("AUTH " + reply.split(" ", 1)[1])
+                fresh.sendto(pkt, self.srv)
+                self.assertEqual(unseal(KEY, fresh.recvfrom(2048)[0]), "OK")
+                break
+        else:
+            self.fail("the rebuilt session never re-paired")
+
+        # And it is really in control, not merely acknowledged.
+        pkt, _ = fc.seal("PING")
+        fresh.sendto(pkt, self.srv)
+        self.assertEqual(unseal(KEY, fresh.recvfrom(2048)[0]), "PONG")
+
+    def test_moving_to_another_network_re_announces_without_a_restart(self):
+        # Roaming to another SSID, or a DHCP lease change, moves our address with no
+        # tick gap at all — so the sleep/resume branch never fires. lan_ip() was read
+        # only at startup and inside that branch, so the mDNS record and the on-screen
+        # QR kept pointing at the old address for the rest of the process, and the
+        # phone had nothing reachable to dial. Closing and reopening the app was the
+        # only cure. The watch re-reads it on its own cadence instead.
+        registered = []
+        net = {"ip": "192.168.1.9", "zc": "zc0", "info": "info0"}
+        address = ["192.168.1.9"]
+
+        def fake_mdns(ip, hostname):
+            registered.append(ip)
+            return f"zc-{ip}", f"info-{ip}"
+
+        with mock.patch.object(rs, "start_mdns", fake_mdns), \
+                mock.patch.object(rs, "lan_ip", lambda: address[0]), \
+                mock.patch.object(rs, "NET_WATCH_S", 0.2):
+            self._start(net=net)
+            time.sleep(0.6)                     # a few watch passes on the old address
+            self.assertEqual(registered, [], "re-announced an address that hadn't moved")
+
+            address[0] = "10.0.0.77"            # the laptop lands on another network
+            self._await_event(lambda e: e[0] == "netchange" and e[1] == "10.0.0.77",
+                              "a netchange for the new address")
+
+        self.assertEqual(net["ip"], "10.0.0.77")
+        self.assertIn("10.0.0.77", registered)
+
+    def test_a_missing_address_is_never_published(self):
+        # Between networks lan_ip() falls back to 127.0.0.1. Publishing that is what
+        # poisoned discovery after a wake; the watch must sit the outage out and then
+        # announce the real address once there is one.
+        registered = []
+        net = {"ip": "192.168.1.9", "zc": "zc0", "info": "info0"}
+        address = ["127.0.0.1"]
+
+        def fake_mdns(ip, hostname):
+            registered.append(ip)
+            return f"zc-{ip}", f"info-{ip}"
+
+        with mock.patch.object(rs, "start_mdns", fake_mdns), \
+                mock.patch.object(rs, "lan_ip", lambda: address[0]), \
+                mock.patch.object(rs, "NET_WATCH_S", 0.2):
+            self._start(net=net)
+            time.sleep(0.8)
+            self.assertEqual(registered, [], f"published a useless address: {registered}")
+
+            address[0] = "10.0.0.77"            # Wi-Fi finally associates
+            self._await_event(lambda e: e[0] == "netchange" and e[1] == "10.0.0.77",
+                              "a netchange once a real address existed")
+        self.assertEqual(registered, ["10.0.0.77"])
+
+    def test_a_wake_rebinds_the_socket_and_keeps_serving(self):
+        # Squeeze RESUME_GAP_S below the loop's own 1s recv timeout so an idle tick
+        # looks like a wake: the resume branch then runs for real — closing and
+        # rebinding the socket, re-arming the guard, re-announcing — over and over.
+        # If any of that is wrong the phone stops being served, which is the whole
+        # failure this change exists to prevent.
+        net = {"ip": "192.168.1.9", "zc": "zc0", "info": "info0"}
+        with mock.patch.object(rs, "start_mdns", lambda ip, h: (f"zc-{ip}", f"info-{ip}")), \
+                mock.patch.object(rs, "lan_ip", lambda: "192.168.1.9"), \
+                mock.patch.object(rs, "RESUME_GAP_S", 0.5):
+            self._start(net=net)
+            self._await_event(lambda e: e[0] == "log" and "Woke" in str(e[1]),
+                              "a simulated wake")
+            # Pair AFTER the loop has started cycling through wakes, and keep
+            # retrying — a rebind in flight can eat a datagram, exactly as a real
+            # one can, and the phone's own handshake resends through it.
+            fc = self._pair_secure()
+            for _ in range(20):
+                pkt, _ = fc.seal("PING")
+                self.cli.sendto(pkt, self.srv)
+                try:
+                    if self._recv_secure() == "PONG":
+                        break
+                except Exception:
+                    continue
+            else:
+                self.fail("the phone stopped being served across socket rebinds")
+        self.assertTrue(self.thread.is_alive(), "the resume path killed the loop")
+
     def test_second_plaintext_phone_is_turned_away_and_reported(self):
         # v1 is gated only by the token, so a second phone that knows the code
         # reaches the pinned-source check. The GUI and terminal have always had a
@@ -1172,6 +1326,460 @@ class ServeLoopResilience(unittest.TestCase):
         self._await_event(lambda e: e[0] == "blocked", "a blocked-takeover event")
         # ...and the intruder's click must not have been executed.
         self.assertNotIn(("click", "<Key.left>", 1), rs.mouse.calls)
+
+
+class _FakeEndpoint:
+    """Stands in for an IAudioEndpointVolume. [dead] mimics the invalidation
+    Windows performs on resume or an output-device change: every call raises."""
+
+    def __init__(self, level=0.56, dead=False):
+        self.level = level
+        self.dead = dead
+
+    def GetMasterVolumeLevelScalar(self):
+        if self.dead:
+            raise OSError("AUDCLNT_E_DEVICE_INVALIDATED")
+        return self.level
+
+    def SetMasterVolumeLevelScalar(self, scalar, _guid):
+        if self.dead:
+            raise OSError("AUDCLNT_E_DEVICE_INVALIDATED")
+        self.level = scalar
+
+
+class WindowsVolumeBackend(unittest.TestCase):
+    """The Windows getter must survive its endpoint going stale.
+
+    This is the bug that made a laptop sleep unrecoverable: the endpoint was
+    captured once at import, the getter had no error handling, and serve_loop
+    calls it inline to answer VGET — above the guard — so the first volume poll
+    after a wake killed the only receive thread. Portable: sys.platform and the
+    pycaw/comtypes imports are stubbed, so it runs on any OS."""
+
+    def _make(self, endpoints):
+        """Build the Windows backend over a queue of endpoints, newest last.
+        Returns (get, set, label, speaker_calls)."""
+        calls = []
+
+        class FakeAudioUtilities:
+            @staticmethod
+            def GetSpeakers():
+                calls.append(1)
+                # Later re-acquisitions get the next endpoint, mimicking Windows
+                # handing back a working one after the device settled.
+                ep = endpoints[min(len(calls), len(endpoints)) - 1]
+                return types.SimpleNamespace(EndpointVolume=ep)
+
+        pycaw_pkg = types.ModuleType("pycaw")
+        pycaw_mod = types.ModuleType("pycaw.pycaw")
+        pycaw_mod.AudioUtilities = FakeAudioUtilities
+        pycaw_mod.IAudioEndpointVolume = object
+        pycaw_pkg.pycaw = pycaw_mod
+
+        with mock.patch.dict(sys.modules, {"pycaw": pycaw_pkg,
+                                           "pycaw.pycaw": pycaw_mod}), \
+                mock.patch.object(sys, "platform", "win32"):
+            get_fn, set_fn, label = rs.make_volume()
+        return get_fn, set_fn, label, calls
+
+    def test_a_healthy_endpoint_is_acquired_once_and_reused(self):
+        get_fn, _set, label, calls = self._make([_FakeEndpoint(0.42)])
+        self.assertEqual(label, "pycaw")
+        self.assertEqual([get_fn() for _ in range(4)], [42, 42, 42, 42])
+        # One lookup at startup (the fail-fast probe); the cached pointer serves
+        # the rest. Re-resolving per call would be a COM round trip per poll.
+        self.assertEqual(len(calls), 1, f"endpoint re-resolved needlessly: {calls}")
+
+    def test_a_stale_endpoint_is_re_acquired_instead_of_raising(self):
+        stale, fresh = _FakeEndpoint(0.42), _FakeEndpoint(0.77)
+        get_fn, _set, _label, calls = self._make([stale, fresh])
+        self.assertEqual(get_fn(), 42)
+
+        stale.dead = True               # the wake / device change happens here
+        before = len(calls)
+        self.assertEqual(get_fn(), 77, "did not recover onto a fresh endpoint")
+        self.assertGreater(len(calls), before, "never re-resolved the endpoint")
+        # And it stays recovered — the new pointer is now the cached one.
+        self.assertEqual(get_fn(), 77)
+
+    def test_a_permanently_dead_backend_degrades_to_none(self):
+        dead_a, dead_b = _FakeEndpoint(dead=True), _FakeEndpoint(dead=True)
+        # The startup probe resolves an endpoint but never calls it, so a backend
+        # whose device dies immediately still constructs — and then answers None.
+        get_fn, set_fn, _label, _calls = self._make([dead_a, dead_b])
+        self.assertIsNone(get_fn(), "a dead device must yield None, not raise")
+        set_fn(50)                      # must also swallow, not raise
+
+    def test_the_setter_recovers_the_same_way(self):
+        stale, fresh = _FakeEndpoint(0.42), _FakeEndpoint(0.10)
+        _get, set_fn, _label, _calls = self._make([stale, fresh])
+        stale.dead = True
+        set_fn(90)
+        self.assertAlmostEqual(fresh.level, 0.90, places=6)
+
+
+class PanicChord(unittest.TestCase):
+    """The panic hotkey is matched against the OS keyboard state, not against the
+    codes the hook reports.
+
+    It used to test a frozenset of the GENERIC modifier codes
+    {VK_SHIFT, VK_CONTROL, VK_MENU, L} for being a subset of what a
+    WH_KEYBOARD_LL hook had recorded. Low-level hooks report the SIDE-SPECIFIC
+    codes — VK_LSHIFT (0xA0), VK_LCONTROL (0xA2), VK_LMENU (0xA4) — so that subset
+    test could not match for any keypress on any keyboard, and Ctrl+Alt+Shift+L
+    had never once fired despite being documented in START_HERE.md and shown in
+    the GUI."""
+
+    def test_the_modifiers_are_the_generic_codes_getasynckeystate_answers_for(self):
+        self.assertEqual(rs.LocalInputGuard.PANIC_MODIFIERS, (0x10, 0x11, 0x12))
+        self.assertEqual(rs.LocalInputGuard.PANIC_KEY, 0x4C)
+
+    def test_no_side_specific_modifier_is_matched_against_hook_output(self):
+        # The regression guard: if anyone reintroduces a set of modifier codes to
+        # compare against hook-reported vkCodes, the side-specific values are what
+        # would actually arrive, and the generic ones would never match them.
+        generic = set(rs.LocalInputGuard.PANIC_MODIFIERS)
+        side_specific = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5}
+        self.assertEqual(generic & side_specific, set(),
+                         "generic modifier codes cannot match a low-level hook's "
+                         "side-specific report — read the OS state instead")
+
+    def test_the_guard_keeps_no_held_key_state(self):
+        # There is nothing left to go stale across a lock screen: the modifiers are
+        # read back from the OS at the moment L is pressed.
+        guard = rs.LocalInputGuard(on_physical=lambda: None, on_panic=lambda: None)
+        self.assertFalse(hasattr(guard, "_down"),
+                         "held-key state is what went stale across a lock; it "
+                         "should no longer exist")
+
+
+class InputGuardRearm(unittest.TestCase):
+    """Windows silently revokes low-level hooks across a wake or a session switch,
+    and reports nothing — the guard just stops noticing physical input."""
+
+    def test_rearm_is_safe_before_the_hook_thread_exists(self):
+        # serve_loop calls this on every wake, including one that lands before the
+        # guard thread has published its id. It must not raise there.
+        guard = rs.LocalInputGuard(on_physical=lambda: None, on_panic=lambda: None)
+        self.assertIsNone(guard._tid)
+        guard.rearm()
+
+
+class PointerVisibility(unittest.TestCase):
+    """Windows only draws the pointer while it thinks the last input was a mouse.
+
+    pynput moves it with SetCursorPos, which does not register as input — measured
+    on Windows 11: SetCursorPos never advances GetLastInputInfo, SendInput always
+    does. So remote movement drove an INVISIBLE pointer: hover states lit up and
+    clicks landed, but the user could not see where, and only touching the real
+    mouse brought it back. A zero-delta SendInput fixes it without moving the
+    pointer or putting Windows' pointer ballistics on our deltas."""
+
+    def setUp(self):
+        self._saved = (rs.mouse, rs.keyboard)
+        rs.mouse, rs.keyboard = _Recorder(), _Recorder()
+        self.addCleanup(lambda: setattr(rs, "mouse", self._saved[0]))
+        self.addCleanup(lambda: setattr(rs, "keyboard", self._saved[1]))
+
+    def test_pointer_verbs_wake_the_cursor(self):
+        woke = []
+        with mock.patch.object(rs, "wake_pointer", lambda: woke.append(1)):
+            rs.handle_packet("MOVE", "3 -4")
+        self.assertEqual(len(woke), 1, "a MOVE left the pointer hidden")
+        self.assertIn(("move", 3, -4), rs.mouse.calls, "the move itself was lost")
+
+    def test_every_pointer_verb_is_covered(self):
+        for verb, rest in [("MOVE", "1 1"), ("SCROLL", "0 1"), ("ZOOM", "1"),
+                           ("CLICK", ""), ("RCLICK", ""), ("MCLICK", ""),
+                           ("MDOWN", ""), ("MUP", "")]:
+            with self.subTest(verb=verb):
+                woke = []
+                with mock.patch.object(rs, "wake_pointer", lambda: woke.append(1)):
+                    rs.handle_packet(verb, rest)
+                self.assertEqual(len(woke), 1, f"{verb} did not wake the pointer")
+
+    def test_typing_does_not_touch_the_pointer(self):
+        # Keyboard verbs have no business un-hiding a pointer the user is not
+        # driving — Windows hides it while typing on purpose.
+        woke = []
+        with mock.patch.object(rs, "wake_pointer", lambda: woke.append(1)):
+            rs.handle_packet("KEYSP", "enter")
+            rs.handle_packet("COMBO", "ctrl c")
+        self.assertEqual(woke, [])
+
+    def test_idle_polling_is_not_a_pointer_verb(self):
+        # The phone polls PING/VGET/BGET every 1.5-4s forever. Waking the pointer
+        # on those would register input around the clock and keep the laptop out
+        # of idle sleep for as long as the app was open.
+        self.assertFalse({"PING", "VGET", "BGET", "BYE"} & rs.POINTER_VERBS)
+
+    def test_a_missing_waker_is_not_fatal(self):
+        # Off Windows make_pointer_waker returns None and the call is skipped.
+        with mock.patch.object(rs, "wake_pointer", None):
+            rs.handle_packet("MOVE", "2 2")
+        self.assertIn(("move", 2, 2), rs.mouse.calls)
+
+    def test_no_waker_is_built_off_windows(self):
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertIsNone(rs.make_pointer_waker())
+
+
+class IdleSuppression(unittest.TestCase):
+    """Remote control never counted as activity, for the same root cause as the
+    invisible pointer: SetCursorPos does not advance the system idle timer. So a
+    session driven entirely from the phone let the display blank and, under a
+    lock-on-wake policy, lock the laptop out from under the user."""
+
+    def setUp(self):
+        self._saved = (rs.mouse, rs.keyboard, rs._last_remote_ts[0])
+        rs.mouse, rs.keyboard = _Recorder(), _Recorder()
+
+        def restore():
+            rs.mouse, rs.keyboard = self._saved[0], self._saved[1]
+            rs._last_remote_ts[0] = self._saved[2]
+        self.addCleanup(restore)
+
+    def test_pointer_verbs_are_a_subset_of_control_verbs(self):
+        # Derived, not a second hand-written copy: a new gesture verb added to one
+        # list and missed in the other would silently stop waking the cursor.
+        self.assertTrue(rs.POINTER_VERBS < rs.CONTROL_VERBS)
+
+    def test_no_wake_hold_before_any_remote_activity(self):
+        # time.monotonic() counts from boot, so a 0.0 sentinel reads as "90s ago"
+        # for the first 90s of uptime — with the server on autostart and a phone
+        # auto-reconnecting at launch, that asserted the hold at boot for nothing.
+        rs._last_remote_ts[0] = None
+        last = rs._last_remote_ts[0]
+        self.assertIsNone(last, "the sentinel must be distinguishable from a real "
+                                "timestamp near boot")
+
+    def test_control_verbs_mark_the_user_present(self):
+        rs._last_remote_ts[0] = 0.0
+        rs.handle_packet("MOVE", "1 1")
+        self.assertGreater(rs._last_remote_ts[0], 0.0)
+
+    def test_a_clicker_press_counts_even_though_it_moves_nothing(self):
+        # A phone used as a presenter remote sends no pointer verbs at all. It is
+        # still someone standing there using the machine.
+        rs._last_remote_ts[0] = 0.0
+        rs.handle_packet("KEYSP", "right")
+        self.assertGreater(rs._last_remote_ts[0], 0.0,
+                           "keyboard-only use would let the display blank")
+
+    def test_the_hold_is_released_when_nothing_holds_it(self):
+        # ES_CONTINUOUS on its own resets to the machine's normal power policy.
+        # Getting this backwards would pin the display awake forever.
+        calls = []
+        with mock.patch.object(sys, "platform", "win32"):
+            fake = types.SimpleNamespace(
+                windll=types.SimpleNamespace(
+                    kernel32=types.SimpleNamespace(
+                        SetThreadExecutionState=lambda f: calls.append(f))))
+            with mock.patch.dict(sys.modules, {"ctypes": fake}):
+                hold = rs.make_idle_suppressor()
+        self.assertIsNotNone(hold)
+        hold(True)
+        hold(False)
+        ES_CONTINUOUS, ES_SYSTEM, ES_DISPLAY = 0x80000000, 0x1, 0x2
+        self.assertEqual(calls[0], ES_CONTINUOUS | ES_SYSTEM | ES_DISPLAY)
+        self.assertEqual(calls[1], ES_CONTINUOUS)
+
+    def test_no_suppressor_off_windows(self):
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertIsNone(rs.make_idle_suppressor())
+
+    def test_a_broken_suppressor_never_reaches_the_loop(self):
+        # It runs on the single receive thread; a raise here is the whole session.
+        with mock.patch.object(sys, "platform", "win32"):
+            def boom(_flags):
+                raise OSError("SetThreadExecutionState failed")
+            fake = types.SimpleNamespace(
+                windll=types.SimpleNamespace(
+                    kernel32=types.SimpleNamespace(SetThreadExecutionState=boom)))
+            with mock.patch.dict(sys.modules, {"ctypes": fake}):
+                hold = rs.make_idle_suppressor()
+        hold(True)      # must not raise
+        hold(False)
+
+
+class LoopSupervision(unittest.TestCase):
+    """serve_forever is the backstop for everything not yet found.
+
+    The receive loop is the only thread that talks to the phone, and on the GUI
+    path it was started bare — anything escaping it ended the session for good
+    while the window still read "server running"."""
+
+    def setUp(self):
+        rs._stop.clear()
+        self.addCleanup(rs._stop.clear)
+
+    def test_a_crashed_loop_is_restarted_and_reported(self):
+        calls, events = [], []
+
+        def flaky(wire, emit, net, hostname):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("injected loop failure")
+            rs._stop.set()          # second run exits cleanly, ending the supervisor
+
+        with mock.patch.object(rs, "serve_loop", flaky):
+            rs.serve_forever(None, lambda kind, *a: events.append((kind,) + a),
+                             None, "testhost")
+
+        self.assertEqual(len(calls), 2, "the crashed loop was not restarted")
+        self.assertTrue(
+            any(e[0] == "warn" and "restarted" in str(e[1]) for e in events),
+            f"the restart was not reported; events={events}")
+
+    def test_a_clean_exit_does_not_restart(self):
+        calls = []
+
+        def clean(wire, emit, net, hostname):
+            calls.append(1)
+            rs._stop.set()
+
+        with mock.patch.object(rs, "serve_loop", clean):
+            rs.serve_forever(None, lambda *a: None, None, "testhost")
+        self.assertEqual(len(calls), 1, "a normal shutdown was treated as a crash")
+
+
+class PublishableAddress(unittest.TestCase):
+    """lan_ip() falls back to 127.0.0.1 so the GUI always has something to draw.
+
+    That fallback must never be PUBLISHED. The resume path used to read the address
+    the instant it detected the wake — before the socket rebind, and so usually
+    before Wi-Fi had re-associated — then re-register mDNS and rebuild the QR with
+    whatever came back. A phone resolving the laptop to 127.0.0.1 dials itself, and
+    the poisoned record outlived the outage: only restarting the app cleared it."""
+
+    def test_loopback_is_not_publishable(self):
+        with mock.patch.object(rs, "lan_ip", lambda: "127.0.0.1"):
+            self.assertIsNone(rs.usable_lan_ip())
+
+    def test_unspecified_is_not_publishable(self):
+        with mock.patch.object(rs, "lan_ip", lambda: "0.0.0.0"):
+            self.assertIsNone(rs.usable_lan_ip())
+
+    def test_link_local_is_not_publishable(self):
+        # The likeliest bad address right after a wake: Wi-Fi has associated but
+        # DHCP has not answered, so Windows self-assigns 169.254.x.y. Publishing it
+        # puts an unreachable address in mDNS and the QR — and the Android side
+        # already refuses to dial 169.254, so accepting it here would leave the two
+        # halves disagreeing.
+        with mock.patch.object(rs, "lan_ip", lambda: "169.254.11.7"):
+            self.assertIsNone(rs.usable_lan_ip())
+
+    def test_a_real_lan_address_is_publishable(self):
+        with mock.patch.object(rs, "lan_ip", lambda: "192.168.1.42"):
+            self.assertEqual(rs.usable_lan_ip(), "192.168.1.42")
+
+    def test_a_failed_registration_closes_the_engine_it_built(self):
+        # start_mdns constructs a Zeroconf before registering. The network watch
+        # now retries a failed registration on a timer, so returning without
+        # closing would leak an event-loop thread and multicast sockets per
+        # attempt, for as long as the failure lasted.
+        closed = []
+
+        class FakeZc:
+            def register_service(self, info):
+                raise OSError("no multicast route")
+
+            def close(self):
+                closed.append(True)
+
+        fake = types.ModuleType("zeroconf")
+        fake.Zeroconf = FakeZc
+        fake.ServiceInfo = lambda *a, **kw: object()
+        with mock.patch.dict(sys.modules, {"zeroconf": fake}):
+            zc, info = rs.start_mdns("192.168.1.42", "host")
+        self.assertEqual((zc, info), (None, None))
+        self.assertEqual(closed, [True], "the Zeroconf engine was leaked")
+
+    def test_announce_reports_whether_the_record_is_live(self):
+        # A failed registration must be reported as failure so the caller retries.
+        # Storing the None and never looking again silently lost discovery for the
+        # rest of the process.
+        wire = rs.Wire(TOKEN, KEY, True)
+        net = {"ip": "192.168.1.9", "zc": None, "info": None}
+        events = []
+        emit = lambda kind, *a: events.append((kind,) + a)
+
+        with mock.patch.object(rs, "start_mdns", lambda ip, h: (None, None)):
+            self.assertFalse(rs.announce_network(net, "host", wire, emit, "192.168.1.50"))
+        with mock.patch.object(rs, "start_mdns", lambda ip, h: ("zc", "info")):
+            self.assertTrue(rs.announce_network(net, "host", wire, emit, "192.168.1.50"))
+        self.assertEqual(net["ip"], "192.168.1.50")
+        # The address changed, so the UI was told to redraw the QR — once.
+        changes = [e for e in events if e[0] == "netchange"]
+        self.assertEqual(len(changes), 1, f"expected one netchange, got {changes}")
+        self.assertEqual(changes[0][1], "192.168.1.50")
+
+    def test_announce_is_quiet_when_the_address_did_not_change(self):
+        # A wake re-registers even on an unchanged address (zeroconf's sockets are
+        # bound to interfaces that just cycled), but "rescan the QR" would be a lie.
+        wire = rs.Wire(TOKEN, KEY, True)
+        net = {"ip": "192.168.1.9", "zc": None, "info": None}
+        events = []
+        with mock.patch.object(rs, "start_mdns", lambda ip, h: ("zc", "info")):
+            rs.announce_network(net, "host", wire,
+                                lambda kind, *a: events.append((kind,) + a),
+                                "192.168.1.9")
+        self.assertEqual([e for e in events if e[0] == "netchange"], [])
+
+
+class SessionTeardown(unittest.TestCase):
+    """A phone that is gone must leave nothing pinned behind it."""
+
+    def test_unpin_clears_the_whole_client_session(self):
+        wire = rs.Wire(TOKEN, KEY, True)
+        sock = FakeSock()
+        handshake(wire, sock)
+        self.assertIsNotNone(wire.cli_sid)
+        self.assertTrue(wire.secure_client)
+
+        wire.unpin_client()
+        self.assertIsNone(wire.cli_sid)
+        self.assertIsNone(wire.cli_magic)
+        self.assertEqual(wire.cli_ctr, -1)
+        self.assertFalse(wire.secure_client)
+        self.assertEqual(wire._chal, {})
+        self.assertIsNone(wire._pending)
+
+    def test_unpin_leaves_other_addresses_challenges_alone(self):
+        # The reconnecting phone comes back on a NEW source port, so the idle drop
+        # for its OLD address routinely fires while its fresh HELLO is already
+        # outstanding. Clearing the whole challenge table there would delete the
+        # nonce it is about to echo, dead-ending the handshake until its next retry.
+        wire = rs.Wire(TOKEN, KEY, True)
+        sock = FakeSock()
+        handshake(wire, sock)                      # pins CLIENT
+
+        newport = ("127.0.0.1", 60001)             # the same phone, rebuilt
+        fc = FakeClient(KEY, sid=b"\x77" * 8)
+        pkt, _ = fc.seal("HELLO")
+        self.assertEqual(wire.parse(pkt, newport, CLIENT)[0], "HELLO")
+        wire.issue_challenge(sock, newport, 100.0)
+        nonce = unseal(KEY, sock.last()).split(" ", 1)[1]
+
+        wire.unpin_client()                        # the old address times out
+
+        pkt, _ = fc.seal(f"AUTH {nonce}")
+        verb, rest, secure = wire.parse(pkt, newport, None)
+        self.assertTrue(wire.verify_challenge(newport, rest, 100.0),
+                        "the in-flight challenge was wiped by the unpin")
+
+    def test_a_new_phone_can_pair_after_an_unpin(self):
+        # The point of clearing it: the next handshake starts from a clean slate
+        # rather than talking its way past a dead session's watermark.
+        wire = rs.Wire(TOKEN, KEY, True)
+        sock = FakeSock()
+        handshake(wire, sock)
+        wire.unpin_client()
+
+        other = ("127.0.0.1", 55555)
+        fc = handshake(wire, sock, addr=other, client=None)
+        pkt, _ = fc.seal("PING")
+        self.assertEqual(wire.parse(pkt, other, other)[0], "PING")
 
 
 def _client_connected_clear():

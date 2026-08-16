@@ -33,7 +33,7 @@ PORT = 50505
 # asserts the git tag matches THAT, and the update check below compares against
 # whatever tag the newest GitHub release carries, so a stale value here would
 # either nag forever or never nag at all.
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 RELEASES_API = "https://api.github.com/repos/B-ismark/lazeR/releases/latest"
 RELEASES_PAGE = "https://github.com/B-ismark/lazeR/releases/latest"
 UPDATE_TIMEOUT_S = 6      # a slow/blocked network must never delay the server
@@ -41,6 +41,25 @@ SINGLETON_PORT = 50506  # loopback-only: a 2nd launch uses it to surface the run
 TOKEN_LEN = 6
 RESUME_GAP_S = 8        # recv-loop tick gap larger than this ⇒ the laptop slept; recover net
 CLIENT_IDLE_S = 12      # no packet from the pinned phone this long ⇒ it left (phone polls 1.5–4s when idle)
+# How long a phone that was pinned before we slept has to speak up after the wake
+# before we report it gone. Far shorter than CLIENT_IDLE_S — which is what the wake
+# used to grant, leaving the window claiming a phone was connected for 12s after
+# every resume — but it has to clear the phone's worst-case idle gap or we would
+# drop a phone that genuinely survived the sleep. That gap is not the 4s poll
+# interval alone: an idle tick is queryVolume(400ms) + ping(500ms) + delay(4000ms),
+# so ~4.9s before jitter or Android doze stretches it further.
+POST_WAKE_GRACE_S = 8
+# How often to re-check our own LAN address. Sleep/resume is NOT the only way it
+# moves — roaming to another SSID, a DHCP lease change, or docking all change it
+# with no tick gap at all, and the resume path was the only thing that ever
+# re-read it. Without this the server keeps advertising an address nobody is at
+# (mDNS record + the on-screen QR) until the app is restarted, which is exactly
+# what "I had to close it and start again" looked like.
+NET_WATCH_S = 5
+# After a wake, the NIC is usually still coming up: lan_ip() called at that instant
+# returns the loopback fallback, and re-announcing THAT poisons mDNS with 127.0.0.1
+# for the rest of the process. Wait (bounded) for a real address before announcing.
+NET_SETTLE_S = 45
 SERVICE_TYPE = "_lazer._udp.local."
 # Resource vs. writable paths differ when frozen into a PyInstaller onefile exe:
 # bundled data lives in the temp _MEIPASS extraction dir (read-only), while the
@@ -71,10 +90,18 @@ CHAL_MAX = 256              # bound the pending-challenge table (anti-flood)
 # handful at most (handshake retries from one or two source ports).
 CHAL_PER_IP = 8
 
+# Verbs that move or press the pointer. Listed separately because Windows needs a
+# nudge to make the pointer visible before one lands (see make_pointer_waker), and
+# defined FIRST so CONTROL_VERBS can be built from it — two hand-maintained copies
+# of the same eight strings would drift the moment a gesture verb was added to one
+# and not the other, silently bringing the invisible-pointer bug back for it.
+POINTER_VERBS = frozenset({
+    "MOVE", "SCROLL", "ZOOM", "CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP",
+})
+
 # Verbs that actually drive the machine. While the user has taken over locally
 # (or after a panic), these are dropped; PING/VGET/HELLO/BYE still flow.
-CONTROL_VERBS = {
-    "MOVE", "SCROLL", "ZOOM", "CLICK", "RCLICK", "MCLICK", "MDOWN", "MUP",
+CONTROL_VERBS = POINTER_VERBS | {
     "COMBO", "ASW", "SYS", "VOL", "MEDIA", "KEY", "KEYSP",
     "BRIGHT",
 }
@@ -90,6 +117,7 @@ _remote_paused = threading.Event()   # set ⇒ ignore remote control verbs
 _panic_latched = threading.Event()   # set ⇒ stay paused until user resumes
 _client_connected = threading.Event()  # a phone is currently paired
 _last_physical_ts = [0.0]            # monotonic time of last physical input
+_input_guard = [None]                # the live LocalInputGuard, for serve_loop's wake handling
 PHYSICAL_RESUME_GRACE_S = 2.0        # auto-resume this long after local input stops
 RATE_WINDOW_S = 10                   # rejected-packet rate window
 RATE_MAX_BAD = 80                    # >this many rejected packets/window ⇒ warn (brute/flood)
@@ -107,26 +135,82 @@ def make_volume():
     plat = sys.platform
 
     if plat.startswith("win"):
+        # The audio endpoint is looked up ON DEMAND and re-acquired when it breaks,
+        # instead of being captured once here and used forever.
+        #
+        # An IAudioEndpointVolume is bound to the default output device as it was at
+        # that moment. Windows invalidates it whenever that device changes underneath
+        # us — resuming from sleep, plugging in headphones, a Bluetooth speaker
+        # connecting — and from then on EVERY call raises COMError
+        # (AUDCLNT_E_DEVICE_INVALIDATED / RPC_E_DISCONNECTED). The old getter had no
+        # error handling at all (unlike the macOS and Linux ones below, which both
+        # swallow failures), and serve_loop answers the phone's VGET by calling it
+        # directly — above the try/except that guards verb handlers. So the first
+        # volume poll after a sleep raised straight out of the receive loop and killed
+        # the only thread serving the phone. The window still said "server running",
+        # the status dot stayed green, and nothing short of restarting the app brought
+        # it back. VGET is the phone's own liveness probe, so this fired every time.
         try:
             from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-            devices = AudioUtilities.GetSpeakers()
-            vol = getattr(devices, "EndpointVolume", None)
-            if vol is None:
-                from ctypes import cast, POINTER
-                from comtypes import CLSCTX_ALL
-                iface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-                vol = cast(iface, POINTER(IAudioEndpointVolume))
-
-            def get_win():
-                return int(round(vol.GetMasterVolumeLevelScalar() * 100))
-
-            def set_win(pct):
-                vol.SetMasterVolumeLevelScalar(pct / 100.0, None)
-
-            return get_win, set_win, "pycaw"
         except Exception as e:
             print(f"[volume] pycaw unavailable ({e}); pip install pycaw")
             return None, None, None
+
+        _ep = [None]
+
+        def _endpoint():
+            if _ep[0] is None:
+                # COM is per-thread, and comtypes only initializes the thread that
+                # imports it — the main one. Re-acquisition happens on the UDP
+                # receive thread, where GetSpeakers() otherwise fails every time
+                # with "CoInitialize has not been called" (measured). That would
+                # have made this whole recovery path a no-op: the first stale
+                # endpoint would leave volume dead until a restart, which is the
+                # symptom it exists to remove. Idempotent, so calling it on each
+                # re-acquire is free after the first.
+                import comtypes
+                try:
+                    comtypes.CoInitialize()
+                except OSError:
+                    # RPC_E_CHANGED_MODE: this thread already has an apartment of
+                    # the other kind. That is fine — it has one, which is all we
+                    # need. Anything else surfaces on the GetSpeakers call below.
+                    pass
+                devices = AudioUtilities.GetSpeakers()
+                vol = getattr(devices, "EndpointVolume", None)
+                if vol is None:
+                    from ctypes import cast, POINTER
+                    from comtypes import CLSCTX_ALL
+                    iface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                    vol = cast(iface, POINTER(IAudioEndpointVolume))
+                _ep[0] = vol
+            return _ep[0]
+
+        def _on_endpoint(call):
+            """Run [call] against the endpoint, re-acquiring once if it has gone
+            stale. Returns None if even a fresh endpoint fails (no output device at
+            all), so callers can degrade instead of raising."""
+            for _ in (0, 1):            # try, then retry once on a fresh endpoint
+                try:
+                    return call(_endpoint())
+                except Exception:
+                    _ep[0] = None       # drop the dead pointer; the retry re-acquires
+            return None
+
+        def get_win():
+            v = _on_endpoint(lambda e: e.GetMasterVolumeLevelScalar())
+            return None if v is None else int(round(v * 100))
+
+        def set_win(pct):
+            _on_endpoint(lambda e: e.SetMasterVolumeLevelScalar(pct / 100.0, None))
+
+        try:
+            _endpoint()          # fail fast at startup, exactly as before
+        except Exception as e:
+            print(f"[volume] pycaw unavailable ({e}); pip install pycaw")
+            return None, None, None
+
+        return get_win, set_win, "pycaw"
 
     if plat == "darwin":
         import subprocess
@@ -563,7 +647,9 @@ def do_system(action):
             keyboard.press(k)
             keyboard.release(k)
         elif set_volume is not None and get_volume is not None:
-            set_volume(0 if get_volume() > 0 else 30)
+            cur = get_volume()          # None when the output device is unavailable
+            if cur is not None:
+                set_volume(0 if cur > 0 else 30)
         return
     if action == "lock":
         if plat.startswith("win"):
@@ -855,6 +941,26 @@ class Wire:
         else:
             self.cli_magic, self.cli_sid, self.cli_ctr = None, None, -1
 
+    def unpin_client(self):
+        """Forget the pinned phone's secure session and any half-finished handshake.
+
+        serve_loop's `client = None` only stopped ACCEPTING that address; the sid /
+        counter watermark and secure_client stayed behind, so replies could still be
+        sealed for a session that no longer exists and a stale `_pending` could be
+        committed by a later AUTH. Called wherever the phone is genuinely gone (idle
+        timeout, BYE, resume) so the next handshake starts from a clean slate.
+
+        Deliberately leaves the challenge table alone. Clearing it looks tidy and
+        is a bug: `_chal` is keyed by address and the departing client is not the
+        only one in it. The reconnecting phone comes back on a NEW source port, so
+        the idle drop for its OLD address routinely fires while its fresh HELLO is
+        already outstanding — wiping the table there would delete the nonce it is
+        about to echo, dead-ending the handshake until its next retry. Unanswered
+        challenges expire on their own via sweep_challenges."""
+        self.cli_magic, self.cli_sid, self.cli_ctr = None, None, -1
+        self.secure_client = False
+        self._pending = None
+
     def _srv_session(self, magic):
         """This dialect's [sid, counter], created on first use. Never re-drawn on a
         dialect change — only when the counter is genuinely spent."""
@@ -884,7 +990,17 @@ class Wire:
         nonce = ent[0] + ent[1].to_bytes(ctr_len, "big")
         hdr = magic + nonce
         ct = self.aes.encrypt(nonce, text.encode("utf-8"), hdr)
-        sock.sendto(hdr + ct, addr)
+        try:
+            sock.sendto(hdr + ct, addr)
+        except OSError:
+            # Same fail-soft contract as reply() below, and for the same reason —
+            # but this path is the one that answers a HELLO with its challenge, and
+            # it runs OUTSIDE serve_loop's handler guard. A send to a phone that has
+            # just moved networks raises ENETUNREACH/EHOSTUNREACH (and WSAECONNRESET
+            # on Windows), so letting it propagate took the whole receive thread down
+            # while the window still read "server running" — the laptop went deaf
+            # until it was restarted. A dropped reply is nothing: the phone resends.
+            pass
 
     def reply(self, sock, addr, text):
         """Send a reply, encrypted iff the client is on the secure wire."""
@@ -909,21 +1025,56 @@ class LocalInputGuard:
     user's real mouse/keyboard always wins: touching it pauses the remote, and a
     panic chord (Ctrl+Alt+Shift+L) latches the pause until they resume."""
 
-    PANIC_VKS = frozenset({0x10, 0x11, 0x12, 0x4C})  # shift, ctrl, alt, L
+    # The panic chord is Ctrl+Alt+Shift+L. Only the L is matched from the hook's
+    # own report; the three modifiers are read back from the OS in chord_held().
+    #
+    # That split is not a style choice. A WH_KEYBOARD_LL hook reports SIDE-SPECIFIC
+    # virtual keys — VK_LSHIFT (0xA0), VK_LCONTROL (0xA2), VK_LMENU (0xA4) — never
+    # the generic VK_SHIFT/CONTROL/MENU (0x10/0x11/0x12). This used to test a set of
+    # the generic codes against what the hook had recorded, which could not match
+    # for any keypress on any keyboard, so the panic hotkey had never once fired
+    # despite being documented in START_HERE.md and shown in the GUI. Asking
+    # GetAsyncKeyState instead fixes that AND is side-agnostic: the generic codes
+    # are exactly what it answers for, whichever Shift you press.
+    PANIC_KEY = 0x4C                                 # L
+    PANIC_MODIFIERS = (0x10, 0x11, 0x12)             # shift, ctrl, alt (generic)
+
+    WM_REARM = 0x8000 + 1        # WM_APP+1: our private "re-install the hooks" ping
 
     def __init__(self, on_physical, on_panic):
         self._on_physical = on_physical
         self._on_panic = on_panic
-        self._down = set()
         self._thread = None
         self._tid = None
 
     def start(self):
+        _input_guard[0] = self        # so serve_loop can re-arm us after a wake
         if not sys.platform.startswith("win"):
             return False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         return True
+
+    def rearm(self):
+        """Re-install the hooks after a wake or a lock/unlock.
+
+        Windows silently drops a low-level hook whose callback ever overran
+        LowLevelHooksTimeout, and a session switch (lock screen, UAC secure
+        desktop) can take them out too. Nothing reports it — the guard simply
+        stops noticing physical input, so the remote no longer yields to the
+        laptop's own mouse and the panic key goes dead, on a session that looks
+        entirely healthy.
+
+        Handled on the hook thread, since that is the thread the hooks belong to;
+        see _run for why the new pair is installed before the old one is dropped."""
+        tid = self._tid
+        if tid is None or not sys.platform.startswith("win"):
+            return
+        try:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(tid, self.WM_REARM, 0, 0)
+        except Exception:
+            pass                          # best effort; the next wake tries again
 
     def _run(self):
         import ctypes
@@ -944,6 +1095,11 @@ class LocalInputGuard:
         user32.CallNextHookEx.restype = LRESULT
         user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int,
                                           wintypes.WPARAM, wintypes.LPARAM]
+        # Declared explicitly: the API returns SHORT, and the "is it down" answer is
+        # the high bit. Left at ctypes' default c_int it happens to work, but only by
+        # accident of how the value is sign-extended.
+        user32.GetAsyncKeyState.restype = ctypes.c_short
+        user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 
         class KBD(ctypes.Structure):
             _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
@@ -955,19 +1111,29 @@ class LocalInputGuard:
                         ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
                         ("dwExtraInfo", ctypes.c_void_p)]
 
+        def chord_held():
+            """True iff the panic modifiers are physically down at this instant.
+
+            Asked of the OS rather than read from `self._down`, for two reasons.
+            The set holds side-specific codes the generic constants never match
+            (see PANIC_KEY), and it is not trustworthy anyway: hooks miss key-UP
+            events across a lock screen / UAC prompt / session switch, so a
+            modifier can linger in it long after the user let go. GetAsyncKeyState
+            answers for the real keyboard, and for either Shift. Three register
+            reads, cheap enough for a hook callback."""
+            return all(user32.GetAsyncKeyState(vk) & 0x8000
+                       for vk in self.PANIC_MODIFIERS)
+
         def kb_proc(nCode, wParam, lParam):
             if nCode == 0:
                 kb = ctypes.cast(lParam, ctypes.POINTER(KBD)).contents
                 if not (kb.flags & LLKHF_INJECTED):       # physical only
                     vk = kb.vkCode
                     if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
-                        self._down.add(vk)
-                        if self.PANIC_VKS.issubset(self._down):
+                        if vk == self.PANIC_KEY and chord_held():
                             self._on_panic()
                         else:
                             self._on_physical()
-                    elif wParam in (WM_KEYUP, WM_SYSKEYUP):
-                        self._down.discard(vk)
             return user32.CallNextHookEx(0, nCode, wParam, lParam)
 
         def ms_proc(nCode, wParam, lParam):
@@ -980,14 +1146,44 @@ class LocalInputGuard:
         self._kb_cb = HOOKPROC(kb_proc)   # keep refs alive
         self._ms_cb = HOOKPROC(ms_proc)
         hmod = kernel32.GetModuleHandleW(None)
-        kb_hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kb_cb, hmod, 0)
-        ms_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._ms_cb, hmod, 0)
+
+        def install():
+            return (user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kb_cb, hmod, 0),
+                    user32.SetWindowsHookExW(WH_MOUSE_LL, self._ms_cb, hmod, 0))
+
+        kb_hook, ms_hook = install()
+        # Set LAST: rearm() posts to this id, and a caller that read it before the
+        # hooks existed would ping a thread with nothing to re-install.
         self._tid = kernel32.GetCurrentThreadId()
         msg = wintypes.MSG()
         while not _stop.is_set():
             r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if r in (0, -1):
                 break
+            if msg.message == self.WM_REARM:
+                # A thread-message has no window, so it is never dispatched — handle
+                # it here.
+                #
+                # Install FIRST, and only drop the old handles once the new pair is
+                # real. Unhooking up front is the obvious order and the wrong one:
+                # SetWindowsHookExW can fail during a session or desktop transition,
+                # which is exactly the wake-and-unlock moment this runs at, and that
+                # would have thrown away two working hooks for nothing. The guard
+                # would go quiet with no error anywhere — physical input would stop
+                # pausing the remote, and the panic key would stop working, for the
+                # rest of the session. A duplicate LL hook from one thread is legal,
+                # so the brief overlap costs nothing.
+                new_kb, new_ms = install()
+                if new_kb and new_ms:
+                    user32.UnhookWindowsHookEx(kb_hook)
+                    user32.UnhookWindowsHookEx(ms_hook)
+                    kb_hook, ms_hook = new_kb, new_ms
+                else:                       # keep what still works
+                    if new_kb:
+                        user32.UnhookWindowsHookEx(new_kb)
+                    if new_ms:
+                        user32.UnhookWindowsHookEx(new_ms)
+                continue
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
         user32.UnhookWindowsHookEx(kb_hook)
@@ -1012,6 +1208,141 @@ def _clamp_int(tok, limit):
     return max(-limit, min(limit, int(tok)))
 
 
+def make_pointer_waker():
+    """Return a callable that un-hides the mouse pointer, or None off Windows.
+
+    Windows only draws the pointer while it believes the most recent input came
+    from a mouse. pynput moves the cursor with SetCursorPos, and SetCursorPos does
+    NOT register as input — measured on Windows 11: it never advances
+    GetLastInputInfo, while a SendInput mouse event does, every time.
+
+    So remote movement drove an invisible pointer. Hover states lit up and clicks
+    landed exactly where they should; the user simply couldn't see where "there"
+    was, and only touching the physical mouse brought it back. It showed up after
+    a resume and on a fresh connect — any moment the system's last input wasn't a
+    real mouse.
+
+    The fix is a zero-delta SendInput: a genuine mouse event that moves nothing,
+    so the pointer reappears without being displaced and without Windows' pointer
+    ballistics touching our carefully-tuned deltas (which is why the movement
+    itself stays on SetCursorPos rather than switching wholesale to SendInput).
+
+    Only fired when the pointer is actually hidden, so the normal path costs one
+    cheap GetCursorInfo and nothing else. CURSOR_SUPPRESSED matters as much as a
+    clear CURSOR_SHOWING: that's the specific state Windows 8+ puts the pointer in
+    after touch input, which is how a touchscreen laptop lands here mid-session."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+
+        class CURSORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                        ("hCursor", wintypes.HANDLE),
+                        ("ptScreenPos", wintypes.POINT)]
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                        ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("mi", MOUSEINPUT)]
+
+        INPUT_MOUSE = 0
+        MOUSEEVENTF_MOVE = 0x0001
+        CURSOR_SHOWING, CURSOR_SUPPRESSED = 0x0001, 0x0002
+
+        nudge = INPUT(type=INPUT_MOUSE,
+                      mi=MOUSEINPUT(dx=0, dy=0, mouseData=0,
+                                    dwFlags=MOUSEEVENTF_MOVE, time=0,
+                                    dwExtraInfo=None))
+        info = CURSORINFO()
+        info.cbSize = ctypes.sizeof(CURSORINFO)
+        size = ctypes.sizeof(INPUT)
+
+        def wake():
+            # Never let this break a MOVE. It is a cosmetic assist, and it runs on
+            # the single receive thread, where the cost of a raise is the whole
+            # session.
+            try:
+                if not user32.GetCursorInfo(ctypes.byref(info)):
+                    return
+                if (info.flags & CURSOR_SHOWING) and not (info.flags & CURSOR_SUPPRESSED):
+                    return                      # already visible; nothing to do
+                user32.SendInput(1, ctypes.byref(nudge), size)
+            except Exception:
+                pass
+
+        return wake
+    except Exception:
+        return None
+
+
+wake_pointer = make_pointer_waker()
+
+# Monotonic time of the last remote control verb, and how long after one we keep
+# telling Windows the machine is in use. Sized to outlast a pause for thought
+# mid-task without pinning the display awake once the phone is merely idling.
+#
+# None, not 0.0: time.monotonic() counts from boot, so a 0.0 sentinel reads as
+# "90 seconds ago" for the first 90 seconds of uptime. With the server on autostart
+# and a phone auto-reconnecting at launch, that meant asserting the wake hold at
+# boot with no remote activity at all.
+_last_remote_ts = [None]
+REMOTE_AWAKE_S = 90
+
+
+def make_idle_suppressor():
+    """Return a callable(bool) that holds the machine awake, or None off Windows.
+
+    Remote control did not count as activity, for the same root reason the pointer
+    stayed invisible: SetCursorPos never advances the system's last-input time. So
+    a session driven entirely from the phone let the idle timer run to completion
+    underneath it — the display would blank, and a lock-on-wake policy would lock
+    the machine, while the user was actively using it.
+
+    The tempting fix is to make every move inject a real mouse event. That works,
+    but it works by lying: it fabricates input to move a clock, which also means
+    the phone's idle polling would have to be carefully excluded forever or the
+    laptop could never sleep again. SetThreadExecutionState is the API that exists
+    for exactly this, is what media players use, and says what it means.
+
+    Per-THREAD state, so every call must come from the one that serves the phone —
+    which is why serve_loop owns the transitions rather than the packet handler."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ES_DISPLAY_REQUIRED = 0x00000002
+
+        def hold(active):
+            try:
+                # ES_CONTINUOUS alone RESETS to the machine's normal policy; it
+                # does not "keep it awake with no display". Dropping the other two
+                # flags is how the hold is released.
+                kernel32.SetThreadExecutionState(
+                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+                    if active else ES_CONTINUOUS)
+            except Exception:
+                pass
+
+        return hold
+    except Exception:
+        return None
+
+
+hold_awake = make_idle_suppressor()
+
+
 def handle_packet(verb, rest):
     """Drive the machine for one authenticated verb.
 
@@ -1021,6 +1352,15 @@ def handle_packet(verb, rest):
     PLAINTEXT straight to the socket; they were dead code (serve_loop intercepts
     both first) but would have leaked in clear the moment dispatch order changed.
     Removing the parameters means a future handler can't reintroduce that."""
+    if verb in CONTROL_VERBS:
+        # Any verb that drives the machine is the user being present, whether or
+        # not it moves the pointer — a phone used purely as a presenter clicker
+        # counts. serve_loop turns this into the actual wake hold.
+        _last_remote_ts[0] = time.monotonic()
+
+    if wake_pointer is not None and verb in POINTER_VERBS:
+        wake_pointer()
+
     if verb == "MOVE":
         try:
             a, b = rest.split()
@@ -1379,10 +1719,17 @@ def load_or_create_token():
     return tok
 
 
+_MDNS_UNAVAILABLE = [False]   # zeroconf isn't installed — never worth retrying
+
+
 def start_mdns(ip, hostname):
     try:
         from zeroconf import Zeroconf, ServiceInfo
     except ImportError:
+        # Latched so the network watch can tell "this machine will never do mDNS"
+        # apart from "that registration failed, try again" — only the latter is
+        # worth retrying, and retrying the former reprints this every few seconds.
+        _MDNS_UNAVAILABLE[0] = True
         print("[discovery] zeroconf not installed — auto-discovery off. QR + manual still work.")
         return None, None
     try:
@@ -1396,11 +1743,73 @@ def start_mdns(ip, hostname):
             server=f"{safe}.local.",
         )
         zc = Zeroconf()
-        zc.register_service(info)
+        try:
+            zc.register_service(info)
+        except Exception:
+            # Close the engine we just built before giving up. It owns an event
+            # loop thread and multicast sockets, and the network watch now retries
+            # this on a timer — so leaking one per failed attempt would pile up
+            # threads and sockets for as long as the failure persisted.
+            try:
+                zc.close()
+            except Exception:
+                pass
+            raise
         return zc, info
     except Exception as e:
         print(f"[discovery] mDNS failed ({e}); QR + manual still work.")
         return None, None
+
+
+def usable_lan_ip():
+    """Our LAN address, or None if we don't have one *right now*.
+
+    lan_ip() never fails — it falls back to 127.0.0.1 so the GUI always has
+    something to render. That fallback must never reach an mDNS record or a QR:
+    a phone that resolves the laptop to 127.0.0.1 dials itself and times out,
+    and the bogus record outlives the outage. So callers that PUBLISH an address
+    ask here instead, and simply wait when the answer is None."""
+    ip = lan_ip()
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    # Link-local (169.254/16) matters as much as loopback here, and is the likelier
+    # of the two right after a wake: Wi-Fi associates, DHCP has not answered yet,
+    # and Windows self-assigns an APIPA address. candidate_ips() filters those out,
+    # so lan_ip() falls through to the default-route probe and hands one back —
+    # publishing it would put an address no phone on the real subnet can reach into
+    # mDNS and the QR. The Android side already rejects 169.254 when picking a host
+    # to dial, so accepting it here would have the two halves disagreeing.
+    if addr.is_loopback or addr.is_unspecified or addr.is_link_local:
+        return None
+    return ip
+
+
+def announce_network(net, hostname, wire, emit, ip):
+    """(Re)publish [ip]: swap the mDNS record and tell the UI to refresh the QR.
+
+    Tears the old registration down first — zeroconf binds sockets to the
+    interfaces it saw at construction, so a Zeroconf built before the NIC cycled
+    keeps answering for an address that no longer exists. Returns True if the
+    record is live afterwards, so the caller can retry a failed registration
+    instead of losing discovery for the rest of the process (the old code stored
+    the None and never looked again)."""
+    if net is None:
+        return False
+    old_ip = net.get("ip")
+    if net.get("zc"):
+        try:
+            net["zc"].unregister_service(net["info"])
+            net["zc"].close()
+        except Exception:
+            pass
+        net["zc"], net["info"] = None, None
+    net["zc"], net["info"] = start_mdns(ip, hostname)
+    net["ip"] = ip
+    if ip != old_ip:
+        emit("netchange", ip, build_uri(ip, wire.token, hostname, wire.key))
+    return net.get("zc") is not None
 
 
 # ── Windows "start with Windows" (HKCU Run key) ───────────────────────────────
@@ -1693,6 +2102,41 @@ def serve_loop(wire, emit, net, hostname):
     blocked_seen = set()     # addresses turned away while a phone is already paired
     plaintext_hinted = False  # explained a secure-only refusal this window
     _client_connected.clear()
+    # Normalize the wake hold. This is per-thread state and serve_forever restarts
+    # us on the SAME thread, so a loop that died mid-session would otherwise leave
+    # the display pinned awake, with awake_held=False here and nothing to release it.
+    if hold_awake is not None:
+        hold_awake(False)
+
+    awake_held = False        # are we currently telling Windows the machine is in use
+    # zeroconf's register/unregister are synchronous and take on the order of a
+    # second (probe + repeated announcements). Running them inline would stall the
+    # ONE thread serving the phone for that long, and the watch now fires them on
+    # every wake and every roam — precisely when the phone is mid-handshake. Five
+    # missed replies at 500ms is all its watchdog needs to declare the link dead,
+    # so a stall here would manufacture the very reconnect this change prevents.
+    # Hand the work to a thread and let the loop keep answering.
+    announce_busy = threading.Event()
+
+    def announce_async(ip):
+        if announce_busy.is_set():
+            return                      # one in flight; the watch will re-check
+        announce_busy.set()
+
+        def work():
+            try:
+                if announce_network(net, hostname, wire, emit, ip):
+                    emit("log", f"Reachable at {ip}")
+            except Exception as e:
+                emit("warn", f"Could not re-announce on the network ({e})")
+            finally:
+                announce_busy.clear()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    net_checked = last_tick   # wall-clock of the last own-address check
+    net_pending = False       # our published address is known-stale; keep trying
+    net_pending_since = 0.0   # when that became true, to bound the post-wake wait
 
     def drop_client():
         nonlocal client
@@ -1701,6 +2145,11 @@ def serve_loop(wire, emit, net, hostname):
             client = None
             _client_connected.clear()
             emit("disconnected")
+        # Whether or not an address was pinned, forget the crypto session that went
+        # with it. Leaving it behind meant a phone that vanished kept a sid/counter
+        # watermark alive on our side, and the next session had to talk its way past
+        # the leftovers instead of starting clean.
+        wire.unpin_client()
 
     while not _stop.is_set():
         now = time.time()
@@ -1710,7 +2159,6 @@ def serve_loop(wire, emit, net, hostname):
         # the process was frozen (laptop slept). Rebind + re-announce so a phone
         # can reach us again without a restart.
         if now - last_tick > RESUME_GAP_S:
-            new_ip = lan_ip()
             try:
                 sock.close()
             except OSError:
@@ -1739,28 +2187,76 @@ def serve_loop(wire, emit, net, hostname):
             # The retry may have taken several seconds; refresh `now` so the stale
             # value doesn't spuriously re-trigger the resume path or idle-drop below.
             now = time.time()
-            # Keep the phone pinned across the rebind: its socket + secure session
-            # survived our sleep, so its very next packet (same addr, advancing
-            # counter) is still accepted and the laptop stays "connected" — no
-            # spurious "Waiting" flash. Just release any Alt held mid-gesture and
-            # give the idle timer a fresh window for the phone to speak again.
+            # Keep the phone pinned, but stop giving it a FULL idle window to prove
+            # it's still there.
+            #
+            # The pin costs nothing to hold: HELLO/AUTH are accepted from any source,
+            # so a phone that rebuilt its session (new port, new sid — what its
+            # watchdog does after ~2.5s of silence, i.e. always, since the gap that
+            # got us here is longer than that) re-pairs immediately regardless. And on
+            # the rarer path where BOTH devices slept, the phone's socket really did
+            # survive and holding the pin means it resumes with no interruption at all.
+            #
+            # What was wrong was the idle window. `last_pkt = now` handed the departed
+            # phone a fresh CLIENT_IDLE_S, so the window sat there claiming a phone was
+            # connected for 12s after a wake, every time. Give it a short grace instead:
+            # a phone that is genuinely still there speaks well inside it, and one that
+            # isn't is reported gone promptly.
             appswitch_reset()
-            last_pkt = time.time()
-            if net is not None:
-                old_ip = net.get("ip")
-                if net.get("zc"):
-                    try:
-                        net["zc"].unregister_service(net["info"])
-                        net["zc"].close()
-                    except Exception:
-                        pass
-                net["zc"], net["info"] = start_mdns(new_ip, hostname)
-                net["ip"] = new_ip
-                if new_ip != old_ip:
-                    emit("netchange", new_ip,
-                         build_uri(new_ip, wire.token, hostname, wire.key))
-            emit("log", "Network recovered after sleep")
+            last_pkt = time.time() - max(0, CLIENT_IDLE_S - POST_WAKE_GRACE_S)
+            # Hooks are commonly revoked across a wake or a lock, and key-ups during
+            # one are never delivered — so re-install and forget any held keys.
+            if _input_guard[0] is not None:
+                _input_guard[0].rearm()
+            # A wake often lands with the panic/pause latch set from whatever the user
+            # touched on the way in (or before sleeping). Clearing the SOFT pause is
+            # safe — it re-arms on the next physical event 2s later. The panic latch is
+            # deliberate, so it stays; the false-trigger it used to suffer is fixed in
+            # LocalInputGuard.rearm/chord_held.
+            _remote_paused.clear()
+            # Re-announce, but NOT with whatever lan_ip() says at this instant. This
+            # ran before the rebind and published the answer unconditionally, so a
+            # wake that beat the Wi-Fi association — the normal case — advertised the
+            # 127.0.0.1 fallback over mDNS and painted it into the QR, and it stayed
+            # that way until the app was restarted. Just mark the address stale; the
+            # watch below publishes it once there's a real one to publish.
+            net_pending, net_pending_since, net_checked = True, now, 0.0
+            emit("log", "Woke from sleep — restoring the network…")
         last_tick = now
+
+        # Own-address watch. Runs on every tick, not only after a sleep gap: roaming
+        # to another SSID or a DHCP change moves us with no gap at all, and the mDNS
+        # record and QR would otherwise keep pointing at the old address for the rest
+        # of the process. [net_pending] also drives the post-wake retry — we may need
+        # several passes before the NIC hands us a usable address.
+        if (net is not None and not announce_busy.is_set()
+                and (net_pending or now - net_checked > NET_WATCH_S)):
+            net_checked = now
+            ip_now = usable_lan_ip()
+            if ip_now is None:
+                # No LAN address yet (still associating, or genuinely offline).
+                # Publishing the loopback fallback here is what poisoned discovery,
+                # so publish nothing and look again on the next tick.
+                if net_pending and now - net_pending_since > NET_SETTLE_S:
+                    # Stop the every-tick retry and say so once. The periodic watch
+                    # keeps running at its normal cadence, so plugging the network
+                    # back in later still re-announces without an app restart.
+                    net_pending = False
+                    emit("warn", "Still no network address after waking — "
+                                 "reconnect Wi-Fi and LazeR will re-announce itself.")
+            elif (ip_now != net.get("ip") or net_pending
+                    or (net.get("zc") is None and not _MDNS_UNAVAILABLE[0])):
+                # Re-register on a changed address, after a wake (the zeroconf
+                # sockets are bound to interfaces that just cycled), or when a
+                # previous attempt failed — that last case used to store the failure
+                # and never look again, silently losing discovery for good. A machine
+                # with no zeroconf installed is a different thing entirely and must
+                # NOT be retried: it would reprint the notice every few seconds.
+                # Stop the fast retry and fall back to the normal NET_WATCH_S
+                # cadence — the clause above re-tries a failed registration on the
+                # next pass without spinning on this one.
+                net_pending = False
+                announce_async(ip_now)
 
         # The phone pings ~every 1.5s; prolonged silence means it left without a
         # BYE (app killed, Wi-Fi dropped). Reflect that instead of showing it
@@ -1781,6 +2277,23 @@ def serve_loop(wire, emit, net, hostname):
                 and (mono - _last_physical_ts[0]) > PHYSICAL_RESUME_GRACE_S):
             _remote_paused.clear()
             emit("resumed")
+
+        # Hold the machine awake while the phone is actively driving it, and let go
+        # once it goes quiet. Remote control never counted as activity — the moves
+        # go through SetCursorPos, which does not advance the system's idle timer —
+        # so a session run entirely from the phone would blank the display and, with
+        # a lock-on-wake policy, lock the laptop out from under the user. Only the
+        # transitions are pushed, so a steady session costs one call, not one a
+        # second; and releasing on quiet means an idle phone still lets the laptop
+        # sleep normally. See make_idle_suppressor for why this is a wake hold
+        # rather than fabricated mouse input.
+        if hold_awake is not None:
+            last = _last_remote_ts[0]
+            want_awake = (client is not None and last is not None
+                          and (mono - last) < REMOTE_AWAKE_S)
+            if want_awake != awake_held:
+                hold_awake(want_awake)
+                awake_held = want_awake
 
         sock.settimeout(1.0)   # 1/s idle wake-ups drive the resume/idle/rate checks
 
@@ -1880,7 +2393,17 @@ def serve_loop(wire, emit, net, hostname):
             continue
         if verb == "VGET":
             if get_volume is not None:
-                wire.reply(sock, addr, f"VOL {get_volume()}")
+                # Belt and braces around the backend: make_volume's Windows path now
+                # re-acquires a stale endpoint by itself, but this branch runs ABOVE
+                # the handler guard below, so anything that still escapes here would
+                # take the whole receive loop with it. A missing answer costs the
+                # phone one poll — it re-probes with PING and stays connected.
+                try:
+                    vol = get_volume()
+                except Exception:
+                    vol = None
+                if vol is not None:
+                    wire.reply(sock, addr, f"VOL {vol}")
             continue
         if verb == "BGET":
             if brightness_svc.available:
@@ -1907,10 +2430,47 @@ def serve_loop(wire, emit, net, hostname):
                 emit("warn", f"{verb} failed and was ignored "
                              f"({type(e).__name__}: {e})")
 
+    # Drop the wake hold on the way out — shutdown, or a crash the supervisor is
+    # about to restart us from. It is thread state, so a restarted loop starts on a
+    # fresh thread with none of it; leaking it here would pin the display awake for
+    # the life of the process with nothing left to release it.
+    if hold_awake is not None and awake_held:
+        hold_awake(False)
     try:
         sock.close()
     except OSError:
         pass
+
+
+def serve_forever(wire, emit, net, hostname):
+    """Run serve_loop, and put it back on its feet if it ever falls over.
+
+    serve_loop is the ONLY thread that talks to the phone, and it was started
+    bare — on the GUI path, as a daemon thread with nothing above it. Any escaping
+    exception therefore ended the session permanently while every visible sign said
+    the server was fine: window open, status dot green, "server running" lit. The
+    user's only recourse was to close the app and pair again.
+
+    The specific escapes found have been fixed at source (a stale audio endpoint on
+    VGET, a send to a departed phone while answering a HELLO), but "the receive
+    thread cannot die unnoticed" should not depend on having found them all. So:
+    log it, wait a moment, and rebuild. serve_loop opens a fresh socket each time it
+    starts, so a restart is also the correct recovery for a socket that has gone bad.
+    Session state is not carried over — the phone re-handshakes within seconds,
+    which is a blink next to needing a human to restart the app."""
+    failures = 0
+    while not _stop.is_set():
+        try:
+            serve_loop(wire, emit, net, hostname)
+            return                      # clean exit — _stop was set
+        except Exception as e:
+            failures += 1
+            emit("warn", f"Receive loop crashed and was restarted "
+                         f"({type(e).__name__}: {e})")
+            # Back off a little so a hard-failing loop (e.g. the port genuinely
+            # taken) doesn't spin the CPU, but stay responsive enough that the
+            # phone's own retry finds us again within a few seconds.
+            _stop.wait(min(1.0 * failures, 5.0))
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -2889,7 +3449,7 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
     guard.start()
 
     try:
-        serve_loop(wire, emit, net, hostname)
+        serve_forever(wire, emit, net, hostname)
     except KeyboardInterrupt:
         pass
     finally:
@@ -3040,7 +3600,7 @@ def main():
             )
             guard.start()
 
-            t = threading.Thread(target=serve_loop,
+            t = threading.Thread(target=serve_forever,
                                  args=(wire, emit, net, hostname), daemon=True)
             t.start()
 
