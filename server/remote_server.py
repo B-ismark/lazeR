@@ -33,7 +33,7 @@ PORT = 50505
 # asserts the git tag matches THAT, and the update check below compares against
 # whatever tag the newest GitHub release carries, so a stale value here would
 # either nag forever or never nag at all.
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 RELEASES_API = "https://api.github.com/repos/B-ismark/lazeR/releases/latest"
 RELEASES_PAGE = "https://github.com/B-ismark/lazeR/releases/latest"
 UPDATE_TIMEOUT_S = 6      # a slow/blocked network must never delay the server
@@ -207,7 +207,11 @@ def make_volume():
         try:
             _endpoint()          # fail fast at startup, exactly as before
         except Exception as e:
-            print(f"[volume] pycaw unavailable ({e}); pip install pycaw")
+            # Deliberately not "pycaw unavailable": _endpoint() also imports
+            # comtypes and then talks to the audio device, so blaming pycaw for
+            # any of the three sent a missing comtypes chasing the wrong package.
+            print(f"[volume] Windows volume unavailable ({e}); "
+                  "pip install pycaw comtypes")
             return None, None, None
 
         return get_win, set_win, "pycaw"
@@ -1899,11 +1903,32 @@ set_startup.last_error = ""
 # server looks healthy locally while every phone times out. We add the rule for
 # the user (one UAC click) instead of making them run netsh by hand. Third-party
 # firewalls and VPN LAN-blocking are out of our reach; we detect + warn for those.
-FW_RULE_NAME = "LazeR UDP 50505"
-_FW_NETSH_ARGS = (
-    f'advfirewall firewall add rule name="{FW_RULE_NAME}" dir=in action=allow '
-    f'protocol=UDP localport={PORT} profile=private,domain'
-)
+#
+# profile=any, NOT private,domain. Windows classifies most Wi-Fi as *Public* —
+# corporate SSIDs and plenty of home routers included — and a private,domain
+# rule is inert there: the port stays shut, every check still reports the rule
+# as present, and phones time out with nothing to go on. Opening it is not the
+# exposure it looks like, because the port is not the security boundary — every
+# datagram is gated by the per-session token, over AES-256-GCM with a
+# replay-proof challenge-response handshake, so a reachable port without the QR
+# is useless.
+#
+# We deliberately don't add remoteip=localsubnet on top. It would be a tighter
+# rule, but it breaks the routed multi-subnet LANs some routers and mesh kits
+# hand out (phone and PC on different subnets), trading a silent failure we
+# just fixed for a rarer one. The auth gate already carries this.
+#
+# The name carries a version suffix on purpose: installs from before this fix
+# left a private,domain rule under the old name, and matching that name would
+# report a healthy firewall that in fact drops every packet. The new name can't
+# match those, so the check fails honestly and the fix path replaces them.
+FW_RULE_NAME = "LazeR inbound UDP 50505 v2"
+_FW_LEGACY_RULE_NAMES = ("LazeR UDP 50505",)
+_FW_ADD_ARGS = [
+    "advfirewall", "firewall", "add", "rule", f"name={FW_RULE_NAME}",
+    "dir=in", "action=allow", "protocol=UDP", f"localport={PORT}",
+    "profile=any",
+]
 
 
 def _no_window_flags():
@@ -1922,7 +1947,12 @@ def is_admin():
 
 
 def firewall_rule_exists():
-    """True if our inbound allow rule is present. Read-only — needs no admin."""
+    """True if our inbound allow rule is present. Read-only — needs no admin.
+
+    Matches on name alone: netsh prints its field labels *and* its profile
+    values in the system language, so parsing them to confirm profile=any
+    breaks on a non-English Windows. The versioned name carries that guarantee
+    instead — only we create it, and only ever with profile=any."""
     if not sys.platform.startswith("win"):
         return True   # we only manage Windows Firewall; assume OK elsewhere
     import subprocess
@@ -1936,14 +1966,28 @@ def firewall_rule_exists():
         return False
 
 
-def _firewall_add_direct():
-    """Add the rule in-process (succeeds only if already elevated)."""
+def _firewall_purge_legacy_direct():
+    """Drop the pre-fix private,domain rules (needs elevation; best effort)."""
     import subprocess
+    for name in _FW_LEGACY_RULE_NAMES:
+        try:
+            subprocess.run(
+                ["netsh", "advfirewall", "firewall", "delete", "rule",
+                 f"name={name}"],
+                capture_output=True, text=True, timeout=8,
+                creationflags=_no_window_flags())
+        except Exception:
+            pass
+
+
+def _firewall_add_direct():
+    """Add the rule in-process (succeeds only if already elevated). Also clears
+    the old private,domain rule so a dead one isn't left sitting behind."""
+    import subprocess
+    _firewall_purge_legacy_direct()
     try:
         subprocess.run(
-            ["netsh", "advfirewall", "firewall", "add", "rule",
-             f"name={FW_RULE_NAME}", "dir=in", "action=allow",
-             "protocol=UDP", f"localport={PORT}", "profile=private,domain"],
+            ["netsh"] + _FW_ADD_ARGS,
             capture_output=True, text=True, timeout=8,
             creationflags=_no_window_flags())
     except Exception:
@@ -1999,7 +2043,17 @@ def ensure_firewall_rule(allow_elevate=False):
     if is_admin():
         return _firewall_add_direct()
     if allow_elevate:
-        _run_elevated_and_wait("netsh", _FW_NETSH_ARGS)
+        # Purge + add has to run in one elevated shell, or the user eats a UAC
+        # prompt per netsh call. cmd.exe chains them; the rule names are quoted
+        # and hold no cmd metacharacters, so `&` only ever splits our commands.
+        parts = [
+            f'netsh advfirewall firewall delete rule name="{name}" >nul 2>nul'
+            for name in _FW_LEGACY_RULE_NAMES
+        ]
+        parts.append("netsh " + " ".join(
+            f'name="{FW_RULE_NAME}"' if a.startswith("name=") else a
+            for a in _FW_ADD_ARGS))
+        _run_elevated_and_wait("cmd.exe", "/c " + " & ".join(parts))
         return firewall_rule_exists()
     return False
 

@@ -43,14 +43,24 @@ Write-Host "Installing dependencies..." -ForegroundColor Cyan
 Write-Host "Dependencies ready." -ForegroundColor Green
 
 # 3. Firewall (UDP 50505) — needs admin, self-elevates just this step.
-# Profile = Private ONLY (home/work networks). We deliberately do NOT open the
-# port on Public networks (open/cafe Wi-Fi) — LazeR is unsafe to expose there.
-$ruleName = "LazeR UDP 50505"
+# Profile = Any. Restricting to Private looks safer but isn't: Windows tags most
+# Wi-Fi as Public (corporate SSIDs and many home routers included), where a
+# Private rule is inert — the port stays shut, the rule still shows up as
+# present, and phones time out with no clue why. The port isn't the security
+# boundary anyway; the per-session token plus AES-256-GCM and a replay-proof
+# handshake are, so a reachable port without the QR gets you nothing.
+# v2 name: pre-fix installs left a Private-only rule under the old name, and
+# matching that would report a firewall that actually drops every packet.
+$ruleName = "LazeR inbound UDP 50505 v2"
+$legacyRuleNames = @("LazeR UDP 50505")
 $have = $false
 try { if (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue) { $have = $true } } catch {}
 if (-not $have) {
-    Write-Host "Opening firewall for UDP 50505 on PRIVATE networks (accept the admin prompt)..." -ForegroundColor Cyan
-    $fw = "New-NetFirewallRule -DisplayName '$ruleName' -Direction Inbound -Protocol UDP -LocalPort 50505 -Action Allow -Profile Private | Out-Null"
+    Write-Host "Opening firewall for UDP 50505 (accept the admin prompt)..." -ForegroundColor Cyan
+    $fw = ($legacyRuleNames | ForEach-Object {
+        "Remove-NetFirewallRule -DisplayName '$_' -ErrorAction SilentlyContinue;"
+    }) -join ' '
+    $fw += "New-NetFirewallRule -DisplayName '$ruleName' -Direction Inbound -Protocol UDP -LocalPort 50505 -Action Allow -Profile Any | Out-Null"
     try {
         Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile", "-Command", $fw -Wait
         Write-Host "Firewall rule added." -ForegroundColor Green

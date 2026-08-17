@@ -96,5 +96,8 @@ token is persistent, so it keeps working across restarts).
   **Resume** in the window. Use this if anything ever feels wrong.
 - **Regenerate** the pairing code anytime (Show details → Pairing code → Regenerate)
   to kick every paired phone and force a fresh scan.
-- **Firewall:** setup opens UDP 50505 on **Private** networks only — never on Public
-  (open) Wi-Fi. Still, treat plaintext mode as trusted-LAN only.
+- **Firewall:** setup opens UDP 50505 on **all** network types. Limiting it to
+  Private sounded safer but broke the common case — Windows labels most Wi-Fi
+  Public, including work and many home networks, so the port stayed shut and the
+  phone just timed out. Your pairing code and encryption are what keep others out,
+  not a closed port. Still, treat plaintext mode as trusted-LAN only.
