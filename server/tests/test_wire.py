@@ -1985,5 +1985,138 @@ class UpdateCheck(unittest.TestCase):
         self.assertIn("B-ismark/lazeR", rs.RELEASES_PAGE)
 
 
+class FirewallRuleCanBeInert(unittest.TestCase):
+    """A rule that exists is not a rule that works.
+
+    Group Policy can set "Apply local firewall rules: No" on a profile. Our rule
+    is then created, `netsh show rule` lists it, and Get-NetFirewallRule reports
+    it Enabled / Allow / Profile=Any — while Windows drops every inbound packet,
+    because only GPO-delivered rules count there. That combination is what made a
+    real failure undiagnosable: the phone times out, the server answers instantly
+    over loopback (which bypasses the firewall), and mDNS is dead too, so
+    discovery can't even correct a stale saved IP. These pin the detection so a
+    green firewall pill can't lie about it again.
+    """
+
+    def _inert(self, blocked, current):
+        with mock.patch.object(rs, "_fw_profiles_ignoring_local_rules",
+                               return_value=blocked), \
+             mock.patch.object(rs, "_fw_current_profile_types",
+                               return_value=current):
+            return rs.firewall_rule_is_inert(), rs.firewall_advice()
+
+    def test_says_nothing_when_local_rules_are_honoured(self):
+        inert, advice = self._inert([], 0x4)
+        self.assertIsNone(inert)
+        self.assertIsNone(advice)
+
+    def test_flags_the_profile_we_are_actually_on_as_live(self):
+        # Public is blocked AND we're on Public ⇒ the rule is dead right now.
+        inert, advice = self._inert([(0x4, "Public")], 0x4)
+        self.assertEqual(inert, ("Public", True))
+        self.assertIn("Private", advice)   # tells the user the actual fix
+
+    def test_still_warns_about_a_profile_we_are_not_on(self):
+        # Blocked on Public but currently Private: works now, breaks on the next
+        # coffee-shop Wi-Fi. Worth saying, but not as "your rule is dead".
+        inert, _ = self._inert([(0x4, "Public")], 0x2)
+        self.assertEqual(inert, ("Public", False))
+
+    def test_reports_conservatively_when_the_profile_is_unknown(self):
+        # No comtypes / COM failed ⇒ we can't tell which profile is live. Report
+        # it, but don't claim the rule is currently inert.
+        inert, advice = self._inert([(0x4, "Public")], None)
+        self.assertEqual(inert, ("Public", False))
+        self.assertIsNotNone(advice)
+
+    def test_names_every_blocked_profile(self):
+        inert, _ = self._inert([(0x2, "Private"), (0x4, "Public")], None)
+        self.assertEqual(inert[0], "Private, Public")
+
+    def test_advice_can_be_derived_without_probing_again(self):
+        # The GUI probes on a worker thread and renders on the Tk thread. Deriving
+        # the text must be pure, or the UI thread repeats a registry walk and a COM
+        # CreateObject for nothing. Patched to explode if anything probes.
+        with mock.patch.object(rs, "_fw_profiles_ignoring_local_rules",
+                               side_effect=AssertionError("re-probed")), \
+             mock.patch.object(rs, "_fw_current_profile_types",
+                               side_effect=AssertionError("re-probed")):
+            self.assertIsNone(rs.firewall_advice_for(None))
+            live = rs.firewall_advice_for(("Public", True))
+            self.assertIn("Private", live)
+            self.assertIn("does nothing", live)
+            self.assertIn("Public", rs.firewall_advice_for(("Public", False)))
+
+    def test_both_policy_roots_are_checked(self):
+        # The first cut of this read only the Group Policy path and found nothing
+        # on a laptop that was provably dropping every packet: the setting had
+        # arrived via Intune, which writes under the firewall service's own Mdm
+        # key instead. Dropping either root re-opens that blind spot.
+        roots = " ".join(rs._FW_POLICY_ROOTS).lower()
+        self.assertIn(r"software\policies\microsoft\windowsfirewall", roots)
+        self.assertIn(r"sharedaccess\parameters\firewallpolicy\mdm", roots)
+
+    def test_private_profile_uses_the_registrys_name_for_it(self):
+        # Windows calls the Private profile "StandardProfile" in the registry.
+        # Guessing "PrivateProfile" would silently never match.
+        subs = dict((s, b) for s, b in rs._FW_PROFILE_BITS)
+        self.assertEqual(subs["StandardProfile"], 0x2)
+        self.assertEqual(rs._FW_PROFILE_LABELS[0x2], "Private")
+
+    def test_registry_probe_is_quiet_when_the_policy_key_is_absent(self):
+        # The overwhelmingly common case: no policy at all. Must not raise, and
+        # must not report a block (a false positive here would nag every user).
+        if not sys.platform.startswith("win"):
+            self.skipTest("windows-only registry probe")
+        self.assertIsInstance(rs._fw_profiles_ignoring_local_rules(), list)
+
+
+class VpnDetectionLooksAtDescriptions(unittest.TestCase):
+    """Windows names VPN adapters like ordinary ones.
+
+    An active Fortinet SSL VPN presents as plain "Ethernet 4"; the vendor string
+    lives only in the driver description. Matching connection names alone made
+    detect_vpn() effectively dead on Windows — it returned None with a live
+    tunnel up — so the firewall hint never mentioned the VPN sitting right there.
+    """
+
+    def _detect(self, stats, descs):
+        psutil_mod = types.ModuleType("psutil")
+        psutil_mod.net_if_stats = lambda: stats
+        with mock.patch.dict(sys.modules, {"psutil": psutil_mod}), \
+             mock.patch.object(rs, "_win_adapter_descriptions",
+                               return_value=descs):
+            return rs.detect_vpn()
+
+    @staticmethod
+    def _if(isup):
+        return types.SimpleNamespace(isup=isup)
+
+    def test_matches_the_driver_description_when_the_name_is_generic(self):
+        got = self._detect({"Ethernet 4": self._if(True)},
+                           {"Ethernet 4": "Fortinet SSL VPN Virtual Ethernet Adapter"})
+        # Returns the description, not "Ethernet 4" — the user has to recognise it.
+        self.assertEqual(got, "Fortinet SSL VPN Virtual Ethernet Adapter")
+
+    def test_still_matches_on_the_connection_name(self):
+        got = self._detect({"MyWireGuard": self._if(True)}, {})
+        self.assertEqual(got, "MyWireGuard")
+
+    def test_ignores_adapters_that_are_down(self):
+        # A disconnected VPN adapter must not produce a scary note.
+        got = self._detect({"Ethernet 4": self._if(False)},
+                           {"Ethernet 4": "Fortinet SSL VPN Virtual Ethernet Adapter"})
+        self.assertIsNone(got)
+
+    def test_returns_none_for_ordinary_adapters(self):
+        got = self._detect({"Wi-Fi": self._if(True)},
+                           {"Wi-Fi": "Intel(R) Dual Band Wireless-AC 8260"})
+        self.assertIsNone(got)
+
+    def test_survives_psutil_being_absent(self):
+        with mock.patch.dict(sys.modules, {"psutil": None}):
+            self.assertIsNone(rs.detect_vpn())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

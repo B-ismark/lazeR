@@ -1966,6 +1966,133 @@ def firewall_rule_exists():
         return False
 
 
+# Group Policy can tell Windows to ignore every locally-created firewall rule on
+# a given profile (the "Apply local firewall rules: No" setting). Managed laptops
+# commonly ship that for Public. When it bites, our rule is created, `netsh show
+# rule` lists it, and Get-NetFirewallRule reports it Enabled / Allow /
+# Profile=Any in the ActiveStore — and Windows still drops every packet, because
+# on that profile only GPO-delivered rules count. Nothing about the rule itself
+# looks wrong, which is exactly why this cost a long afternoon to find: the phone
+# times out, the server is healthy over loopback (which bypasses the firewall),
+# and mDNS is dead too, so discovery can't even correct a stale saved IP.
+#
+# Read from the registry, not netsh: it's a plain DWORD with no localized text
+# (netsh prints both labels and values in the system language), and it needs no
+# elevation. A missing value means the default — local rules are honoured.
+#
+# TWO roots, because the setting arrives by two different routes and the machine
+# this was found on used the second one: classic Group Policy writes under
+# SOFTWARE\Policies, while Intune/MDM writes under the firewall service's own
+# `Mdm` subkey. Checking only the GPO path found nothing on a laptop that was
+# demonstrably dropping the packets — PersistentStore read "NotConfigured" while
+# ActiveStore read False, and the RSOP store was empty. Both roots use the same
+# profile subkey names (StandardProfile is Private).
+_FW_POLICY_ROOTS = (
+    r"SOFTWARE\Policies\Microsoft\WindowsFirewall",
+    r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\Mdm",
+)
+_FW_PROFILE_BITS = (("DomainProfile", 0x1), ("StandardProfile", 0x2),
+                    ("PublicProfile", 0x4))
+_FW_PROFILE_LABELS = {0x1: "Domain", 0x2: "Private", 0x4: "Public"}
+
+
+def _fw_profiles_ignoring_local_rules():
+    """[(bit, label)] for profiles where policy discards local firewall rules."""
+    if not sys.platform.startswith("win"):
+        return []
+    try:
+        import winreg
+    except Exception:
+        return []
+    out = []
+    for sub, bit in _FW_PROFILE_BITS:
+        blocked = False
+        for root in _FW_POLICY_ROOTS:
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    root + "\\" + sub) as k:
+                    val, _ = winreg.QueryValueEx(k, "AllowLocalPolicyMerge")
+                if int(val) == 0:
+                    blocked = True
+                    break     # either root saying "no merge" is enough
+            except (OSError, TypeError, ValueError):
+                continue      # absent ⇒ default ⇒ local rules honoured
+            except Exception:
+                continue
+        if blocked:
+            out.append((bit, _FW_PROFILE_LABELS[bit]))
+    return out
+
+
+def _fw_current_profile_types():
+    """Bitmask of the firewall profiles in force right now (1 Domain / 2 Private
+    / 4 Public), or None if we can't tell.
+
+    COM is per-thread — comtypes only initialises the importing thread — so
+    CoInitialize() first or this fails every time with "CoInitialize has not been
+    called". Same trap the volume endpoint already paid for."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import comtypes
+        import comtypes.client
+    except Exception:
+        return None
+    try:
+        comtypes.CoInitialize()
+    except Exception:
+        pass
+    try:
+        return int(comtypes.client.CreateObject("HNetCfg.FwPolicy2")
+                   .CurrentProfileTypes)
+    except Exception:
+        return None
+
+
+def firewall_rule_is_inert():
+    """(labels, active) when policy stops our rule from taking effect, else None.
+
+    [labels] names the affected profiles; [active] is True when one of them is
+    the profile currently in force, i.e. the rule is dead *right now* rather than
+    only on network types we aren't attached to. We still report the inactive
+    case, because the user's next Wi-Fi may well be one of them."""
+    blocked = _fw_profiles_ignoring_local_rules()
+    if not blocked:
+        return None
+    cur = _fw_current_profile_types()
+    if cur is not None:
+        live = [lbl for bit, lbl in blocked if cur & bit]
+        if live:
+            return (", ".join(live), True)
+    return (", ".join(lbl for _, lbl in blocked), False)
+
+
+def firewall_advice():
+    """One-line explanation when inbound UDP is (or may be) blocked despite the
+    rule, or None when there's nothing to say. Probes; call it off the UI thread."""
+    return firewall_advice_for(firewall_rule_is_inert())
+
+
+def firewall_advice_for(inert):
+    """The same text from an ALREADY-PROBED firewall_rule_is_inert() result.
+
+    Split out so a caller that already has the value doesn't probe again — the
+    GUI computes it on a worker thread, and re-deriving the text on the Tk thread
+    would repeat a registry walk and a COM CreateObject there for nothing."""
+    if inert is None:
+        return None
+    labels, active = inert
+    if active:
+        return (f"Your network is classified {labels}, and this PC's policy "
+                f"ignores locally-added firewall rules there — so LazeR's rule "
+                f"exists but does nothing. Set the Wi-Fi to Private in "
+                f"Settings › Network & internet, or ask IT to allow inbound "
+                f"UDP {PORT} by policy.")
+    return (f"Note: this PC's policy ignores locally-added firewall rules on "
+            f"the {labels} profile. LazeR's rule won't work on a network "
+            f"Windows classifies that way — mark such networks Private.")
+
+
 def _firewall_purge_legacy_direct():
     """Drop the pre-fix private,domain rules (needs elevation; best effort)."""
     import subprocess
@@ -2058,21 +2185,78 @@ def ensure_firewall_rule(allow_elevate=False):
     return False
 
 
+_VPN_NEEDLES = ("vpn", "forti", "wireguard", "openvpn", "tap-", "tun",
+                "zscaler", "globalprotect", "anyconnect", "cisco", "nordlynx",
+                "expressvpn", "pangp", "wintun", "sonicwall", "netextender",
+                "sophos", "netskope", "checkpoint", "ipsec", "softether")
+
+
+def _win_adapter_descriptions():
+    """{connection name: driver description} for Windows NICs, from the registry.
+
+    psutil only knows the *connection* name, and Windows names VPN adapters just
+    like ordinary ones — an active Fortinet SSL VPN shows up as plain
+    "Ethernet 4". The vendor string exists only in the driver description, so
+    matching names alone missed a live tunnel entirely, which made detect_vpn()
+    effectively dead on Windows and left the firewall hint silent about a VPN
+    that was right there. Registry read: no admin, no extra dependency."""
+    out = {}
+    if not sys.platform.startswith("win"):
+        return out
+    try:
+        import winreg
+    except Exception:
+        return out
+    net_class = r"{4D36E972-E325-11CE-BFC1-08002BE10318}"
+    class_key = r"SYSTEM\CurrentControlSet\Control\Class" "\\" + net_class
+    net_key = r"SYSTEM\CurrentControlSet\Control\Network" "\\" + net_class
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, class_key) as cls:
+            i = 0
+            while True:
+                try:
+                    sub = winreg.EnumKey(cls, i)
+                except OSError:
+                    break                      # no more subkeys
+                i += 1
+                try:
+                    with winreg.OpenKey(cls, sub) as k:
+                        desc = winreg.QueryValueEx(k, "DriverDesc")[0]
+                        guid = winreg.QueryValueEx(k, "NetCfgInstanceId")[0]
+                    with winreg.OpenKey(
+                            winreg.HKEY_LOCAL_MACHINE,
+                            net_key + "\\" + guid + r"\Connection") as c:
+                        name = winreg.QueryValueEx(c, "Name")[0]
+                except OSError:
+                    continue                   # non-adapter subkey, or no name
+                out[str(name)] = str(desc)
+    except Exception:
+        return out
+    return out
+
+
 def detect_vpn():
-    """Best-effort: name of an active VPN-ish interface, or None. A VPN that
+    """Best-effort: label of an active VPN-ish interface, or None. A VPN that
     full-tunnels or blocks LAN can stop phones reaching us even past the firewall;
-    we can't override that, but we can tell the user where to look."""
+    we can't override that, but we can tell the user where to look.
+
+    Matches the driver description as well as the connection name, and returns
+    whichever one matched so the message names something the user can recognise
+    ("Fortinet SSL VPN Virtual Ethernet Adapter", not "Ethernet 4")."""
     try:
         import psutil
         stats = psutil.net_if_stats()
     except Exception:
         return None
-    needles = ("vpn", "forti", "wireguard", "openvpn", "tap-", "tun",
-               "zscaler", "globalprotect", "anyconnect", "cisco", "nordlynx",
-               "expressvpn", "pangp", "wintun")
+    descs = _win_adapter_descriptions()
     for name, st in stats.items():
-        if getattr(st, "isup", False) and any(n in name.lower() for n in needles):
+        if not getattr(st, "isup", False):
+            continue
+        if any(n in name.lower() for n in _VPN_NEEDLES):
             return name
+        desc = descs.get(name, "")
+        if desc and any(n in desc.lower() for n in _VPN_NEEDLES):
+            return desc
     return None
 
 
@@ -2823,10 +3007,10 @@ class LazeRWindow:
                                 padx=14, pady=6)
         self._fw_btn.pack(side="left")
         self._fw_btn.bind("<Button-1>", lambda e: self._fix_firewall())
-        dismiss = tk.Label(btns, text="Dismiss", bg=_C["card2"], fg=_C["fg"],
-                           font=self.f_sm, cursor="hand2", padx=14, pady=6)
-        dismiss.pack(side="left", padx=(8, 0))
-        dismiss.bind("<Button-1>", lambda e: self._clear_firewall_banner())
+        self._fw_dismiss = tk.Label(btns, text="Dismiss", bg=_C["card2"], fg=_C["fg"],
+                                    font=self.f_sm, cursor="hand2", padx=14, pady=6)
+        self._fw_dismiss.pack(side="left", padx=(8, 0))
+        self._fw_dismiss.bind("<Button-1>", lambda e: self._clear_firewall_banner())
 
     def _check_firewall(self):
         """Probe the rule off the UI thread, then show the banner if it's missing."""
@@ -2836,17 +3020,35 @@ class LazeRWindow:
         def work():
             ok = firewall_rule_exists()
             vpn = detect_vpn()
-            self._root.after(0, lambda: self._on_firewall_status(ok, vpn))
+            inert = firewall_rule_is_inert()
+            self._root.after(0, lambda: self._on_firewall_status(ok, vpn, inert))
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_firewall_status(self, ok, vpn):
-        self._fw_ok = ok
+    def _on_firewall_status(self, ok, vpn, inert=None):
+        # A rule that EXISTS is not the same as a rule that WORKS. When policy
+        # discards local rules on the profile we're on, the rule reads back as
+        # Enabled/Allow/Profile=Any and Windows drops the packets anyway — so a
+        # green pill here is a lie that costs hours. Count it as blocked.
+        blocked_now = bool(inert and inert[1])
+        self._fw_ok = ok and not blocked_now
         self._update_fw_pill()
-        if ok:
+        advice = firewall_advice_for(inert)   # no re-probe on the Tk thread
+        if self._fw_ok:
             self._clear_firewall_banner()
+            if advice:
+                self._log(advice, "warn")
             return
-        sub = (f"Windows Firewall is dropping inbound traffic on UDP {PORT}, so phones "
-               "time out. One click adds the allow rule (asks for admin once).")
+        if blocked_now:
+            # Adding the rule again cannot help, so don't offer a button that
+            # would just spend a UAC prompt to change nothing.
+            sub = advice
+            self._fw_btn.pack_forget()
+        else:
+            sub = (f"Windows Firewall is dropping inbound traffic on UDP {PORT}, so phones "
+                   "time out. One click adds the allow rule (asks for admin once).")
+            if advice:
+                sub += "\n" + advice
+            self._fw_btn.pack(side="left", before=self._fw_dismiss)
         if vpn:
             sub += (f"\nNote: VPN “{vpn}” is active — if it blocks local network "
                     "traffic, also enable “allow local LAN” in the VPN.")
@@ -3463,15 +3665,22 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
     # Inbound UDP must be allowed or phones silently time out (loopback bypasses
     # the firewall, so the server looks fine here). If we're admin this adds the
     # rule outright; otherwise point at the one-shot self-elevating flag.
-    if sys.platform.startswith("win") and not ensure_firewall_rule():
-        print(f"  [firewall] Inbound UDP {PORT} appears blocked — phones may not connect.")
-        print("             Fix once (accepts a UAC prompt):")
-        print("               python remote_server.py --setup-firewall")
-        vpn = detect_vpn()
-        if vpn:
-            print(f"             VPN '{vpn}' is active — if it blocks LAN, also enable "
-                  "'allow local network' in the VPN.")
-        print()
+    if sys.platform.startswith("win"):
+        if not ensure_firewall_rule():
+            print(f"  [firewall] Inbound UDP {PORT} appears blocked — phones may not connect.")
+            print("             Fix once (accepts a UAC prompt):")
+            print("               python remote_server.py --setup-firewall")
+            vpn = detect_vpn()
+            if vpn:
+                print(f"             VPN '{vpn}' is active — if it blocks LAN, also enable "
+                      "'allow local network' in the VPN.")
+            print()
+        # Reported even when the rule IS present: policy can discard local rules
+        # outright, and then a healthy-looking rule blocks every phone anyway.
+        advice = firewall_advice()
+        if advice:
+            print(f"  [firewall] {advice}")
+            print()
 
     def emit(kind, *a):
         if kind == "connected":
@@ -3589,6 +3798,10 @@ def main():
             print(f"[firewall] inbound rule '{FW_RULE_NAME}' is in place — phones can reach UDP {PORT}.")
         else:
             print("[firewall] could not add the rule (UAC declined?). Re-run and accept the prompt.")
+        # Say this even on success — the rule can be in place and still inert.
+        advice = firewall_advice()
+        if advice:
+            print(f"[firewall] {advice}")
         return
 
     token = load_or_create_token()

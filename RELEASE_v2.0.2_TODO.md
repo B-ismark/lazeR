@@ -158,7 +158,28 @@ showed a healthy firewall while every phone timed out with nothing to diagnose.
   were scoped to the `make_volume()` call while `_endpoint()` re-imports comtypes on
   every re-acquisition. Both fixed; CI is green.
 
-No functional Android change in this release — the fix is entirely server-side. The
+**Second firewall failure mode, found while verifying the first on a managed laptop.**
+Widening the rule to `profile=any` was necessary but **not sufficient**. Policy can
+set *"Apply local firewall rules: No"* on a profile (`AllowLocalPolicyMerge = 0`),
+after which only policy-delivered rules count. Our rule is created, `netsh show rule`
+lists it, and `Get-NetFirewallRule` reports it Enabled / Allow / Profile=Any in the
+ActiveStore — and Windows drops every packet anyway. mDNS dies too, so the phone's
+discovery finds nothing and keeps retrying a stale saved IP forever, reporting it as
+a network problem.
+
+- `firewall_rule_is_inert()` detects it and the GUI banner + terminal startup now say
+  so, instead of showing a healthy firewall. The "Allow through firewall" button is
+  hidden in that state, since re-adding the rule cannot help.
+- Read from **both** policy roots: `SOFTWARE\Policies\...\WindowsFirewall` (GPO) and
+  `...\SharedAccess\Parameters\FirewallPolicy\Mdm` (Intune). The machine this was
+  found on used only the second, so a GPO-only probe reported nothing.
+- `detect_vpn()` was effectively dead on Windows: it matched its needles against
+  connection *names*, but Windows names VPN adapters `Ethernet 4` — the vendor string
+  lives only in the driver description. It returned `None` with a live Fortinet SSL
+  VPN up. Now matches descriptions too (read from the registry, no new dependency)
+  and returns the description so the message names something recognisable.
+
+No functional Android change in this release — both fixes are server-side. The
 APK is rebuilt only so its `versionName` stays in step with the tag.
 
 ---
@@ -182,6 +203,22 @@ Opening the port is not the exposure it sounds like: the port was never the secu
 boundary. Every packet is gated by your per-session pairing token over AES-256-GCM
 with a replay-proof handshake, so a reachable port without the QR code gets an
 attacker nothing. The docs claimed the opposite scoping and have been corrected.
+
+## Also fixed: a "healthy" firewall that silently drops everything
+
+On a work-managed PC, policy can be set to **ignore locally-added firewall rules** on
+a given network type — usually Public. LazeR's rule is then created and reads back as
+enabled and correct, but Windows discards it and phones still time out. Discovery
+breaks too, so the app keeps retrying whatever address it last saved and reports it as
+a network problem.
+
+LazeR now detects this and says so plainly, instead of showing a healthy firewall.
+The fix is to set that Wi-Fi to **Private** (Settings › Network & internet), or to ask
+IT to allow inbound UDP 50505 by policy — LazeR cannot override it from user space.
+
+The VPN warning also actually works on Windows now. It was matching adapter *names*,
+but Windows names VPN adapters things like "Ethernet 4", so a live corporate VPN was
+never mentioned.
 
 **If phones still time out** after updating, the remaining suspects are a VPN that
 blocks local network traffic, or client isolation on the Wi-Fi access point (common on

@@ -72,6 +72,24 @@ python remote_server.py --setup-firewall   # self-elevates, adds the rule, exits
 
 On macOS/Linux, allow inbound UDP `50505` in your firewall if prompted.
 
+**Work-managed PCs: the rule can be added and still do nothing.** Some company
+policies tell Windows to **ignore locally-added firewall rules** on a given network
+type — Public, usually. LazeR's rule is then created and reads back as enabled and
+correct, but Windows discards it and phones keep timing out. Discovery breaks with
+it, so the app finds no laptop and retries whatever address it last saved. LazeR
+detects this and says so instead of reporting a healthy firewall. To confirm it
+yourself:
+
+```powershell
+Get-NetFirewallProfile -PolicyStore ActiveStore | Select Name, AllowLocalFirewallRules
+```
+
+`AllowLocalFirewallRules: False` on the profile you're connected to is the tell. Fix
+it by setting that Wi-Fi to **Private** under *Settings → Network & internet → Wi-Fi
+→ (your network) → Network profile type*, or ask IT to allow inbound UDP `50505` by
+policy. LazeR cannot override it — the setting exists specifically to stop apps
+doing that.
+
 **Start with Windows.** LazeR does not auto-launch out of the box. Turn on the
 **Start with Windows** toggle in the desktop GUI, or from the command line:
 

@@ -154,6 +154,27 @@ recovery above into a no-op until it was caught.
   The server self-adds the rule (`--setup-firewall`, or the GUI "Allow through
   firewall" button, one UAC). A full-tunnel/LAN-blocking VPN can still block it —
   not overridable; user must allow local LAN in the VPN.
+- **A managed PC can make our firewall rule INERT, and everything still looks fine.**
+  Policy can set *"Apply local firewall rules: No"* on a profile
+  (`AllowLocalPolicyMerge = 0`); only policy-delivered rules then count. Our rule is
+  created, `netsh show rule` lists it, and `Get-NetFirewallRule` reports it
+  Enabled/Allow/Profile=Any in the **ActiveStore** — while Windows drops every packet.
+  Tells: `Get-NetFirewallProfile -PolicyStore ActiveStore` shows
+  `AllowLocalFirewallRules: False` for the profile you're on, and mDNS dies too, so
+  phone discovery finds nothing and can't correct a stale saved IP (the phone then
+  retries a long-dead address forever and blames the network). It's read from **two**
+  registry roots — `SOFTWARE\Policies\Microsoft\WindowsFirewall\<Profile>` (GPO) and
+  `SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\Mdm\<Profile>`
+  (Intune/MDM). Checking only the GPO one finds nothing on an Intune-managed laptop.
+  `<Profile>` is `DomainProfile` / `StandardProfile` (= **Private**) / `PublicProfile`.
+  `firewall_rule_is_inert()` detects it and the UI says so instead of showing a green
+  pill. Only real fix from the user side: mark the network **Private**, or have IT
+  push the rule. Public is the profile that gets locked down in practice.
+- **`Get-NetFirewallRule` defaults to the PersistentStore**, which does NOT include
+  GPO/MDM rules. Query `-PolicyStore ActiveStore` when you want what's *in force*.
+- **Windows ignores inbound ping by default** — every `Echo Request` rule ships
+  disabled. A phone that can't ping the laptop proves nothing; don't chase it. ARP
+  resolving the phone's MAC is better evidence that the LAN path works.
 
 ## Secrets
 
