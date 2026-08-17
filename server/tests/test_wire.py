@@ -1376,9 +1376,37 @@ class WindowsVolumeBackend(unittest.TestCase):
         pycaw_mod.IAudioEndpointVolume = object
         pycaw_pkg.pycaw = pycaw_mod
 
-        with mock.patch.dict(sys.modules, {"pycaw": pycaw_pkg,
-                                           "pycaw.pycaw": pycaw_mod}), \
-                mock.patch.object(sys, "platform", "win32"):
+        # comtypes has to be stubbed as well, not just pycaw. _endpoint() calls
+        # comtypes.CoInitialize() to give the calling thread a COM apartment, and
+        # make_volume runs _endpoint() once as a startup probe inside a try whose
+        # except prints "pycaw unavailable" — so anywhere comtypes is missing (every
+        # CI runner: the workflow installs only cryptography) the real
+        # ModuleNotFoundError was swallowed, mislabelled as a pycaw problem, and the
+        # backend degraded to (None, None, None). These four tests then failed on
+        # `label != "pycaw"` and on calling None, which read as a volume-recovery
+        # regression rather than a missing stub. Only CoInitialize is reached:
+        # FakeAudioUtilities.GetSpeakers hands back an object that already carries an
+        # EndpointVolume, so the CLSCTX_ALL/cast fallback never runs. CLSCTX_ALL is
+        # defined anyway so that path would raise something honest rather than
+        # AttributeError if it ever did.
+        comtypes_mod = types.ModuleType("comtypes")
+        comtypes_mod.CoInitialize = lambda: None
+        comtypes_mod.CLSCTX_ALL = 0x17
+
+        # The module stubs have to outlive make_volume(). _endpoint() imports
+        # comtypes again on every re-acquisition, and two of these tests drive
+        # exactly that path after make_volume has already returned — so scoping the
+        # patch to the call alone left the re-import hitting the real environment.
+        # On a Windows dev box that passes (comtypes is installed) and on CI it
+        # raises inside _on_endpoint, which swallows the error and returns None:
+        # green locally, red on Linux, for a recovery path that was never broken.
+        # sys.platform is only read once, inside the call, so it stays scoped.
+        stubs = mock.patch.dict(sys.modules, {"pycaw": pycaw_pkg,
+                                              "pycaw.pycaw": pycaw_mod,
+                                              "comtypes": comtypes_mod})
+        stubs.start()
+        self.addCleanup(stubs.stop)
+        with mock.patch.object(sys, "platform", "win32"):
             get_fn, set_fn, label = rs.make_volume()
         return get_fn, set_fn, label, calls
 

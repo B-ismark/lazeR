@@ -207,7 +207,11 @@ def make_volume():
         try:
             _endpoint()          # fail fast at startup, exactly as before
         except Exception as e:
-            print(f"[volume] pycaw unavailable ({e}); pip install pycaw")
+            # Deliberately not "pycaw unavailable": _endpoint() also imports
+            # comtypes and then talks to the audio device, so blaming pycaw for
+            # any of the three sent a missing comtypes chasing the wrong package.
+            print(f"[volume] Windows volume unavailable ({e}); "
+                  "pip install pycaw comtypes")
             return None, None, None
 
         return get_win, set_win, "pycaw"
