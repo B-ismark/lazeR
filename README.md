@@ -144,10 +144,14 @@ in Play Services. No volume-button hooks.
   until you resume. So even a successful intruder can't fight your own hand.
 - The pairing **token + key are persistent** (`server/.lazer_token`, `.lazer_key`)
   and reused across launches; **Regenerate** in the UI rotates both and kicks phones.
-- Open/public Wi-Fi: the firewall rule LazeR adds is scoped to the **Private and
-  Domain** profiles only, so it won't open the port on a network Windows has
-  classified Public. Treat plaintext mode as untrusted there; prefer QR pairing,
-  which is the default.
+- Open/public Wi-Fi: the firewall rule LazeR adds covers **all** profiles, Public
+  included. It used to be scoped to Private and Domain, which sounded safer and
+  wasn't: Windows classifies most Wi-Fi as Public — corporate SSIDs and plenty of
+  home routers — so the rule was inert exactly where people were trying to use it,
+  and the port silently stayed shut. The port was never the security boundary
+  anyway; the per-session token, AES-256-GCM and the replay-proof handshake are, so
+  a reachable port without the QR gets an attacker nothing. Treat plaintext mode as
+  untrusted on open Wi-Fi; prefer QR pairing, which is the default.
 - **Control traffic never leaves the LAN.** There is exactly one outbound internet
   request in the whole product, and it isn't control-related — see below.
 
