@@ -33,7 +33,7 @@ PORT = 50505
 # asserts the git tag matches THAT, and the update check below compares against
 # whatever tag the newest GitHub release carries, so a stale value here would
 # either nag forever or never nag at all.
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 RELEASES_API = "https://api.github.com/repos/B-ismark/lazeR/releases/latest"
 RELEASES_PAGE = "https://github.com/B-ismark/lazeR/releases/latest"
 UPDATE_TIMEOUT_S = 6      # a slow/blocked network must never delay the server
