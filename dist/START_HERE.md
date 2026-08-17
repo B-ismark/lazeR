@@ -81,6 +81,44 @@ token is persistent, so it keeps working across restarts).
 - Volume on Windows uses `pycaw` (installed by the script); macOS uses `osascript`;
   Linux uses `amixer`/`pactl`.
 
+## If the phone won't connect
+
+**On a work laptop, set the Wi-Fi to Private.** This is the fix for the most
+confusing failure there is. Some company policies tell Windows to **ignore firewall
+rules that apps add for themselves** on networks labelled *Public* — and Windows
+labels most Wi-Fi Public, work networks included. LazeR's rule then gets created and
+looks perfectly correct, and Windows throws it away anyway. The phone times out, and
+because the same block also kills discovery, the app finds no laptop and keeps
+retrying the last address it remembers — so it looks like a Wi-Fi problem.
+
+Fix it in **Settings → Network & internet → Wi-Fi → (your network) → Network profile
+type → Private**. LazeR can't do this for you; the setting exists precisely to stop
+apps overriding it. Newer LazeR versions say so in the window instead of showing a
+healthy firewall. To see it yourself:
+
+```powershell
+Get-NetFirewallProfile -PolicyStore ActiveStore | Select Name, AllowLocalFirewallRules
+```
+
+`AllowLocalFirewallRules: False` on the profile you're using is the giveaway. If it's
+your own PC and you'd rather not mark the network Private, ask IT to allow inbound
+UDP 50505 by policy instead.
+
+**Other things that block it, in order of likelihood:**
+
+- **The phone is on a stale saved laptop.** If a saved entry shows an address on a
+  different network from the phone's own, delete it and scan the QR again.
+- **A VPN on either device** that blocks local network traffic. Turn on "allow local
+  network" in the VPN, or disconnect it. A split-tunnel VPN is fine. Note the phone
+  side too: ad-blockers like AdGuard run as a local VPN.
+- **Client isolation** on the Wi-Fi access point — common on guest and corporate
+  networks. Nothing on either device can override it.
+- **2.4 GHz vs 5 GHz as separate names**, or a guest network. Those are different
+  networks even though they're the same router; the app tells you when it detects it.
+
+Don't bother testing with **ping** — Windows ignores incoming pings by default, so a
+failed ping means nothing here.
+
 ## Security
 - **Scan the QR for encryption.** QR pairing uses an **AES-256-GCM** encrypted,
   authenticated, replay-protected channel — your keystrokes and clicks can't be

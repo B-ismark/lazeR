@@ -2033,6 +2033,20 @@ class FirewallRuleCanBeInert(unittest.TestCase):
         inert, _ = self._inert([(0x2, "Private"), (0x4, "Public")], None)
         self.assertEqual(inert[0], "Private, Public")
 
+    def test_advice_can_be_derived_without_probing_again(self):
+        # The GUI probes on a worker thread and renders on the Tk thread. Deriving
+        # the text must be pure, or the UI thread repeats a registry walk and a COM
+        # CreateObject for nothing. Patched to explode if anything probes.
+        with mock.patch.object(rs, "_fw_profiles_ignoring_local_rules",
+                               side_effect=AssertionError("re-probed")), \
+             mock.patch.object(rs, "_fw_current_profile_types",
+                               side_effect=AssertionError("re-probed")):
+            self.assertIsNone(rs.firewall_advice_for(None))
+            live = rs.firewall_advice_for(("Public", True))
+            self.assertIn("Private", live)
+            self.assertIn("does nothing", live)
+            self.assertIn("Public", rs.firewall_advice_for(("Public", False)))
+
     def test_both_policy_roots_are_checked(self):
         # The first cut of this read only the Group Policy path and found nothing
         # on a laptop that was provably dropping every packet: the setting had

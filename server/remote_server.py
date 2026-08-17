@@ -2069,8 +2069,16 @@ def firewall_rule_is_inert():
 
 def firewall_advice():
     """One-line explanation when inbound UDP is (or may be) blocked despite the
-    rule, or None when there's nothing to say."""
-    inert = firewall_rule_is_inert()
+    rule, or None when there's nothing to say. Probes; call it off the UI thread."""
+    return firewall_advice_for(firewall_rule_is_inert())
+
+
+def firewall_advice_for(inert):
+    """The same text from an ALREADY-PROBED firewall_rule_is_inert() result.
+
+    Split out so a caller that already has the value doesn't probe again — the
+    GUI computes it on a worker thread, and re-deriving the text on the Tk thread
+    would repeat a registry walk and a COM CreateObject there for nothing."""
     if inert is None:
         return None
     labels, active = inert
@@ -2200,8 +2208,8 @@ def _win_adapter_descriptions():
     except Exception:
         return out
     net_class = r"{4D36E972-E325-11CE-BFC1-08002BE10318}"
-    class_key = r"SYSTEM\CurrentControlSet\Control\Class\\" + net_class
-    net_key = r"SYSTEM\CurrentControlSet\Control\Network\\" + net_class
+    class_key = r"SYSTEM\CurrentControlSet\Control\Class" "\\" + net_class
+    net_key = r"SYSTEM\CurrentControlSet\Control\Network" "\\" + net_class
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, class_key) as cls:
             i = 0
@@ -3024,21 +3032,22 @@ class LazeRWindow:
         blocked_now = bool(inert and inert[1])
         self._fw_ok = ok and not blocked_now
         self._update_fw_pill()
+        advice = firewall_advice_for(inert)   # no re-probe on the Tk thread
         if self._fw_ok:
             self._clear_firewall_banner()
-            if inert:
-                self._log(firewall_advice(), "warn")
+            if advice:
+                self._log(advice, "warn")
             return
         if blocked_now:
             # Adding the rule again cannot help, so don't offer a button that
             # would just spend a UAC prompt to change nothing.
-            sub = firewall_advice()
+            sub = advice
             self._fw_btn.pack_forget()
         else:
             sub = (f"Windows Firewall is dropping inbound traffic on UDP {PORT}, so phones "
                    "time out. One click adds the allow rule (asks for admin once).")
-            if inert:
-                sub += "\n" + firewall_advice()
+            if advice:
+                sub += "\n" + advice
             self._fw_btn.pack(side="left", before=self._fw_dismiss)
         if vpn:
             sub += (f"\nNote: VPN “{vpn}” is active — if it blocks local network "
