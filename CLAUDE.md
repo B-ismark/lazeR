@@ -140,9 +140,13 @@ recovery above into a no-op until it was caught.
   - `build_exe.ps1` sets PyInstaller `--workpath`/`--specpath` to `$env:TEMP`.
   - `publish_release.ps1` builds the APK with a generated `--init-script` that
     redirects `layout.buildDirectory` + a `--project-cache-dir`, both under `$env:TEMP`.
-  - Manual Gradle build off-sync:
-    `./gradlew assembleRelease --init-script <init.gradle> --project-cache-dir <tmp>`
-    where the init sets `allprojects { layout.buildDirectory.set(...) }` to a temp path.
+  - Manual Gradle build off-sync: use `tools\gradle-offsync.cmd <tasks>` (e.g.
+    `tools\gradle-offsync.cmd assembleRelease`). It wraps `gradlew` with
+    `--init-script` + `--project-cache-dir` and writes the init script itself, so
+    there is nothing to remember. It regenerates that script when missing **or
+    zero-length** — an empty one parses fine and does nothing, silently putting the
+    build back inside the synced tree. Paths resolve from the script's own location,
+    so the invocation directory doesn't matter.
   The APK then lands under `%TEMP%\lazeR-build\app\outputs\apk\release\`, not `android/app/build/`.
 - **Python:** use the uv-managed venv at `server/.venv` (bare `python` is the broken
   MS Store stub). Create/refresh: `cd server && uv venv && uv pip install -r requirements.txt`.
