@@ -1869,6 +1869,15 @@ def startup_lnk_path():
                         "Programs", "Startup", "LazeR.lnk")
 
 
+def _self_invocation():
+    """How the user would re-run THIS build, for printable hints. The frozen exe
+    and a source run need different words, and telling an .exe user to type
+    `python remote_server.py` just sends them down a dead end."""
+    if getattr(sys, "frozen", False):
+        return os.path.basename(sys.executable)
+    return f"python {os.path.basename(SCRIPT_PATH)}"
+
+
 def _startup_command():
     """Command string to register under Run — handles frozen .exe and .py."""
     if getattr(sys, "frozen", False):              # PyInstaller bundle
@@ -2612,6 +2621,11 @@ def serve_loop(wire, emit, net, hostname):
                          f"manual-code pairing paused {int(PLAINTEXT_SUSPEND_S)}s "
                          "(QR pairing unaffected)")
                 else:
+                    # No key (or no `cryptography`) ⇒ the plaintext wire is the ONLY
+                    # way in, so pausing it would lock the user out entirely rather
+                    # than push them to the QR. Warn and keep serving: a deliberate
+                    # availability-over-throttling trade, bounded by a 36^6 (~2.2e9)
+                    # token space that is only reachable from the LAN.
                     emit("warn", "High rate of rejected packets — possible brute-force / flood")
             continue
         verb, rest, secure = res
@@ -3216,15 +3230,23 @@ class LazeRWindow:
             from PIL import ImageTk
             self._make_qr_photo = self._build_qr_maker(qrcode, ImageTk)
             self._photo = self._make_qr_photo(uri)
-            holder = tk.Frame(pad, bg="#FFFFFF", padx=10, pady=10)
-            holder.pack(pady=(16, 14))
+            # The QR and its placeholder swap inside a slot packed ONCE, rather
+            # than being packed into `pad` directly: Tk appends a re-packed widget
+            # at the END of its parent's pack order, so a direct swap dropped the
+            # code below the pairing chip and the plaintext note after the first
+            # idle hide, and left it there.
+            slot = tk.Frame(pad, bg=_C["card"])
+            slot.pack(pady=(16, 14))
+            self._qr_slot = slot
+            holder = tk.Frame(slot, bg="#FFFFFF", padx=10, pady=10)
+            holder.pack()
             self._qr_img_label = tk.Label(holder, image=self._photo, bg="#FFFFFF")
             self._qr_img_label.pack()
             self._qr_holder = holder
             # Click-to-show placeholder swapped in by the idle hide
             # (QR_HIDE_AFTER_MS): an unattended laptop must not advertise its
             # token+key to every passer-by indefinitely.
-            self._qr_placeholder = tk.Frame(pad, bg=_C["card"])
+            self._qr_placeholder = tk.Frame(slot, bg=_C["card"])
             ph = tk.Label(self._qr_placeholder,
                           text="Pairing code hidden — click to show",
                           bg=_C["card"], fg=_C["dim"], font=self.f_md,
@@ -3342,16 +3364,17 @@ class LazeRWindow:
         self._qr_hidden = True
         try:
             self._qr_holder.pack_forget()
-            self._qr_placeholder.pack(pady=(16, 14))
+            self._qr_placeholder.pack()
         except Exception:
             pass
+        self._resize()      # let the card shrink to the placeholder
 
     def _show_qr(self):
         if self._qr_hidden:
             self._qr_hidden = False
             try:
                 self._qr_placeholder.pack_forget()
-                self._qr_holder.pack(pady=(16, 14))
+                self._qr_holder.pack()
             except Exception:
                 pass
             self._resize()
@@ -3407,7 +3430,7 @@ class LazeRWindow:
             pass
         self._connect_border.pack(fill="x")
         self._resize()
-        self._arm_qr_hide()
+        self._show_qr()     # unhide if it had timed out, and restart the clock
 
     def _show_connected_view(self):
         try:
@@ -3428,7 +3451,7 @@ class LazeRWindow:
             self._qr_hidden = False
             try:
                 self._qr_placeholder.pack_forget()
-                self._qr_holder.pack(pady=(16, 14))
+                self._qr_holder.pack()
             except Exception:
                 pass
 
@@ -3827,7 +3850,7 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
             print("[takeover] remote resumed")
         elif kind == "panic":
             print("[takeover] PANIC hotkey — remote latched OFF. Resume from the "
-                  "GUI window, or run:  python remote_server.py --resume")
+                  f"GUI window, or run:  {_self_invocation()} --resume")
         elif kind == "netchange":
             print(f"\n[resume] new IP {a[0]} — rescan:\n")
             show_qr(a[1])
@@ -3839,6 +3862,13 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
     # latch here too — the terminal has no Resume button. poke=False: a second
     # headless launch must not nudge an existing instance's window.
     kind_i, lsock_i = singleton_acquire(poke=False)
+    if kind_i == "existing":
+        # We still bind UDP 50505 below — SO_REUSEADDR lets a second server share
+        # the port, and the two then split the phone's packets between them, which
+        # presents as constant drops/reconnects on a perfectly healthy link. Say so
+        # rather than leaving the user to diagnose it.
+        print("[warn] another LazeR is already running — two servers will fight "
+              "over UDP 50505 (drops/reconnects). Close the other one.")
     if kind_i == "owner" and lsock_i is not None:
         ctrl_q = queue.Queue()
         threading.Thread(target=singleton_serve, args=(lsock_i, ctrl_q),

@@ -156,10 +156,22 @@ in Play Services. No volume-button hooks.
   while encryption is required, the activity log says so rather than leaving you
   with an unexplained timeout.
 - Acceptance is bound to one source IP:port + session; a high rate of rejected
-  packets raises a brute-force/flood warning.
+  packets raises a brute-force/flood warning and briefly pauses **manual-code**
+  (plaintext) acceptance — the only path a token guess exists against. QR-paired
+  phones keep working throughout, since the secure wire authenticates by GCM tag
+  and never sees a token.
+- The QR encodes the token **and** the key, so whoever photographs the screen owns
+  the machine until you Regenerate. An idle, unpaired window therefore hides the
+  code after five minutes behind a click-to-show placeholder. Pairing is unchanged:
+  one click brings it back.
 - **Local input wins.** Physical mouse/keyboard on the laptop (detected via
   non-injected low-level hooks) pauses the remote; **Ctrl+Alt+Shift+L** latches it off
-  until you resume. So even a successful intruder can't fight your own hand.
+  until you resume. So even a successful intruder can't fight your own hand. Resume
+  from the GUI window, or — handy when running headless — from a second terminal:
+
+  ```bash
+  python remote_server.py --resume     # or: LazeR.exe --resume
+  ```
 - The pairing **token + key are persistent** (`server/.lazer_token`, `.lazer_key`)
   and reused across launches; **Regenerate** in the UI rotates both and kicks phones.
 - Open/public Wi-Fi: the firewall rule LazeR adds covers **all** profiles, Public

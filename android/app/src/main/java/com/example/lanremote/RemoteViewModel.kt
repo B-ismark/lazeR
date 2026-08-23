@@ -249,11 +249,17 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
      * (a plain number pad on many IMEs has no "." at all, which made manual
      * entry impossible). Decimal separators are LOCALE-dependent — plenty of
      * keyboards render a comma — and pasted values carry stray spaces, so both
-     * are normalized here into a clean dotted quad rather than letting a
-     * valid-looking-but-unparseable string reach connect().
+     * are normalized here rather than letting a valid-looking-but-unparseable
+     * string reach connect().
+     *
+     * Letters and hyphens survive on purpose: connect() resolves through
+     * InetAddress.getByName, so a hostname ("laptop", "laptop.local") is a legal
+     * value here, and a digits-only filter silently shredded a pasted one into
+     * something unresolvable.
      */
     fun onIp(v: String) = update {
-        it.copy(ip = v.replace(',', '.').filter { c -> c.isDigit() || c == '.' }.trim(),
+        it.copy(ip = v.replace(',', '.')
+            .filter { c -> c.isLetterOrDigit() || c == '.' || c == '-' },
             error = null)
     }
     fun onPort(v: String) = update { it.copy(port = v.filter { c -> c.isDigit() }, error = null) }
