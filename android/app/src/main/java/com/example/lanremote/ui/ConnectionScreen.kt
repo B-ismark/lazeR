@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -82,6 +83,8 @@ fun ConnectionScreen(
     // reads as "scan the QR" and nothing else.
     var showDiscovered by rememberSaveable { mutableStateOf(true) }
     var showManual by rememberSaveable { mutableStateOf(false) }
+    // Delete asks before it acts — see the dialog at the bottom of this screen.
+    var pendingDelete by remember { mutableStateOf<Device?>(null) }
 
     Column(
         modifier = Modifier
@@ -116,7 +119,7 @@ fun ConnectionScreen(
                         device = dev,
                         enabled = !connecting,
                         onClick = { onConnectSaved(dev) },
-                        onDelete = { onDeleteDevice(dev) },
+                        onDelete = { pendingDelete = dev },
                     )
                 }
             }
@@ -202,6 +205,26 @@ fun ConnectionScreen(
             }
         }
     }
+
+    // Deleting a saved device discards its stored pairing — recovering means
+    // getting at the laptop and rescanning its QR. One misclick on the small
+    // trash icon must not cost that, so the delete asks first.
+    pendingDelete?.let { dev ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("Remove ${dev.name}?") },
+            text = { Text("You'll need to scan the laptop's QR code to pair again.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingDelete = null
+                    onDeleteDevice(dev)
+                }) { Text("Remove") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) { Text("Cancel") }
+            },
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
@@ -233,7 +256,10 @@ private fun ManualCard(
                     value = state.ip, onValueChange = onIp,
                     label = { Text("Laptop IP") }, placeholder = { Text("192.168.1.20") },
                     singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    // Decimal (not Number): plain number pads on many IMEs have no
+                    // "." key at all, which made typing an IP impossible. The comma
+                    // some locales render in place of "." is normalized in onIp.
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     modifier = Modifier.weight(2f),
                 )
                 Spacer(Modifier.width(8.dp))

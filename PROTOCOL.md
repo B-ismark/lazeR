@@ -10,8 +10,10 @@ Every datagram is a single packet. No framing beyond the datagram boundary.
 ```
 
 - `<TOKEN>` — the shared secret string shown by the server at startup. Present on **every**
-  packet (handshake and all control packets). Packets with a wrong/missing token are
-  silently dropped.
+  **v1 (plaintext)** packet (handshake and all control packets); packets with a wrong or
+  missing token are silently dropped. On the **v2/v3 secure wire** no token rides the wire
+  at all — a valid GCM tag *is* the authentication, because it proves the sender holds the
+  key that only the QR ever carried.
 - The server parses at most three fields: `token`, `verb`, and a single `rest` string.
   So `KEY hello world` delivers the literal text `hello world` (spaces preserved).
 
@@ -69,7 +71,7 @@ mid-gesture can't leave `Alt` stuck. Maps to the Windows three-finger touchpad s
 
 ## Wire formats
 
-Two datagram encodings coexist; the server auto-detects per packet.
+Two datagram encodings exist; the server auto-detects per packet.
 
 ### v2/v3 — secure (default for QR pairing)
 
@@ -85,7 +87,7 @@ bytes either way, so framing, AAD and every other rule below are identical:
 | Magic | nonce split              | session space | status |
 |-------|--------------------------|---------------|--------|
 | `L3`  | `sid(8)` \| `counter(4)` | 2^64          | **current** |
-| `L2`  | `sid(4)` \| `counter(8)` | 2^32          | legacy — accepted for one release, removed after v2.0 |
+| `L2`  | `sid(4)` \| `counter(8)` | 2^32          | removed — accepted through v2.x for un-updated phones |
 
 **Why the split moved.** The key is *persistent* across launches while the `sid` is
 random per session, so a `sid` collision means GCM nonce reuse under one key — which
@@ -96,16 +98,17 @@ counts are reachable over a device's lifetime. Moving four bytes from the counte
 the `sid` buys 2^64 at no practical cost — a 4-byte counter still allows 4.29e9
 packets in a single session, and exhausting it re-keys the `sid` rather than wrapping.
 
-**Compatibility.** The server accepts both and **replies in whichever dialect the
-client opened with** (otherwise the phone couldn't read its own `CHAL`). The client
-sends `L3` and, if that draws no reply, retries once on `L2` — so a phone updated
-ahead of its laptop still pairs. There is no flag day in either direction.
+**Compatibility.** The server replies in whichever dialect the client opened with
+(otherwise the phone couldn't read its own `CHAL`). The L2 dialect was accepted
+through v2.x so a phone updated ahead of its laptop kept pairing; it is now
+removed — an L2 packet is unknown magic and is dropped like any other junk, so a
+phone that never updated past v1.x must update to pair with this server.
 
 - The 256-bit key is shared **only** via the QR (`&k=` below); never on the wire,
   never over mDNS. A valid GCM tag *is* the authentication — it proves the sender
   holds the key, so no token rides secure packets.
-- `sid` is a random per-session id the client picks at connect (8 bytes on `L3`,
-  4 on `L2`); `counter` is a per-session monotonic integer filling the rest of the
+- `sid` is a random per-session id the client picks at connect (8 bytes);
+  `counter` is a per-session monotonic integer filling the rest of the
   nonce (first `HELLO` = 1, then +1 per send).
 - A session is identified by **dialect + sid** together, so a packet that switches
   dialect mid-session is refused like any other unpinned session.
@@ -151,7 +154,9 @@ a manual-code attempt gets an explanation instead of a silent timeout.
 3. **Plaintext (v1):** token match pins `(ip, port)`; later packets need the token
    **and** the pinned source. A plaintext re-pin from a new address is accepted (so
    reconnects work) but logged as a warning — turn on Require encryption to forbid it.
-4. **Brute-force / flood:** a high rate of rejected packets raises a warning.
+4. **Brute-force / flood:** a high rate of rejected packets raises a warning and
+   pauses manual-code (plaintext) acceptance briefly — the only path a token
+   brute-force exists against. QR-paired phones are unaffected.
 5. **Local takeover:** physical mouse/keyboard input on the laptop (detected via
    non-injected low-level hooks) pauses the remote so the user's own device always
    wins; `Ctrl+Alt+Shift+L` latches the remote OFF until the user resumes.

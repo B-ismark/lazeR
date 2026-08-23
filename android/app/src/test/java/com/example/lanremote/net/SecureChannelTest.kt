@@ -11,15 +11,14 @@ import org.junit.Test
  *
  * The secure wire is implemented twice — here and in the Python server's `Wire` —
  * and the two must agree byte for byte or pairing silently breaks. [GOLDEN_L3_HEX]
- * and [GOLDEN_HEX] are the SAME frozen packets asserted by
- * `server/tests/test_wire.py` (classes `GoldenVectorL3` and `GoldenVector`).
- * Change the header layout, the nonce derivation, or the AAD on either side and
- * exactly one of the two suites goes red, so the skew is caught in CI instead of
- * on a user's phone.
+ * is the SAME frozen packet asserted by `server/tests/test_wire.py` (class
+ * `GoldenVectorL3`). Change the header layout, the nonce derivation, or the AAD on
+ * either side and exactly one of the two suites goes red, so the skew is caught in
+ * CI instead of on a user's phone.
  *
- * L3 is the current dialect; L2 is kept for one release so an un-updated phone
- * still pairs. Both are pinned here — dropping L2 means deleting its vector from
- * BOTH suites, not just this one.
+ * The legacy L2 dialect was accepted through v2.x and is now removed; its golden
+ * vector was deleted from BOTH suites together (the documented procedure). One L2
+ * packet is kept inline below purely to prove open() refuses it.
  *
  * Plain JVM unit test — no Robolectric. That means anything touching
  * `android.util.Base64` (i.e. [SecureChannel.keyFromBase64]) is deliberately NOT
@@ -35,14 +34,7 @@ class SecureChannelTest {
         /** key = bytes(0..31) — deterministic test key, never a real one. */
         val KEY = ByteArray(32) { it.toByte() }
 
-        /** L2 (legacy): sid(4)|counter(8) = 01020304 / 1, "MOVE 3 -4". AES-GCM is
-         *  deterministic for a fixed (key, nonce, aad, plaintext), so these bytes
-         *  are stable forever. Must match GoldenVector.HEX in test_wire.py. */
-        const val GOLDEN_HEX =
-            "4c32010203040000000000000001" +
-                "9cbe917b3b744aee3cc2838803178e6aa93726c156c2f73bb4"
-
-        /** L3 (current): sid(8)|counter(4) = 0102030405060708 / 1, same plaintext.
+        /** L3 (current): sid(8)|counter(4) = 0102030405060708 / 1, "MOVE 3 -4".
          *  Must match GoldenVectorL3.HEX in test_wire.py. */
         const val GOLDEN_L3_HEX =
             "4c3301020304050607080000000128" +
@@ -64,18 +56,10 @@ class SecureChannelTest {
     }
 
     @Test
-    fun `opens the legacy L2 golden packet regardless of our own dialect`() {
-        // open() is permissive on receive: an L3 channel must still read an L2 reply,
-        // so a mid-flight dialect change can never dead-end the handshake.
-        val pkt = hex(GOLDEN_HEX)
-        assertEquals(GOLDEN_PLAINTEXT, SecureChannel(KEY).open(pkt, pkt.size))
-        assertEquals(GOLDEN_PLAINTEXT,
-            SecureChannel(KEY, legacy = true).open(pkt, pkt.size))
-    }
-
-    @Test
     fun `L3 golden packet layout is frozen`() {
         val pkt = hex(GOLDEN_L3_HEX)
+        // Field offsets are part of the contract, not an implementation detail:
+        // magic(2) | sid(8) | counter(4 BE) | ciphertext+tag.
         assertEquals(14 + GOLDEN_PLAINTEXT.length + 16, pkt.size)
         assertEquals('L'.code.toByte(), pkt[0])
         assertEquals('3'.code.toByte(), pkt[1])
@@ -83,46 +67,16 @@ class SecureChannelTest {
         var ctr = 0L
         for (i in 10 until 14) ctr = (ctr shl 8) or (pkt[i].toLong() and 0xFF)
         assertEquals(1L, ctr)
-        // Same framing as L2 — only the sid/counter boundary moved.
-        assertEquals(hex(GOLDEN_HEX).size, pkt.size)
     }
 
     @Test
-    fun `seal defaults to L3 and honours the legacy flag`() {
-        val current = SecureChannel(KEY).seal("PING")
-        assertEquals('3'.code.toByte(), current[1])
-        // 8-byte sid, 4-byte counter starting at 1.
-        assertEquals(1L, beAt(current, 10, 4))
-
-        val legacy = SecureChannel(KEY, legacy = true).seal("PING")
-        assertEquals('2'.code.toByte(), legacy[1])
-        assertEquals(1L, beAt(legacy, 6, 8))
-
-        // Identical framing regardless of dialect.
-        assertEquals(current.size, legacy.size)
-    }
-
-    @Test
-    fun `both dialects round-trip through a peer channel`() {
-        for (legacy in booleanArrayOf(false, true)) {
-            val sender = SecureChannel(KEY, legacy = legacy)
-            val receiver = SecureChannel(KEY, legacy = legacy)
-            val pkt = sender.seal("VOL 42")
-            assertEquals("VOL 42", receiver.open(pkt, pkt.size))
-        }
-    }
-
-    @Test
-    fun `golden packet layout is frozen`() {
-        val pkt = hex(GOLDEN_HEX)
-        // magic(2) | sid(4) | counter(8 BE) | ciphertext+tag(len+16)
-        assertEquals(14 + GOLDEN_PLAINTEXT.length + 16, pkt.size)
-        assertEquals('L'.code.toByte(), pkt[0])
-        assertEquals('2'.code.toByte(), pkt[1])
-        assertArrayEquals(byteArrayOf(1, 2, 3, 4), pkt.copyOfRange(2, 6))
-        var ctr = 0L
-        for (i in 6 until 14) ctr = (ctr shl 8) or (pkt[i].toLong() and 0xFF)
-        assertEquals(1L, ctr)
+    fun `an L2 packet is no longer readable`() {
+        // The legacy dialect is removed: open() must refuse it outright rather than
+        // mis-slice its 4-byte sid as the first bytes of an 8-byte one.
+        val l2 = hex(
+            "4c32010203040000000000000001" +
+                "9cbe917b3b744aee3cc2838803178e6aa93726c156c2f73bb4")
+        assertNull(SecureChannel(KEY).open(l2, l2.size))
     }
 
     // ── inbound replay guard (mirrors the server's watermark) ────────────────
@@ -163,7 +117,7 @@ class SecureChannelTest {
     @Test
     fun `too-short and non-v2 packets are rejected`() {
         val ch = SecureChannel(KEY)
-        val pkt = hex(GOLDEN_HEX)
+        val pkt = hex(GOLDEN_L3_HEX)
         for (n in intArrayOf(0, 1, 2, 13, 14, 29)) {
             assertNull("accepted a $n-byte packet", ch.open(pkt.copyOf(n), n))
         }
@@ -183,15 +137,15 @@ class SecureChannelTest {
     // ── outbound layout ──────────────────────────────────────────────────────
 
     @Test
-    fun `seal emits the header with a monotonic counter from one`() {
+    fun `seal emits the L3 header with a monotonic counter from one`() {
         val ch = SecureChannel(KEY)
         val first = ch.seal("PING")
         val second = ch.seal("PING")
 
-        // Deliberately no magic-byte assertion here: `seal defaults to L3 and
-        // honours the legacy flag` owns that, and asserting the default dialect in
-        // two places is what let this test go stale when L3 landed. This one is
-        // about the counter and nonce uniqueness.
+        // Deliberately no magic-byte assertion split across two tests: this one owns
+        // both the dialect marker and the counter/nonce-uniqueness contract.
+        assertEquals('L'.code.toByte(), first[0])
+        assertEquals('3'.code.toByte(), first[1])
         assertEquals(14 + "PING".length + 16, first.size)
         assertEquals(1L, counterOf(first))
         assertEquals(2L, counterOf(second))
@@ -224,7 +178,7 @@ class SecureChannelTest {
         assertNotEquals(a.toList(), b.toList())
     }
 
-    /** L3 counter: 4 bytes at offset 10. (L2 is 8 bytes at offset 6.) */
+    /** L3 counter: 4 bytes at offset 10. */
     private fun counterOf(pkt: ByteArray): Long = beAt(pkt, 10, 4)
 
     private fun beAt(buf: ByteArray, off: Int, width: Int): Long {

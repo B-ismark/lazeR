@@ -57,7 +57,7 @@ class RemoteClient {
 
             // HELLO → (encrypted CHAL → AUTH) → OK on the secure wire; plain HELLO →
             // OK on v1.
-            val ok = handshakeWithFallback(sock, addr, port, timeoutMs, rawKey)
+            val ok = doHandshake(sock, addr, port, timeoutMs)
             if (ok) {
                 // The server answers OK to every retried HELLO/AUTH, so drain the
                 // duplicates before the first PING/VGET can misread one.
@@ -98,34 +98,6 @@ class RemoteClient {
         } catch (e: Exception) {
             // best effort
         }
-    }
-
-    /**
-     * Handshake, retrying once on the legacy L2 dialect if L3 draws no reply.
-     *
-     * A server that predates L3 doesn't recognise the magic, so it treats our
-     * packets as junk and answers nothing — indistinguishable from an unreachable
-     * host. Since the APK and the .exe ship together but are installed separately,
-     * a phone updated ahead of its laptop would otherwise just fail to pair.
-     *
-     * The budget is SPLIT rather than doubled, so a genuinely dead host still fails
-     * in the caller's expected time — that matters because connectResolving() walks
-     * every mDNS-discovered host in turn. L3 gets two thirds (still several resends
-     * at the 250ms cadence), L2 the rest. Plaintext v1 has no dialect, so it skips
-     * the retry entirely.
-     */
-    private fun handshakeWithFallback(
-        sock: DatagramSocket, addr: InetAddress, port: Int, budgetMs: Long,
-        rawKey: ByteArray?, stepMs: Int = 250,
-    ): Boolean {
-        // Always (re)start on the current dialect, so a previous call that ended on
-        // the legacy fallback doesn't leave us silently downgraded.
-        if (rawKey != null) channel = SecureChannel(rawKey)
-        val first = if (rawKey == null) budgetMs else budgetMs * 2 / 3
-        if (doHandshake(sock, addr, port, first, stepMs)) return true
-        if (rawKey == null) return false          // v1: nothing to fall back to
-        channel = SecureChannel(rawKey, legacy = true)
-        return doHandshake(sock, addr, port, budgetMs - first, stepMs)
     }
 
     /** Handshake to (addr,port) until the server pins us: send HELLO, answer the

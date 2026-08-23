@@ -1,6 +1,8 @@
 package com.example.lanremote.ui
 
 import android.app.Activity
+import android.os.SystemClock
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
@@ -105,6 +107,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
@@ -166,12 +169,40 @@ fun ControlScreen(state: UiState, a: ControlActions) {
     var showAdvanced by rememberSaveable { mutableStateOf(false) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
 
-    BackHandler(enabled = true) {
-        if (fullscreen) fullscreen = false else a.onDisconnect()
+    val view = LocalView.current
+    val context = LocalContext.current
+
+    // Keep the screen on for the whole session. Driving the laptop as a media /
+    // presenter remote is active use even when nothing is touching the phone —
+    // letting the display time out backgrounds the app and stalls the socket
+    // mid-show. Cleared when this screen leaves composition (disconnect).
+    DisposableEffect(Unit) {
+        val window = (view.context as? Activity)?.window
+        window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        onDispose {
+            window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
     }
 
-    // Immersive while the trackpad is expanded.
-    val view = LocalView.current
+    // Back = leave, but a single accidental press must not kill the session:
+    // disconnect() clears lastDeviceId, so no auto-reconnect would undo it.
+    // The first press explains, the second inside 2s commits. Exiting the
+    // expanded trackpad stays a single press — that IS the expected navigation.
+    var lastBackMs by remember { mutableStateOf(0L) }
+    BackHandler(enabled = true) {
+        if (fullscreen) {
+            fullscreen = false
+        } else {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastBackMs < 2000) {
+                a.onDisconnect()
+            } else {
+                lastBackMs = now
+                Toast.makeText(context, "Press back again to disconnect",
+                    Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
     // Leaving the screen entirely never flipped `fullscreen` back, so a link that
     // dropped while expanded (the health loop declaring the laptop dead) left the
     // connection screen rendering underneath hidden system bars.
@@ -778,7 +809,7 @@ private fun TrackpadCard(modifier: Modifier, a: ControlActions, natural: Boolean
                         a.onSwitchStep, a.onSwitchEnd, { natural }),
             )
             Spacer(Modifier.width(14.dp))
-            ScrollStrip(a.onScroll)
+            ScrollStrip(a.onScroll, { natural })
         }
     }
 }
@@ -787,7 +818,7 @@ private fun TrackpadCard(modifier: Modifier, a: ControlActions, natural: Boolean
  *  springs back to centre on release. It's a RATE scroller (the laptop's scroll
  *  position is unknown), so the thumb is a relative grip, not a document map. */
 @Composable
-private fun ScrollStrip(onScroll: (Int, Int) -> Unit) {
+private fun ScrollStrip(onScroll: (Int, Int) -> Unit, natural: () -> Boolean) {
     val acc = remember { floatArrayOf(0f) }
     val scope = rememberCoroutineScope()
     val density = LocalDensity.current
@@ -811,9 +842,14 @@ private fun ScrollStrip(onScroll: (Int, Int) -> Unit) {
                 ) { change, dy ->
                     change.consume()
                     acc[0] += dy
-                    // Inverted: drag down = scroll up, drag up = scroll down.
-                    while (acc[0] <= -SCROLL_STEP_PX) { onScroll(0, -1); acc[0] += SCROLL_STEP_PX }
-                    while (acc[0] >= SCROLL_STEP_PX) { onScroll(0, 1); acc[0] -= SCROLL_STEP_PX }
+                    // Same direction convention as two-finger scroll on the pad:
+                    // natural mode drags like a touchscreen (drag down = content
+                    // follows = wheel up), reversed otherwise. This strip used to
+                    // hardcode the natural direction, contradicting the setting the
+                    // pad right next to it obeys.
+                    val m = if (natural()) 1 else -1
+                    while (acc[0] <= -SCROLL_STEP_PX) { onScroll(0, -m); acc[0] += SCROLL_STEP_PX }
+                    while (acc[0] >= SCROLL_STEP_PX) { onScroll(0, m); acc[0] -= SCROLL_STEP_PX }
                     // Thumb rides the finger within the track, clamped to the groove.
                     val max = (boxH / 2f - thumbHalfPx - padPx).coerceAtLeast(0f)
                     thumbOff = (thumbOff + dy).coerceIn(-max, max)
@@ -880,7 +916,7 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
                         a.onSwitchStep, a.onSwitchEnd, { state.settings.naturalScroll }),
             )
             Spacer(Modifier.width(14.dp))
-            ScrollStrip(a.onScroll)
+            ScrollStrip(a.onScroll, { state.settings.naturalScroll })
         }
         // Same click bar as the home page — the connected Left/Middle/Right group +
         // hold-drag — reused in the dead space below the pad instead of a bespoke

@@ -65,8 +65,9 @@ token is persistent, so it keeps working across restarts).
 
 - **Trackpad** (bottom): drag = move, tap = left-click, **two-finger tap =
   right-click**. Holding does nothing on purpose, so a resting hand never clicks.
-- **Two fingers**: vertical = scroll · **horizontal swipe = browser back / forward**
-  (like a Windows touchpad). **Three fingers** left/right = switch apps.
+- **Two fingers**: scroll on both axes, like a real trackpad — vertical scrolls,
+  and horizontal becomes back / forward in a browser (the app you're in decides).
+  **Three fingers** left/right = switch apps.
 - **Scroll strip** on the trackpad's right edge.
 - **Volume** slider — synced both ways with the laptop.
 - **Media / Keyboard** — toggle between them with the buttons up top.

@@ -14,33 +14,26 @@ import javax.crypto.spec.SecretKeySpec
  *   AAD    = the packet's first 14 bytes
  *   text   = "VERB args"  (UTF-8)
  *
- * Two dialects differ only in how the 12-byte nonce is split:
- *
- *   L2 (legacy)  sid(4) | counter(8)   — 32-bit session space
- *   L3 (current) sid(8) | counter(4)   — 64-bit session space
+ * Dialect L3 is the only one: nonce = sid(8) | counter(4).
  *
  * The key is PERSISTENT across launches while the sid is random per session, so a
  * sid collision means GCM nonce reuse under one key — which leaks the
- * authentication key, not merely a plaintext. A 4-byte sid put that at the
- * birthday bound of 2^32 (~1.2% by 10k sessions, ~39% by 65k), and every reconnect
- * mints a session. L3 moves four bytes from the counter to the sid for 2^64, and a
- * 4-byte counter still allows 4.29e9 packets per session.
+ * authentication key, not merely a plaintext. The original L2 dialect split
+ * sid(4)|counter(8), putting reuse at the 2^32 birthday bound (~1.2% by 10k
+ * sessions, ~39% by 65k), and every reconnect mints a session. L3 moves four bytes
+ * from the counter to the sid for 2^64, and a 4-byte counter still allows 4.29e9
+ * packets per session. L2 was accepted through v2.x for un-updated phones and is
+ * now removed: a server that old simply never answers, exactly as a pre-L3 phone
+ * sees silence from us.
  *
  * A valid GCM tag authenticates the sender (proves key possession) — no token on
  * the wire — and the monotonic counter the server enforces blocks replay. The
  * 256-bit key arrives only in the scanned QR, never over mDNS or in the clear.
- *
- * [legacy] selects L2, for talking to a server that predates L3. See
- * RemoteClient.doHandshake, which falls back once if L3 draws no reply.
  */
-class SecureChannel(key: ByteArray, private val legacy: Boolean = false) {
+class SecureChannel(key: ByteArray) {
 
     private val keySpec = SecretKeySpec(key, "AES")
-    private val magicLo: Byte = if (legacy) '2'.code.toByte() else '3'.code.toByte()
-    private val sidLen = if (legacy) 4 else 8
-    private val ctrLen = if (legacy) 8 else 4
-    private val ctrMax = if (legacy) Long.MAX_VALUE else 0xFFFFFFFFL
-    private val sid = ByteArray(sidLen).also { SecureRandom().nextBytes(it) }
+    private val sid = ByteArray(8).also { SecureRandom().nextBytes(it) }
     private val sendCtr = AtomicLong(0L)
 
     // Inbound replay guard (mirrors the server): pin the server's sid on the first
@@ -51,19 +44,19 @@ class SecureChannel(key: ByteArray, private val legacy: Boolean = false) {
     private var srvSid: ByteArray? = null
     private var recvCtr = -1L
 
-    /** Build a datagram for [body] (e.g. "MOVE 3 -4") in this channel's dialect. */
+    /** Build a datagram for [body] (e.g. "MOVE 3 -4"). */
     fun seal(body: String): ByteArray {
         val ctr = sendCtr.incrementAndGet()
         // Wrapping the counter would repeat a nonce under a key that outlives the
         // session — the exact failure L3 exists to prevent. Refuse instead. The
         // caller treats sends as lossy, so packets simply stop and the watchdog
         // reconnects, which builds a fresh channel with a new sid.
-        check(ctr <= ctrMax) { "session counter exhausted; reconnect for a fresh sid" }
+        check(ctr <= 0xFFFFFFFFL) { "session counter exhausted; reconnect for a fresh sid" }
         val header = ByteArray(14)
         header[0] = 'L'.code.toByte()
-        header[1] = magicLo
-        System.arraycopy(sid, 0, header, 2, sidLen)
-        putBE(header, 2 + sidLen, ctr, ctrLen)
+        header[1] = '3'.code.toByte()
+        System.arraycopy(sid, 0, header, 2, 8)
+        putBE(header, 10, ctr, 4)
         val nonce = header.copyOfRange(2, 14)             // sid | counter
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, keySpec, GCMParameterSpec(128, nonce))
@@ -74,16 +67,13 @@ class SecureChannel(key: ByteArray, private val legacy: Boolean = false) {
 
     /**
      * Decrypt a server reply (OK / CHAL / PONG / VOL n); null if it isn't a valid
-     * packet. Accepts EITHER dialect regardless of which one we send: the server
-     * answers in the dialect we opened with, but being permissive on receive costs
-     * nothing and avoids a silent dead-end if that ever changes.
+     * packet. Strictly L3: the server answers in the dialect we opened with, and
+     * there is only one now.
      */
     fun open(data: ByteArray, len: Int): String? {
-        if (len < 14 + 16 || data[0] != 'L'.code.toByte()) return null
-        val inSidLen = when (data[1]) {
-            '3'.code.toByte() -> 8
-            '2'.code.toByte() -> 4
-            else -> return null
+        if (len < 14 + 16 || data[0] != 'L'.code.toByte() ||
+            data[1] != '3'.code.toByte()) {
+            return null
         }
         return try {
             val header = data.copyOfRange(0, 14)
@@ -95,9 +85,9 @@ class SecureChannel(key: ByteArray, private val legacy: Boolean = false) {
             val text = String(cipher.doFinal(ct), Charsets.UTF_8)  // valid tag ⇒ authentic
             // Freshness: reject a replayed/reordered reply (same session, counter not
             // advancing) or one from a different server session.
-            val rsid = header.copyOfRange(2, 2 + inSidLen)
+            val rsid = header.copyOfRange(2, 10)
             var ctr = 0L
-            for (i in 2 + inSidLen until 14) ctr = (ctr shl 8) or (header[i].toLong() and 0xFF)
+            for (i in 10 until 14) ctr = (ctr shl 8) or (header[i].toLong() and 0xFF)
             synchronized(recvLock) {
                 val pinned = srvSid
                 if (pinned == null) {

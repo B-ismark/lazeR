@@ -4,8 +4,8 @@ Phone-as-trackpad. Android (Kotlin/Compose) client + Python server. LAN-only UDP
 `50505`, gated by a per-session token; secure wire is AES-256-GCM (QR pairing) with a
 challenge-response handshake (`HELLO`→`CHAL`→`AUTH`, replay-proof). Encryption is
 required by default — `--allow-plaintext` opts into the legacy manual-code wire.
-Two dialects share that wire: `L3` (`sid(8)|counter(4)`, current) and `L2`
-(`sid(4)|counter(8)`, accepted for one release then removed).
+The wire dialect is `L3` (`sid(8)|counter(4)`); the legacy `L2` dialect was removed
+after its one-release grace window.
 See [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md) for the full picture.
 
 ## Update checks — the only internet access

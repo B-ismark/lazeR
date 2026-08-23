@@ -241,7 +241,21 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
     // --- form fields ---
     fun onName(v: String) = update { it.copy(name = v, error = null) }
-    fun onIp(v: String) = update { it.copy(ip = v.trim(), error = null) }
+
+    /**
+     * Normalize the IP field instead of trusting the IME.
+     *
+     * The field uses a decimal keyboard so a separator key is always available
+     * (a plain number pad on many IMEs has no "." at all, which made manual
+     * entry impossible). Decimal separators are LOCALE-dependent — plenty of
+     * keyboards render a comma — and pasted values carry stray spaces, so both
+     * are normalized here into a clean dotted quad rather than letting a
+     * valid-looking-but-unparseable string reach connect().
+     */
+    fun onIp(v: String) = update {
+        it.copy(ip = v.replace(',', '.').filter { c -> c.isDigit() || c == '.' }.trim(),
+            error = null)
+    }
     fun onPort(v: String) = update { it.copy(port = v.filter { c -> c.isDigit() }, error = null) }
     fun onToken(v: String) = update { it.copy(token = v.trim().uppercase(), error = null) }
 

@@ -60,6 +60,13 @@ NET_WATCH_S = 5
 # returns the loopback fallback, and re-announcing THAT poisons mDNS with 127.0.0.1
 # for the rest of the process. Wait (bounded) for a real address before announcing.
 NET_SETTLE_S = 45
+# How long the QR stays fully rendered while UNPAIRED and idle before it is
+# swapped for a click-to-show placeholder. The QR encodes the token AND the
+# 256-bit key — whoever can photograph the screen owns the machine until
+# Regenerate — so an unattended laptop must not advertise it indefinitely.
+# Pairing flow is unchanged: one click restores it, and any repaint (new IP,
+# regenerate, returning to the QR view) shows it again and restarts the clock.
+QR_HIDE_AFTER_MS = 5 * 60 * 1000
 SERVICE_TYPE = "_lazer._udp.local."
 # Resource vs. writable paths differ when frozen into a PyInstaller onefile exe:
 # bundled data lives in the temp _MEIPASS extraction dir (read-only), while the
@@ -121,6 +128,14 @@ _input_guard = [None]                # the live LocalInputGuard, for serve_loop'
 PHYSICAL_RESUME_GRACE_S = 2.0        # auto-resume this long after local input stops
 RATE_WINDOW_S = 10                   # rejected-packet rate window
 RATE_MAX_BAD = 80                    # >this many rejected packets/window ⇒ warn (brute/flood)
+# When that warning fires, plaintext (manual-code) ACCEPTANCE is paused for this
+# many seconds: Wire.parse drops v1 packets before any parsing or comparison.
+# Token brute force only exists on the v1 wire — the secure wire authenticates by
+# GCM tag and never sees a token — so pausing exactly that path makes guessing
+# futile while QR-paired phones are untouched. Deliberately GLOBAL, not per-source
+# blocking: UDP source addresses are spoofable, so per-IP blocking would let a
+# flooder frame the real phone's address and lock the genuine user out.
+PLAINTEXT_SUSPEND_S = 60
 
 
 def resume_remote():
@@ -675,36 +690,29 @@ def do_system(action):
         return
 
 
-# ── crypto: secure wire (v2) ──────────────────────────────────────────────────
-# Two wire formats coexist so existing flows keep working:
+# ── crypto: secure wire (v2/v3) ───────────────────────────────────────────────
 #   v1 (legacy, PLAINTEXT):  "<TOKEN> <VERB> [args]"   — trusted LAN only.
-#   v2 (SECURE):  b"L2" || sid(4) || counter(8 BE) || AES-256-GCM(ct+tag)
-#     nonce = sid||counter (12 B) · AAD = b"L2"||sid||counter · plaintext = "VERB [args]"
+#   SECURE:  b"L3" || sid(8) || counter(4 BE) || AES-256-GCM(ct+tag)
+#     nonce = sid||counter (12 B) · AAD = b"L3"||sid||counter · plaintext = "VERB [args]"
 # The 256-bit key is shipped in the QR (and auto-discovery never carries it). A valid
 # GCM tag *is* the authentication (proves key possession) — no token on the wire —
 # and the monotonic counter gives replay protection. Sniffing/forgery/replay all fail.
-# Two wire dialects, differing ONLY in how the 12-byte GCM nonce is split. The
-# header is 14 bytes either way (magic 2 + nonce 12), so nothing else about framing
-# changes:
-#   L2 (legacy)  sid(4) | counter(8)   — 32-bit session space
-#   L3 (current) sid(8) | counter(4)   — 64-bit session space
 #
-# Why: the key is PERSISTENT across launches while the sid is random per session, so
-# a sid collision means GCM nonce reuse under the same key — which leaks the
-# authentication key, not just a plaintext. A 4-byte sid puts that at the birthday
-# bound of 2^32: ~1.2% odds by 10k sessions, ~39% by 65k. Every reconnect mints a
-# session and the watchdog reconnects on any drop, so those numbers are reachable
-# over a phone's lifetime. Moving four bytes from the counter to the sid buys 2^64
-# at zero real cost: a 4-byte counter still allows 4.29e9 packets in one session.
-#
-# L2 is accepted for one release so a phone that hasn't been updated keeps working;
-# it is scheduled for removal the release after v2.0. Do not add a third dialect
-# without also updating the golden vectors in server/tests/test_wire.py AND
+# Why sid(8)|counter(4): the key is PERSISTENT across launches while the sid is random
+# per session, so a sid collision means GCM nonce reuse under the same key — which
+# leaks the authentication key, not just a plaintext. The original L2 dialect split
+# sid(4)|counter(8), putting reuse at the 2^32 birthday bound (~1.2% by 10k sessions,
+# ~39% by 65k — reachable, since every reconnect mints a session and the watchdog
+# reconnects on any drop). L3 moved four bytes to the sid for 2^64 at zero cost: a
+# 4-byte counter still allows 4.29e9 packets per session, and exhausting it re-keys
+# the sid rather than wrapping. L2 was accepted through v2.x so un-updated phones
+# kept working, and is REMOVED as of this release — an L2 packet is now just unknown
+# magic and falls through like any other junk. Do not add a new dialect without also
+# updating the golden vectors in server/tests/test_wire.py AND
 # android/.../SecureChannelTest.kt — they are what stop the two implementations
 # drifting apart.
-MAGIC_V2 = b"L2"
 MAGIC_V3 = b"L3"
-WIRE_FORMATS = {MAGIC_V2: (4, 8), MAGIC_V3: (8, 4)}   # magic -> (sid_len, ctr_len)
+WIRE_FORMATS = {MAGIC_V3: (8, 4)}   # magic -> (sid_len, ctr_len)
 
 
 try:
@@ -765,6 +773,7 @@ def rotate_secrets(wire):
     wire.aes = AESGCM(key) if (key and _HAVE_CRYPTO) else None
     wire.cli_magic, wire.cli_sid, wire.cli_ctr = None, None, -1
     wire.secure_client = False
+    wire.pt_suspended_until = 0.0   # fresh credentials deserve a fresh chance
     # Fresh key ⇒ start the server's send sessions over. Not strictly required (a
     # repeated nonce under a DIFFERENT key is harmless), but it keeps the invariant
     # "one (key, dialect, sid) never reuses a counter" true without a caveat.
@@ -799,6 +808,9 @@ class Wire:
         # Set when a correctly-tokened plaintext packet was refused because
         # encryption is required; serve_loop turns it into a one-time explanation.
         self.plaintext_refused = False
+        # Monotonic deadline while plaintext v1 acceptance is paused (see
+        # PLAINTEXT_SUSPEND_S). 0.0 ⇒ accepting.
+        self.pt_suspended_until = 0.0
         self._pending = None            # (sid, ctr) of the in-flight HELLO/AUTH
         self._chal = {}                 # addr -> (nonce, expiry_monotonic): open challenges
 
@@ -838,7 +850,12 @@ class Wire:
                 return None                     # not the pinned client / replay / reorder
             self.cli_ctr = ctr
             return verb, rest, True
-        # plaintext v1
+        # plaintext v1. Flood suspension first (see PLAINTEXT_SUSPEND_S): while
+        # paused, drop before ANY decoding or comparison. The secure path above is
+        # untouched — manual-code pairing is the only thing paused, because it is
+        # the only path a token brute-force exists against.
+        if time.monotonic() < self.pt_suspended_until:
+            return None
         if self.require_secure:
             # Nothing is accepted here — but tell apart "a real phone tried to pair
             # with the manual code" from random junk, so the UI can explain the
@@ -1640,25 +1657,36 @@ def open_socket():
     return sock
 
 
-def singleton_acquire():
+def singleton_acquire(poke=True):
     """Single-instance guard over a loopback control port.
 
-    Returns ("existing", None) if another instance is already running (and was
-    signaled to surface its window), ("owner", lsock) if we are the first
-    instance (lsock is the control listener to serve), or ("solo", None) if the
-    guard couldn't be set up (proceed unguarded)."""
-    # Already running? Connect to its control port and ask it to come forward.
+    Returns ("existing", None) if another instance is already running (and, when
+    [poke], was signaled to surface its window), ("owner", lsock) if we are the
+    first instance (lsock is the control listener to serve), or ("solo", None) if
+    the guard couldn't be set up (proceed unguarded).
+
+    [poke]=False (terminal mode) still detects an existing owner but does NOT
+    send SHOW — a second headless launch must not pop anyone's window; it only
+    wants to claim the port so a later `--resume` can reach us."""
+    # Already running? Connect to its control port — and, unless asked to be
+    # quiet, ask it to come forward.
+    probe = None
     try:
-        c = socket.create_connection(("127.0.0.1", SINGLETON_PORT), timeout=0.5)
+        probe = socket.create_connection(("127.0.0.1", SINGLETON_PORT), timeout=0.5)
+    except OSError:
+        probe = None
+    if probe is not None:
         try:
-            c.sendall(b"SHOW")
+            if poke:
+                probe.sendall(b"SHOW")
         except OSError:
             pass
         finally:
-            c.close()
+            try:
+                probe.close()
+            except OSError:
+                pass
         return "existing", None
-    except OSError:
-        pass
     # No one answered — claim the port. No SO_REUSEADDR: on Windows it would let
     # a second instance steal the port and defeat the guard; we want bind to fail.
     try:
@@ -1672,7 +1700,8 @@ def singleton_acquire():
 
 
 def singleton_serve(lsock, eq):
-    """Accept loopback 'SHOW' pokes from later launches; surface the window."""
+    """Accept loopback pokes from later launches: SHOW surfaces the window;
+    RESUME clears a panic latch (the terminal has no Resume button — --resume)."""
     while not _stop.is_set():
         try:
             conn, _ = lsock.accept()
@@ -1680,8 +1709,9 @@ def singleton_serve(lsock, eq):
             continue
         except OSError:
             break
+        cmd = b""
         try:
-            conn.recv(16)
+            cmd = conn.recv(16)
         except OSError:
             pass
         finally:
@@ -1689,7 +1719,12 @@ def singleton_serve(lsock, eq):
                 conn.close()
             except OSError:
                 pass
-        eq.put(("show",))
+        if cmd.startswith(b"RESUME"):
+            # Safe from this thread: resume_remote only clears threading.Events.
+            resume_remote()
+            eq.put(("resumed",))
+        else:
+            eq.put(("show",))
     try:
         lsock.close()
     except OSError:
@@ -2564,8 +2599,20 @@ def serve_loop(wire, emit, net, hostname):
                                  "Require encryption is on — scan the QR instead "
                                  "(or restart with --allow-plaintext).")
             if bad > RATE_MAX_BAD and not warned:
-                emit("warn", "High rate of rejected packets — possible brute-force / flood")
                 warned = True
+                if wire.aes is not None:
+                    # Suspend plaintext ACCEPTANCE for a window (PLAINTEXT_SUSPEND_S):
+                    # brute force only exists on the v1 wire, so pausing exactly that
+                    # path makes guessing futile while QR-paired phones are untouched.
+                    # Global, not per-source: UDP source addresses are spoofable, and
+                    # per-IP blocking would let a flooder frame the real phone.
+                    wire.pt_suspended_until = mono + PLAINTEXT_SUSPEND_S
+                    emit("warn",
+                         "High rate of rejected packets — possible brute-force / flood; "
+                         f"manual-code pairing paused {int(PLAINTEXT_SUSPEND_S)}s "
+                         "(QR pairing unaffected)")
+                else:
+                    emit("warn", "High rate of rejected packets — possible brute-force / flood")
             continue
         verb, rest, secure = res
 
@@ -3161,6 +3208,9 @@ class LazeRWindow:
 
         self._qr_img_label = None
         self._make_qr_photo = None
+        self._photo = None
+        self._qr_hidden = False
+        self._qr_after = None
         try:
             import qrcode
             from PIL import ImageTk
@@ -3170,6 +3220,17 @@ class LazeRWindow:
             holder.pack(pady=(16, 14))
             self._qr_img_label = tk.Label(holder, image=self._photo, bg="#FFFFFF")
             self._qr_img_label.pack()
+            self._qr_holder = holder
+            # Click-to-show placeholder swapped in by the idle hide
+            # (QR_HIDE_AFTER_MS): an unattended laptop must not advertise its
+            # token+key to every passer-by indefinitely.
+            self._qr_placeholder = tk.Frame(pad, bg=_C["card"])
+            ph = tk.Label(self._qr_placeholder,
+                          text="Pairing code hidden — click to show",
+                          bg=_C["card"], fg=_C["dim"], font=self.f_md,
+                          width=24, height=6, justify="center", cursor="hand2")
+            ph.pack()
+            ph.bind("<Button-1>", lambda e: self._show_qr())
         except ImportError:
             tk.Label(pad, text="Install Pillow for the QR image:\npip install pillow",
                      bg=_C["card"], fg=_C["dim"], font=self.f_sm,
@@ -3193,6 +3254,7 @@ class LazeRWindow:
                             lambda e: self._copy_btn.config(bg=_C["accent"]))
         self._copy_btn.bind("<Leave>",
                             lambda e: self._copy_btn.config(bg=_C["accent2"]))
+        self._arm_qr_hide()
 
     # ── connected panel: shown instead of the QR once a phone is paired ───────
     def _build_connected_panel(self, parent):
@@ -3254,8 +3316,46 @@ class LazeRWindow:
             try:
                 self._photo = self._make_qr_photo(uri)
                 self._qr_img_label.config(image=self._photo)
+                # A freshly painted QR exists to be scanned — show it and restart
+                # the idle-hide clock.
+                self._show_qr()
             except Exception:
                 pass
+
+    # ── QR idle-hide ──────────────────────────────────────────────────────────
+    def _arm_qr_hide(self):
+        """(Re)start the timer that hides the QR while unpaired and idle. Every
+        view change or repaint re-arms, so the clock measures idle time, not
+        absolute time since launch."""
+        if self._qr_after is not None:
+            try:
+                self._root.after_cancel(self._qr_after)
+            except Exception:
+                pass
+            self._qr_after = None
+        self._qr_after = self._root.after(QR_HIDE_AFTER_MS, self._hide_qr)
+
+    def _hide_qr(self):
+        self._qr_after = None
+        if self._photo is None or self._qr_img_label is None:
+            return                      # no Pillow, or nothing rendered
+        self._qr_hidden = True
+        try:
+            self._qr_holder.pack_forget()
+            self._qr_placeholder.pack(pady=(16, 14))
+        except Exception:
+            pass
+
+    def _show_qr(self):
+        if self._qr_hidden:
+            self._qr_hidden = False
+            try:
+                self._qr_placeholder.pack_forget()
+                self._qr_holder.pack(pady=(16, 14))
+            except Exception:
+                pass
+            self._resize()
+        self._arm_qr_hide()
 
     def _regenerate(self):
         rotate_secrets(self._wire)
@@ -3270,6 +3370,20 @@ class LazeRWindow:
             pass
         self._show_qr_view()
         self._log("New pairing code generated — old phones must rescan", "ok")
+
+    def _confirm_regenerate(self):
+        """Rotation kicks every paired phone and invalidates saved pairings —
+        destructive enough that one misclick on this small label must not do it."""
+        try:
+            import tkinter.messagebox as mb
+            ok = mb.askyesno(
+                "Regenerate pairing code",
+                "Generate a new pairing code? Every paired phone is kicked "
+                "and must scan the new QR.")
+        except Exception:
+            ok = True       # no dialog available — behave as before
+        if ok:
+            self._regenerate()
 
     def _toggle_secure(self):
         self._require_secure = not self._require_secure
@@ -3293,6 +3407,7 @@ class LazeRWindow:
             pass
         self._connect_border.pack(fill="x")
         self._resize()
+        self._arm_qr_hide()
 
     def _show_connected_view(self):
         try:
@@ -3301,6 +3416,21 @@ class LazeRWindow:
             pass
         self._connected_border.pack(fill="x")
         self._resize()
+        # Paired: stop the idle-hide clock and leave the QR renderable, so a
+        # later disconnect lands on a visible code rather than the placeholder.
+        if self._qr_after is not None:
+            try:
+                self._root.after_cancel(self._qr_after)
+            except Exception:
+                pass
+            self._qr_after = None
+        if self._qr_hidden:
+            self._qr_hidden = False
+            try:
+                self._qr_placeholder.pack_forget()
+                self._qr_holder.pack(pady=(16, 14))
+            except Exception:
+                pass
 
     def _resize(self):
         self._root.geometry("")
@@ -3407,7 +3537,7 @@ class LazeRWindow:
         regen = tk.Label(r, text="Regenerate", bg=_C["accent2"], fg=_C["fg"],
                          font=self.f_sm, cursor="hand2", padx=14, pady=5)
         regen.pack(side="right")
-        regen.bind("<Button-1>", lambda e: self._regenerate())
+        regen.bind("<Button-1>", lambda e: self._confirm_regenerate())
 
         tk.Label(parent, text="Panic: press  Ctrl+Alt+Shift+L  to instantly stop the remote",
                  bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(anchor="w", pady=(10, 0))
@@ -3696,13 +3826,34 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
         elif kind == "resumed":
             print("[takeover] remote resumed")
         elif kind == "panic":
-            print("[takeover] PANIC hotkey — remote latched off; press it again is not needed, restart to re-enable")
+            print("[takeover] PANIC hotkey — remote latched OFF. Resume from the "
+                  "GUI window, or run:  python remote_server.py --resume")
         elif kind == "netchange":
             print(f"\n[resume] new IP {a[0]} — rescan:\n")
             show_qr(a[1])
             print()
         elif kind == "log":
             print(f"[info] {a[0]}")
+
+    # Claim the loopback control port so a later `--resume` can clear a panic
+    # latch here too — the terminal has no Resume button. poke=False: a second
+    # headless launch must not nudge an existing instance's window.
+    kind_i, lsock_i = singleton_acquire(poke=False)
+    if kind_i == "owner" and lsock_i is not None:
+        ctrl_q = queue.Queue()
+        threading.Thread(target=singleton_serve, args=(lsock_i, ctrl_q),
+                         daemon=True).start()
+
+        def _drain_ctrl():
+            while not _stop.is_set():
+                try:
+                    ev = ctrl_q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if ev[0] == "resumed":
+                    emit("resumed")
+                # "show" has nothing to surface in a terminal — ignored.
+        threading.Thread(target=_drain_ctrl, daemon=True).start()
 
     wire = Wire(token, key, require_secure)
     guard = LocalInputGuard(
@@ -3767,6 +3918,9 @@ def main():
     ap.add_argument("--allow-plaintext", action="store_true",
                     help="permit manual-code (plaintext v1) pairing. Trusted LANs "
                          "only — v1 offers no confidentiality and is replayable")
+    ap.add_argument("--resume", action="store_true",
+                    help="tell an already-running LazeR to resume remote control "
+                         "(clears a panic latch) and exit")
     ap.add_argument("--setup-firewall", action="store_true",
                     help="add the Windows Firewall inbound rule (self-elevates) and exit")
     ap.add_argument("--enable-startup", action="store_true",
@@ -3787,6 +3941,19 @@ def main():
         else:
             reason = getattr(set_startup, "last_error", "") or "unknown error"
             print(f"[startup] could not change launch-at-login: {reason}")
+        return
+
+    if args.resume:
+        try:
+            c = socket.create_connection(("127.0.0.1", SINGLETON_PORT), timeout=1.0)
+        except OSError:
+            print("[resume] no running LazeR found — start it first.")
+            return
+        try:
+            c.sendall(b"RESUME")
+        finally:
+            c.close()
+        print("[resume] asked the running LazeR to resume remote control.")
         return
 
     if args.setup_firewall:
