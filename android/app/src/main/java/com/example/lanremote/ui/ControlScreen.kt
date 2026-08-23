@@ -14,8 +14,10 @@ import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.offset
 import androidx.compose.material.icons.filled.KeyboardDoubleArrowLeft
 import androidx.compose.material.icons.filled.KeyboardDoubleArrowRight
+import androidx.compose.runtime.State
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -172,6 +174,14 @@ fun ControlScreen(state: UiState, a: ControlActions) {
     val view = LocalView.current
     val context = LocalContext.current
 
+    // Live handle on the scroll-direction setting for the GESTURE LOOPS. The pad and
+    // strip run inside pointerInput(Unit), whose coroutine outlives the recomposition
+    // that flipped the toggle — a Boolean captured there kept its startup value, so
+    // "Natural scrolling" changed nothing and the toggle was redundant. Reading
+    // through this State means whichever mode is set NOW is what the next scroll
+    // step uses, with no dependency on when the pointer block was (re)started.
+    val naturalScrollState = rememberUpdatedState(state.settings.naturalScroll)
+
     // Keep the screen on for the whole session. Driving the laptop as a media /
     // presenter remote is active use even when nothing is touching the phone —
     // letting the display time out backgrounds the app and stalls the socket
@@ -271,7 +281,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
             TrackpadCard(
                 modifier = Modifier.fillMaxWidth().weight(1f).heightIn(min = 220.dp),
                 a = a,
-                natural = state.settings.naturalScroll,
+                natural = naturalScrollState,
             )
             Spacer(Modifier.height(10.dp))
             ClickBar(a)
@@ -787,7 +797,7 @@ private fun Modifier.hexDots(color: Color): Modifier = drawBehind {
 }
 
 @Composable
-private fun TrackpadCard(modifier: Modifier, a: ControlActions, natural: Boolean) {
+private fun TrackpadCard(modifier: Modifier, a: ControlActions, natural: State<Boolean>) {
     Card(
         modifier = modifier,
         shape = RoundedCornerShape(28.dp),
@@ -806,10 +816,10 @@ private fun TrackpadCard(modifier: Modifier, a: ControlActions, natural: Boolean
                     .background(MaterialTheme.colorScheme.surface)
                     .hexDots(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.22f))
                     .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
-                        a.onSwitchStep, a.onSwitchEnd, { natural }),
+                        a.onSwitchStep, a.onSwitchEnd, { natural.value }),
             )
             Spacer(Modifier.width(14.dp))
-            ScrollStrip(a.onScroll, { natural })
+            ScrollStrip(a.onScroll, { natural.value })
         }
     }
 }
@@ -894,6 +904,10 @@ private fun ScrollStrip(onScroll: (Int, Int) -> Unit, natural: () -> Boolean) {
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> Unit) {
+    // Same live-handle pattern as ControlScreen: the fullscreen pad's gesture loops
+    // must see the toggle's CURRENT value, not the one from whenever their
+    // pointerInput coroutine started.
+    val naturalScrollState = rememberUpdatedState(state.settings.naturalScroll)
     // Frame tone matches the compact card so the recessed pad reads the same way.
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerHighest)) {
         // Same tactile pad + real scrollbar as the compact view, now full-bleed. (Two-finger
@@ -913,10 +927,10 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
                     .background(MaterialTheme.colorScheme.surface)
                     .hexDots(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.22f))
                     .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
-                        a.onSwitchStep, a.onSwitchEnd, { state.settings.naturalScroll }),
+                        a.onSwitchStep, a.onSwitchEnd, { naturalScrollState.value }),
             )
             Spacer(Modifier.width(14.dp))
-            ScrollStrip(a.onScroll, { state.settings.naturalScroll })
+            ScrollStrip(a.onScroll, { naturalScrollState.value })
         }
         // Same click bar as the home page — the connected Left/Middle/Right group +
         // hold-drag — reused in the dead space below the pad instead of a bespoke

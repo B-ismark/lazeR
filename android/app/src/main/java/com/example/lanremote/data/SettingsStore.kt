@@ -5,7 +5,10 @@ import android.content.Context
 /** Small persisted preferences: pointer feel, scroll direction, haptics, last device. */
 data class Settings(
     val sensitivity: Float = 1.6f,    // cursor speed multiplier
-    val naturalScroll: Boolean = true,  // touchscreen feel: content follows fingers
+    // Default OFF = the traditional wheel feel: fingers/wheel up moves the view up —
+    // the scroll runs INVERSE to finger movement. Natural (touchscreen) scrolling,
+    // where content follows the fingers, is the opt-in.
+    val naturalScroll: Boolean = false,
     val haptics: Boolean = true,
     val acceleration: Boolean = true,   // fast flicks travel farther (pointer accel curve)
     // The only setting that governs internet access: everything else in the app is
@@ -20,7 +23,7 @@ class SettingsStore(context: Context) {
 
     fun load() = Settings(
         sensitivity = prefs.getFloat("sensitivity", 1.6f),
-        naturalScroll = prefs.getBoolean("naturalScroll", true),
+        naturalScroll = prefs.getBoolean("naturalScroll", false),
         haptics = prefs.getBoolean("haptics", true),
         acceleration = prefs.getBoolean("acceleration", true),
         updateCheck = prefs.getBoolean("updateCheck", true),
