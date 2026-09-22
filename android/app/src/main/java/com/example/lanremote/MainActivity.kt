@@ -120,6 +120,7 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
                 onSystem = vm::system,
                 onSensitivity = vm::setSensitivity,
                 onNaturalScroll = vm::setNaturalScroll,
+                onScrollStripLeft = vm::setScrollStripLeft,
                 onHaptics = vm::setHaptics,
                 onAcceleration = vm::setAcceleration,
                 onUpdateCheck = vm::setUpdateCheck,

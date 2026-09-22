@@ -5,10 +5,22 @@ import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.displayCutoutPadding
+import androidx.compose.foundation.layout.isImeVisible
+import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.animation.core.animate
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.offset
@@ -59,6 +71,7 @@ import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.automirrored.outlined.Backspace
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.BrightnessHigh
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Headphones
@@ -87,6 +100,8 @@ import androidx.compose.material3.IconButtonShapes
 import androidx.compose.material3.MaterialShapes
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.Surface
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -109,6 +124,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextRange
@@ -157,6 +173,7 @@ class ControlActions(
     val onSystem: (String) -> Unit,
     val onSensitivity: (Float) -> Unit,
     val onNaturalScroll: (Boolean) -> Unit,
+    val onScrollStripLeft: (Boolean) -> Unit,
     val onHaptics: (Boolean) -> Unit,
     val onAcceleration: (Boolean) -> Unit,
     val onUpdateCheck: (Boolean) -> Unit,
@@ -170,6 +187,14 @@ fun ControlScreen(state: UiState, a: ControlActions) {
     var fullscreen by rememberSaveable { mutableStateOf(false) }
     var showAdvanced by rememberSaveable { mutableStateOf(false) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
+    // Which slide-out panel the landscape deck has open (null = pad only).
+    var deckPanel by rememberSaveable { mutableStateOf<DeckPanel?>(null) }
+
+    // Wider than tall = landscape deck. Read from the configuration, which the
+    // activity receives in place (configChanges=orientation), so rotating swaps the
+    // layout without recreating anything or touching the session.
+    val config = LocalConfiguration.current
+    val landscape = config.screenWidthDp > config.screenHeightDp
 
     val view = LocalView.current
     val context = LocalContext.current
@@ -202,6 +227,9 @@ fun ControlScreen(state: UiState, a: ControlActions) {
     BackHandler(enabled = true) {
         if (fullscreen) {
             fullscreen = false
+        } else if (landscape && deckPanel != null) {
+            // An open slide-out panel is the innermost layer — back closes it first.
+            deckPanel = null
         } else {
             val now = SystemClock.elapsedRealtime()
             if (now - lastBackMs < 2000) {
@@ -242,49 +270,63 @@ fun ControlScreen(state: UiState, a: ControlActions) {
         return
     }
 
-    Scaffold(
-        topBar = {
-            CenterAlignedTopAppBar(
-                title = { Text("LazeR") },
-                navigationIcon = {
-                    IconButton(onClick = a.onDisconnect) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back · disconnect")
-                    }
-                },
-                actions = {
-                    IconButton(onClick = { showAdvanced = true }) {
-                        Icon(Icons.Filled.Tune, contentDescription = "Advanced")
-                    }
-                    IconButton(onClick = { showSettings = true }) {
-                        Icon(Icons.Filled.Settings, contentDescription = "Settings")
-                    }
-                    IconButton(onClick = { fullscreen = true }) {
-                        Icon(Icons.Filled.Fullscreen, contentDescription = "Expand trackpad")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.surface,
-                ),
-            )
-        },
-    ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .imePadding()
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-        ) {
-            ControlsPanel(state, a)
-            Spacer(Modifier.height(12.dp))
-            TrackpadCard(
-                modifier = Modifier.fillMaxWidth().weight(1f).heightIn(min = 220.dp),
-                a = a,
-                natural = naturalScrollState,
-            )
-            Spacer(Modifier.height(10.dp))
-            ClickBar(a)
+    if (landscape) {
+        LandscapeDeck(
+            state = state,
+            a = a,
+            natural = naturalScrollState,
+            panel = deckPanel,
+            onPanel = { deckPanel = it },
+            onAdvanced = { showAdvanced = true },
+            onSettings = { showSettings = true },
+            onFullscreen = { fullscreen = true },
+        )
+    } else {
+        Scaffold(
+            topBar = {
+                CenterAlignedTopAppBar(
+                    title = { Text("LazeR") },
+                    navigationIcon = {
+                        IconButton(onClick = a.onDisconnect) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "Back · disconnect")
+                        }
+                    },
+                    actions = {
+                        IconButton(onClick = { showAdvanced = true }) {
+                            Icon(Icons.Filled.Tune, contentDescription = "Advanced")
+                        }
+                        IconButton(onClick = { showSettings = true }) {
+                            Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                        }
+                        IconButton(onClick = { fullscreen = true }) {
+                            Icon(Icons.Filled.Fullscreen, contentDescription = "Expand trackpad")
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                    ),
+                )
+            },
+        ) { padding ->
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .imePadding()
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
+            ) {
+                ControlsPanel(state, a)
+                Spacer(Modifier.height(12.dp))
+                TrackpadCard(
+                    modifier = Modifier.fillMaxWidth().weight(1f).heightIn(min = 220.dp),
+                    a = a,
+                    natural = naturalScrollState,
+                    stripLeft = state.settings.scrollStripLeft,
+                )
+                Spacer(Modifier.height(10.dp))
+                ClickBar(a)
+            }
         }
     }
 
@@ -797,7 +839,12 @@ private fun Modifier.hexDots(color: Color): Modifier = drawBehind {
 }
 
 @Composable
-private fun TrackpadCard(modifier: Modifier, a: ControlActions, natural: State<Boolean>) {
+private fun TrackpadCard(
+    modifier: Modifier,
+    a: ControlActions,
+    natural: State<Boolean>,
+    stripLeft: Boolean,
+) {
     Card(
         modifier = modifier,
         shape = RoundedCornerShape(28.dp),
@@ -805,19 +852,41 @@ private fun TrackpadCard(modifier: Modifier, a: ControlActions, natural: State<B
             containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
         ),
     ) {
-        Row(Modifier.fillMaxSize().padding(8.dp)) {
-            // Bare tactile field: hex-dot lattice on a recessed (darker) surface, no
-            // hint text. The grid + inset colour do the talking.
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight()
-                    .clip(RoundedCornerShape(22.dp))
-                    .background(MaterialTheme.colorScheme.surface)
-                    .hexDots(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.22f))
-                    .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
-                        a.onSwitchStep, a.onSwitchEnd, { natural.value }),
-            )
+        PadWithStrip(Modifier.fillMaxSize().padding(8.dp), a, natural, stripLeft,
+            padCorner = 22.dp)
+    }
+}
+
+/** The dotted pad with the scroll strip beside it — on the right by default, on the
+ *  left when [stripLeft] (the "Scroll bar on the left" setting). One composable for
+ *  the compact card, the landscape deck and the expanded view, so the setting
+ *  can't end up honoured in one and forgotten in another. */
+@Composable
+private fun PadWithStrip(
+    modifier: Modifier,
+    a: ControlActions,
+    natural: State<Boolean>,
+    stripLeft: Boolean,
+    padCorner: Dp,
+) {
+    Row(modifier) {
+        if (stripLeft) {
+            ScrollStrip(a.onScroll, { natural.value })
+            Spacer(Modifier.width(14.dp))
+        }
+        // Bare tactile field: hex-dot lattice on a recessed (darker) surface, no
+        // hint text. The grid + inset colour do the talking.
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .clip(RoundedCornerShape(padCorner))
+                .background(MaterialTheme.colorScheme.surface)
+                .hexDots(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.22f))
+                .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
+                    a.onSwitchStep, a.onSwitchEnd, { natural.value }),
+        )
+        if (!stripLeft) {
             Spacer(Modifier.width(14.dp))
             ScrollStrip(a.onScroll, { natural.value })
         }
@@ -899,6 +968,203 @@ private fun ScrollStrip(onScroll: (Int, Int) -> Unit, natural: () -> Boolean) {
 }
 
 // ---------------------------------------------------------------------------
+// Landscape: the "laptop deck". The trackpad takes the full width with the click
+// bar under it, like a laptop's palm rest; the top bar and the Media / Keyboard
+// panel fold into a navigation rail, and those panels slide out over the pad on
+// demand. The portrait stack simply doesn't fit a 360dp-tall screen — the panel
+// ate the height and pushed the pad and click bar off the bottom edge.
+// ---------------------------------------------------------------------------
+private enum class DeckPanel { Media, Keyboard }
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun LandscapeDeck(
+    state: UiState,
+    a: ControlActions,
+    natural: State<Boolean>,
+    panel: DeckPanel?,
+    onPanel: (DeckPanel?) -> Unit,
+    onAdvanced: () -> Unit,
+    onSettings: () -> Unit,
+    onFullscreen: () -> Unit,
+) {
+    fun toggle(p: DeckPanel) { a.onButtonTap(); onPanel(if (panel == p) null else p) }
+
+    Row(
+        Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.surface)
+            // Status bar, side nav bar and camera cutout. The IME is handled only
+            // by the main area below, so the rail keeps its full height while typing.
+            .systemBarsPadding()
+            .displayCutoutPadding(),
+    ) {
+        DeckRail(
+            panel = panel,
+            onToggle = { toggle(it) },
+            onBack = a.onDisconnect,
+            onAdvanced = onAdvanced,
+            onSettings = onSettings,
+            onFullscreen = onFullscreen,
+        )
+
+        Box(Modifier.weight(1f).fillMaxHeight().imePadding()) {
+            Column(Modifier.fillMaxSize().padding(top = 8.dp, end = 16.dp, bottom = 12.dp)) {
+                TrackpadCard(
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    a = a,
+                    natural = natural,
+                    stripLeft = state.settings.scrollStripLeft,
+                )
+                Spacer(Modifier.height(10.dp))
+                ClickBar(a)
+            }
+
+            // Scrim: dims the pad while a panel is out, and a tap on it closes the
+            // panel. It sits above the pad, so that tap never reaches the laptop
+            // as a click.
+            AnimatedVisibility(visible = panel != null, enter = fadeIn(), exit = fadeOut()) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.32f))
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                        ) { onPanel(null) },
+                )
+            }
+
+            // Slides in from the rail edge. Switching Media ↔ Keyboard cross-fades
+            // in place rather than sliding out and back in.
+            AnimatedContent(
+                targetState = panel,
+                transitionSpec = {
+                    val swap = if (initialState != null && targetState != null) {
+                        fadeIn() togetherWith fadeOut()
+                    } else {
+                        (slideInHorizontally { -it } + fadeIn()) togetherWith
+                            (slideOutHorizontally { -it } + fadeOut())
+                    }
+                    swap using SizeTransform(clip = false)
+                },
+                modifier = Modifier.fillMaxHeight(),
+                label = "deckPanel",
+            ) { p ->
+                if (p != null) DeckPanelSheet(p, state, a, onClose = { onPanel(null) })
+            }
+        }
+    }
+}
+
+/** Back on top; the panel toggles under it; the sheet shortcuts pinned to the
+ *  bottom. Scrolls if the window is too short (split screen), so nothing is ever
+ *  cut off. */
+@Composable
+private fun DeckRail(
+    panel: DeckPanel?,
+    onToggle: (DeckPanel) -> Unit,
+    onBack: () -> Unit,
+    onAdvanced: () -> Unit,
+    onSettings: () -> Unit,
+    onFullscreen: () -> Unit,
+) {
+    BoxWithConstraints(Modifier.width(80.dp).fillMaxHeight()) {
+        Column(
+            modifier = Modifier
+                .verticalScroll(rememberScrollState())
+                .heightIn(min = maxHeight)
+                .padding(vertical = 4.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Back · disconnect")
+                }
+                NavigationRailItem(
+                    selected = panel == DeckPanel.Media,
+                    onClick = { onToggle(DeckPanel.Media) },
+                    icon = { Icon(Icons.Filled.Headphones, contentDescription = null) },
+                    label = { Text("Media") },
+                )
+                NavigationRailItem(
+                    selected = panel == DeckPanel.Keyboard,
+                    onClick = { onToggle(DeckPanel.Keyboard) },
+                    icon = { Icon(Icons.Filled.Keyboard, contentDescription = null) },
+                    label = { Text("Keys") },
+                )
+            }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                IconButton(onClick = onAdvanced) {
+                    Icon(Icons.Filled.Tune, contentDescription = "Advanced")
+                }
+                IconButton(onClick = onSettings) {
+                    Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                }
+                IconButton(onClick = onFullscreen) {
+                    Icon(Icons.Filled.Fullscreen, contentDescription = "Expand trackpad")
+                }
+            }
+        }
+    }
+}
+
+/** The slide-out itself: the same Media and Keyboard panels as portrait, at
+ *  portrait's content width (360dp less padding), so neither needed a second
+ *  layout. While the phone's keyboard is up it widens to the full area and drops
+ *  its header — the IME covers over half a landscape screen, and what's left
+ *  belongs to the text field. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun DeckPanelSheet(
+    panel: DeckPanel,
+    state: UiState,
+    a: ControlActions,
+    onClose: () -> Unit,
+) {
+    val typing = panel == DeckPanel.Keyboard && WindowInsets.isImeVisible
+    Surface(
+        modifier = Modifier
+            .fillMaxHeight()
+            .then(if (typing) Modifier.fillMaxWidth() else Modifier.width(360.dp)),
+        shape = RoundedCornerShape(topEnd = 28.dp, bottomEnd = 28.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        shadowElevation = 6.dp,
+    ) {
+        Column(
+            Modifier
+                .verticalScroll(rememberScrollState())
+                .padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 16.dp),
+        ) {
+            if (!typing) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        if (panel == DeckPanel.Media) "Media" else "Keyboard",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.weight(1f),
+                    )
+                    IconButton(onClick = onClose) {
+                        Icon(Icons.Filled.Close, contentDescription = "Close panel")
+                    }
+                }
+            } else {
+                Spacer(Modifier.height(8.dp))
+            }
+            // KeyboardPanel takes no UiState on purpose — see ControlsPanel.
+            if (panel == DeckPanel.Media) MediaPanel(state, a) else KeyboardPanel(a)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fullscreen trackpad
 // ---------------------------------------------------------------------------
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
@@ -912,26 +1178,17 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
     Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerHighest)) {
         // Same tactile pad + real scrollbar as the compact view, now full-bleed. (Two-finger
         // drag still scrolls too — the strip is just an explicit alternative.)
-        Row(
+        PadWithStrip(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
                 .statusBarsPadding()
                 .padding(12.dp),
-        ) {
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight()
-                    .clip(RoundedCornerShape(24.dp))
-                    .background(MaterialTheme.colorScheme.surface)
-                    .hexDots(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.22f))
-                    .trackpadInput(a.onMove, a.onScroll, a.onZoom, a.onClick, a.onRightClick,
-                        a.onSwitchStep, a.onSwitchEnd, { naturalScrollState.value }),
-            )
-            Spacer(Modifier.width(14.dp))
-            ScrollStrip(a.onScroll, { naturalScrollState.value })
-        }
+            a = a,
+            natural = naturalScrollState,
+            stripLeft = state.settings.scrollStripLeft,
+            padCorner = 24.dp,
+        )
         // Same click bar as the home page — the connected Left/Middle/Right group +
         // hold-drag — reused in the dead space below the pad instead of a bespoke
         // floating toolbar, so both views feel identical. Exit rides along as the
@@ -1029,6 +1286,9 @@ private fun SettingsSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
             SheetTitle("Scrolling")
             ToggleRow("Natural scrolling", "Content follows your fingers",
                 state.settings.naturalScroll, a.onNaturalScroll)
+            ToggleRow("Scroll bar on the left", "Puts the scroll strip on the left of the " +
+                "trackpad — handy for left-handed use",
+                state.settings.scrollStripLeft, a.onScrollStripLeft)
 
             Spacer(Modifier.height(16.dp))
             SheetTitle("Feedback")

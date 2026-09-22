@@ -181,6 +181,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     // --- settings ---
     fun setSensitivity(v: Float) = updateSettings { it.copy(sensitivity = v) }
     fun setNaturalScroll(v: Boolean) = updateSettings { it.copy(naturalScroll = v) }
+    fun setScrollStripLeft(v: Boolean) = updateSettings { it.copy(scrollStripLeft = v) }
     fun setHaptics(v: Boolean) = updateSettings { it.copy(haptics = v) }
     fun setAcceleration(v: Boolean) = updateSettings { it.copy(acceleration = v) }
 
