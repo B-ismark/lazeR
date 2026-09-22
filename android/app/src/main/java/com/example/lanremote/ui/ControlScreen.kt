@@ -84,6 +84,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ButtonGroup
 import androidx.compose.material3.Card
@@ -551,12 +552,6 @@ private fun KeyboardPanel(a: ControlActions) {
         setBuffer("")
     }
 
-    fun commitCombo(spec: String) {
-        a.onButtonTap()
-        a.onCombo(spec)
-        setBuffer("")
-    }
-
     SectionCard {
         // Long text wraps and the field grows, rather than one line sliding
         // sideways out of view. Capped so it can't eat the screen: sideways there
@@ -566,20 +561,12 @@ private fun KeyboardPanel(a: ControlActions) {
         OutlinedTextField(
             value = buffer,
             onValueChange = { next ->
-                if ('\n' in next.text) {
-                    // Multi-line, so the phone keyboard's Enter key now inserts a
-                    // newline. Treat it as the laptop's Enter, same as the Enter
-                    // button: type whatever else changed, press Enter, start fresh.
-                    // A pasted multi-line block arrives joined into one line.
-                    a.onKeyboardInput(buffer.text, next.text.replace("\n", ""))
-                    commitKey("enter")
-                } else {
-                    // Send the delta first, then adopt the new value verbatim so
-                    // selection and composition are preserved exactly as the IME
-                    // set them.
-                    a.onKeyboardInput(buffer.text, next.text)
-                    buffer = next
-                }
+                // Send the delta first, then adopt the new value verbatim so
+                // selection and composition are preserved exactly as the IME set
+                // them. The phone keyboard's return key puts a real line break in
+                // the field; the laptop gets it as Shift+Enter (see keyboardOps).
+                a.onKeyboardInput(buffer.text, next.text)
+                buffer = next
             },
             label = { Text("Type on laptop") },
             singleLine = false,
@@ -589,9 +576,10 @@ private fun KeyboardPanel(a: ControlActions) {
             modifier = Modifier.fillMaxWidth(),
         )
         Spacer(Modifier.height(10.dp))
-        // One row, equal-width keys (weight) so all six fit on a single line regardless of
-        // screen width. Backspace and New line are icon keys to stay compact; the centre
-        // four are text. Tight content padding lets the labels breathe in the narrow cells.
+        // One row of keys, sized by weight so they always fit on one line. New line
+        // isn't here: the phone keyboard's own return key does that. Enter submits,
+        // so it's the one filled, wider key. Tight content padding lets the labels
+        // breathe in the narrow cells.
         val keyPad = PaddingValues(horizontal = 4.dp)
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -614,16 +602,12 @@ private fun KeyboardPanel(a: ControlActions) {
                 contentPadding = keyPad, modifier = Modifier.weight(1f)) {
                 Text("Esc", maxLines = 1)
             }
-            FilledTonalButton(onClick = { commitKey("enter") }, shapes = ButtonDefaults.shapes(),
-                contentPadding = keyPad, modifier = Modifier.weight(1f)) {
+            Button(onClick = { commitKey("enter") }, shapes = ButtonDefaults.shapes(),
+                contentPadding = keyPad, modifier = Modifier.weight(1.6f)) {
+                Icon(Icons.AutoMirrored.Filled.KeyboardReturn, contentDescription = null,
+                    modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
                 Text("Enter", maxLines = 1)
-            }
-            // Shift+Enter: soft newline without submitting — near-universal (chat apps,
-            // editors), unlike Alt+Enter which varies by app. Shown as the return glyph.
-            FilledTonalButton(onClick = { commitCombo("shift enter") }, shapes = ButtonDefaults.shapes(),
-                contentPadding = keyPad, modifier = Modifier.weight(1f)) {
-                Icon(Icons.AutoMirrored.Filled.KeyboardReturn,
-                    contentDescription = "New line (Shift+Enter)", modifier = Modifier.size(20.dp))
             }
         }
     }

@@ -6,7 +6,8 @@ import org.junit.Test
 /**
  * [keyboardDelta] turns an edit of the phone's text field into what the laptop
  * must receive. The laptop's caret sits at the end of what was sent, so every
- * case is "backspace this many, then type this".
+ * case is "backspace this many, then type this". [keyboardOps] is the same edit
+ * as the keystrokes that carry it out.
  */
 class KeyboardDeltaTest {
 
@@ -37,4 +38,21 @@ class KeyboardDeltaTest {
     // emoji on the laptop and then type the other half on its own.
     @Test fun swappingEmojiNeverSplitsASurrogatePair() =
         assertEquals(1 to "😃", keyboardDelta("hi 😀", "hi 😃"))
+
+    // --- keyboardOps: line breaks go out as Shift+Enter, never a bare Enter ---
+
+    @Test fun lineBreakIsSentAsNewLine() =
+        assertEquals(listOf(KeyOp.NewLine), keyboardOps("hi", "hi\n"))
+
+    @Test fun textAfterALineBreakIsTypedAfterTheNewLine() =
+        assertEquals(listOf(KeyOp.NewLine, KeyOp.Type("yo")), keyboardOps("hi", "hi\nyo"))
+
+    @Test fun pastedLinesAlternateTextAndNewLines() =
+        assertEquals(
+            listOf(KeyOp.Type("a"), KeyOp.NewLine, KeyOp.NewLine, KeyOp.Type("b")),
+            keyboardOps("", "a\n\nb"),
+        )
+
+    @Test fun backspacingOverALineBreakIsOneBackspace() =
+        assertEquals(listOf(KeyOp.Backspace, KeyOp.Backspace), keyboardOps("a\nb", "a"))
 }

@@ -750,9 +750,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun onKeyboardInput(old: String, new: String) {
         touch()
-        val (backspaces, typed) = keyboardDelta(old, new)
-        repeat(backspaces) { client.keySpecial("backspace") }
-        if (typed.isNotEmpty()) client.key(typed)
+        for (op in keyboardOps(old, new)) when (op) {
+            KeyOp.Backspace -> client.keySpecial("backspace")
+            KeyOp.NewLine -> client.combo("shift enter")
+            is KeyOp.Type -> client.key(op.text)
+        }
     }
 
     fun specialKey(name: String) {
@@ -810,4 +812,31 @@ internal fun keyboardDelta(old: String, new: String): Pair<Int, String> {
     // Count characters, not UTF-16 units: one backspace on the laptop removes a
     // whole emoji, which is two units here.
     return old.codePointCount(common, old.length) to new.substring(common)
+}
+
+/** One thing to send the laptop while mirroring the phone's text field. */
+internal sealed interface KeyOp {
+    data object Backspace : KeyOp
+    data object NewLine : KeyOp
+    data class Type(val text: String) : KeyOp
+}
+
+/**
+ * [keyboardDelta] as the keystrokes that carry it out.
+ *
+ * A line break typed on the phone becomes Shift+Enter, not a literal newline:
+ * typed as text it arrives as Enter, which submits in chat apps and many forms.
+ * Shift+Enter is the near-universal "new line without sending". Backspacing
+ * over a line break needs nothing special: one backspace removes it on the
+ * laptop too.
+ */
+internal fun keyboardOps(old: String, new: String): List<KeyOp> {
+    val (backspaces, typed) = keyboardDelta(old, new)
+    return buildList {
+        repeat(backspaces) { add(KeyOp.Backspace) }
+        typed.split('\n').forEachIndexed { i, part ->
+            if (i > 0) add(KeyOp.NewLine)
+            if (part.isNotEmpty()) add(KeyOp.Type(part))
+        }
+    }
 }
