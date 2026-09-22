@@ -1699,6 +1699,28 @@ def singleton_acquire(poke=True):
         return "solo", None
 
 
+def _reclaim_singleton_port(dead):
+    """Re-bind the single-instance port after its socket died. Retries until it
+    succeeds or we are stopping (returns None then)."""
+    try:
+        dead.close()
+    except OSError:
+        pass
+    while not _stop.is_set():
+        lsock = None
+        try:
+            lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            lsock.bind(("127.0.0.1", SINGLETON_PORT))
+            lsock.listen(1)
+            lsock.settimeout(0.5)
+            return lsock
+        except OSError:
+            if lsock is not None:
+                lsock.close()
+            _stop.wait(0.5)
+    return None
+
+
 def singleton_serve(lsock, eq):
     """Accept loopback pokes from later launches: SHOW surfaces the window;
     RESUME clears a panic latch (the terminal has no Resume button — --resume)."""
@@ -1707,8 +1729,23 @@ def singleton_serve(lsock, eq):
             conn, _ = lsock.accept()
         except socket.timeout:
             continue
+        except (ConnectionResetError, ConnectionAbortedError):
+            # One queued caller hung up before we accepted it (Windows reports a
+            # reset there). The listener is fine; reclaiming it would free the port
+            # for a moment, long enough for a launch to slip in as a second owner.
+            continue
         except OSError:
-            break
+            # The listening socket died under us. This used to `break`, closing
+            # the port for good, and the next launch found it free, became the
+            # owner, and opened a second server next to this one. Seen on a copy
+            # that had been up for two days. Take the port back instead.
+            lsock = _reclaim_singleton_port(lsock)
+            if lsock is None:
+                return
+            # If a fresh socket fails the same way, retry at this pace rather
+            # than spinning a core on close/rebind.
+            _stop.wait(0.5)
+            continue
         cmd = b""
         try:
             cmd = conn.recv(16)
@@ -2855,6 +2892,7 @@ class LazeRWindow:
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._tray = None
+        self._tray_thread = None
         self._setup_tray()
         self._log("Server started", "ok")
         self._poll()
@@ -2879,7 +2917,8 @@ class LazeRWindow:
             pystray.MenuItem("Quit", self._tray_quit),
         )
         self._tray = pystray.Icon("LazeR", img, "LazeR — LAN remote", menu)
-        threading.Thread(target=self._tray.run, daemon=True).start()
+        self._tray_thread = threading.Thread(target=self._tray.run, daemon=True)
+        self._tray_thread.start()
 
     def _tray_show(self, icon=None, item=None):
         self._root.after(0, self._restore)
@@ -3771,6 +3810,11 @@ class LazeRWindow:
 
     def run(self):
         self._root.mainloop()
+        # Icon.stop() only asks the tray thread to remove the icon. The process is
+        # ended outright after this, so wait for the removal, or a dead LazeR icon
+        # stays in the notification area until the mouse passes over it.
+        if self._tray_thread is not None:
+            self._tray_thread.join(timeout=1)
 
 
 # ── terminal mode ─────────────────────────────────────────────────────────────
@@ -3897,14 +3941,58 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
     except KeyboardInterrupt:
         pass
     finally:
-        _stop.set()
-        if net["zc"]:
-            try:
-                net["zc"].unregister_service(net["info"])
-                net["zc"].close()
-            except Exception:
-                pass
+        _exit_watchdog()
+        try:
+            _stop.set()
+            _stop_mdns(net)
+        except KeyboardInterrupt:
+            pass    # a second Ctrl+C during cleanup still ends in _exit_process
     print("\nServer stopped.")
+    _exit_process(0)
+
+
+def _stop_mdns(net):
+    """Withdraw our mDNS announcement, on a time limit. A zeroconf call that
+    blocks here must not keep a quitting process alive."""
+    if not net["zc"]:
+        return
+
+    def work():
+        try:
+            net["zc"].unregister_service(net["info"])
+            net["zc"].close()
+        except Exception:
+            pass
+    w = threading.Thread(target=work, daemon=True)
+    w.start()
+    w.join(timeout=3)
+
+
+def _exit_process(code=0):
+    """End the process now, once shutdown cleanup has run.
+
+    A normal return leaves exit to interpreter finalization, and a copy of the
+    server was found still running two days after it had stopped serving: no
+    window, neither port held, yet the process never ended. The cause wasn't
+    reproduced (a plain quit, one with a phone's audio reads, and one with input
+    flowing through the hooks all exited cleanly), so this closes off the
+    outcome: after our own cleanup nothing is left worth waiting for."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
+
+
+def _exit_watchdog(seconds=10.0):
+    """Backstop for the one way out that skips _exit_process: an exception on
+    its way up, left to propagate so its traceback (or the exe's error dialog)
+    still appears. If the process is still alive [seconds] later, end it. Longer
+    than the cleanup's own limits (2s serve join + 3s mDNS)."""
+    t = threading.Timer(seconds, os._exit, args=(1,))
+    t.daemon = True
+    t.start()
 
 
 # ── local-takeover event helpers (shared by GUI + terminal) ──────────────────
@@ -4074,16 +4162,15 @@ def main():
             except KeyboardInterrupt:
                 pass
             finally:
-                _stop.set()
-                t.join(timeout=2)
-                if net["zc"]:
-                    try:
-                        net["zc"].unregister_service(net["info"])
-                        net["zc"].close()
-                    except Exception:
-                        pass
-                print("Server stopped.")
-            return
+                _exit_watchdog()
+                try:
+                    _stop.set()
+                    t.join(timeout=2)
+                    _stop_mdns(net)
+                    print("Server stopped.")
+                except KeyboardInterrupt:
+                    pass
+            _exit_process(0)
 
     run_terminal(token, key, ip, require_secure,
                  update_check=not args.no_update_check)
