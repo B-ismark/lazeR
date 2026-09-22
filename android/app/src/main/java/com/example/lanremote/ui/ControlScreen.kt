@@ -5,14 +5,14 @@ import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.SizeTransform
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -21,7 +21,6 @@ import androidx.compose.foundation.layout.displayCutoutPadding
 import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.animation.core.animate
-import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.offset
 import androidx.compose.material.icons.filled.KeyboardDoubleArrowLeft
@@ -76,6 +75,7 @@ import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Keyboard
+import androidx.compose.material.icons.filled.PanTool
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.PauseCircle
@@ -101,7 +101,6 @@ import androidx.compose.material3.MaterialShapes
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationRailItem
-import androidx.compose.material3.Surface
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -187,7 +186,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
     var fullscreen by rememberSaveable { mutableStateOf(false) }
     var showAdvanced by rememberSaveable { mutableStateOf(false) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
-    // Which slide-out panel the landscape deck has open (null = pad only).
+    // Which panel the landscape deck has docked open (null = pad only).
     var deckPanel by rememberSaveable { mutableStateOf<DeckPanel?>(null) }
 
     // Wider than tall = landscape deck. Read from the configuration, which the
@@ -228,7 +227,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
         if (fullscreen) {
             fullscreen = false
         } else if (landscape && deckPanel != null) {
-            // An open slide-out panel is the innermost layer — back closes it first.
+            // An open docked panel is the innermost layer — back closes it first.
             deckPanel = null
         } else {
             val now = SystemClock.elapsedRealtime()
@@ -620,6 +619,7 @@ private fun KeyboardPanel(a: ControlActions) {
 private fun ClickBar(
     a: ControlActions,
     modifier: Modifier = Modifier,
+    compact: Boolean = false,
     trailing: (@Composable () -> Unit)? = null,
 ) {
     Row(
@@ -633,11 +633,12 @@ private fun ClickBar(
             overflowIndicator = { },
             modifier = Modifier.weight(3f),
         ) {
-            clickableItem(onClick = a.onClick, label = "Left", weight = 1f)
-            clickableItem(onClick = a.onMiddleClick, label = "Middle", weight = 1f)
-            clickableItem(onClick = a.onRightClick, label = "Right", weight = 1f)
+            clickableItem(onClick = a.onClick, label = if (compact) "L" else "Left", weight = 1f)
+            clickableItem(onClick = a.onMiddleClick, label = if (compact) "M" else "Middle", weight = 1f)
+            clickableItem(onClick = a.onRightClick, label = if (compact) "R" else "Right", weight = 1f)
         }
-        HoldDragButton(a.onDragStart, a.onDragEnd, modifier = Modifier.weight(1.2f))
+        HoldDragButton(a.onDragStart, a.onDragEnd, compact = compact,
+            modifier = Modifier.weight(if (compact) 1f else 1.2f))
         // Optional trailing affordance (e.g. the fullscreen-exit button) sits after the
         // hold-drag button without stealing width from the connected group.
         trailing?.invoke()
@@ -651,6 +652,7 @@ private fun HoldDragButton(
     onDragStart: () -> Unit,
     onDragEnd: () -> Unit,
     modifier: Modifier = Modifier,
+    compact: Boolean = false,
 ) {
     val src = remember { MutableInteractionSource() }
     val pressed by src.collectIsPressedAsState()
@@ -659,8 +661,19 @@ private fun HoldDragButton(
         if (pressed) { onDragStart(); wasPressed = true }
         else if (wasPressed) { onDragEnd(); wasPressed = false }
     }
-    OutlinedButton(onClick = {}, interactionSource = src, modifier = modifier) {
-        Text(if (pressed) "Drag…" else "Hold drag")
+    OutlinedButton(
+        onClick = {},
+        interactionSource = src,
+        modifier = modifier,
+        contentPadding = if (compact) PaddingValues(horizontal = 8.dp)
+            else ButtonDefaults.ContentPadding,
+    ) {
+        if (compact) {
+            Icon(Icons.Filled.PanTool, contentDescription = "Hold drag",
+                modifier = Modifier.size(20.dp))
+        } else {
+            Text(if (pressed) "Drag…" else "Hold drag")
+        }
     }
 }
 
@@ -969,10 +982,12 @@ private fun ScrollStrip(onScroll: (Int, Int) -> Unit, natural: () -> Boolean) {
 
 // ---------------------------------------------------------------------------
 // Landscape: the "laptop deck". The trackpad takes the full width with the click
-// bar under it, like a laptop's palm rest; the top bar and the Media / Keyboard
-// panel fold into a navigation rail, and those panels slide out over the pad on
-// demand. The portrait stack simply doesn't fit a 360dp-tall screen — the panel
-// ate the height and pushed the pad and click bar off the bottom edge.
+// bar under it, like a laptop's palm rest; the top bar folds into a navigation
+// rail. Media and Keys open a panel DOCKED beside the rail that pushes the pad
+// over. Never an overlay: a sheet opened from the rail (Advanced -> Display) is
+// then the only modal on screen, not a modal stacked on a modal. The portrait
+// stack doesn't fit a 360dp-tall screen: its panel ate the height and pushed
+// the pad and click bar off the bottom edge.
 // ---------------------------------------------------------------------------
 private enum class DeckPanel { Media, Keyboard }
 
@@ -990,12 +1005,21 @@ private fun LandscapeDeck(
 ) {
     fun toggle(p: DeckPanel) { a.onButtonTap(); onPanel(if (panel == p) null else p) }
 
+    // Typing sideways: the phone's keyboard covers over half the screen, so the
+    // pad steps aside and the Keys panel takes the whole width above it.
+    val typing = panel == DeckPanel.Keyboard && WindowInsets.isImeVisible
+
+    // The panel keeps showing its last content while it collapses, so closing
+    // doesn't blank it mid-animation.
+    var lastPanel by remember { mutableStateOf(DeckPanel.Media) }
+    if (panel != null) lastPanel = panel
+
     Row(
         Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.surface)
-            // Status bar, side nav bar and camera cutout. The IME is handled only
-            // by the main area below, so the rail keeps its full height while typing.
+            // Status bar, side nav bar and camera cutout. The IME is handled per
+            // column below, so the rail keeps its full height while typing.
             .systemBarsPadding()
             .displayCutoutPadding(),
     ) {
@@ -1008,8 +1032,25 @@ private fun LandscapeDeck(
             onFullscreen = onFullscreen,
         )
 
-        Box(Modifier.weight(1f).fillMaxHeight().imePadding()) {
-            Column(Modifier.fillMaxSize().padding(top = 8.dp, end = 16.dp, bottom = 12.dp)) {
+        // A plain, quick width change: the pad is pushed over, nothing slides on
+        // top of it and nothing bounces.
+        AnimatedVisibility(
+            visible = panel != null,
+            enter = expandHorizontally(tween(180)),
+            exit = shrinkHorizontally(tween(160)),
+            modifier = if (typing) Modifier.weight(1f) else Modifier,
+        ) {
+            DockedPanel(lastPanel, state, a, wide = typing, onClose = { onPanel(null) })
+        }
+
+        if (!typing) {
+            Column(
+                Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .imePadding()
+                    .padding(top = 8.dp, end = 16.dp, bottom = 12.dp),
+            ) {
                 TrackpadCard(
                     modifier = Modifier.fillMaxWidth().weight(1f),
                     a = a,
@@ -1017,47 +1058,9 @@ private fun LandscapeDeck(
                     stripLeft = state.settings.scrollStripLeft,
                 )
                 Spacer(Modifier.height(10.dp))
-                ClickBar(a)
-            }
-
-            // Scrim: dims the pad while a panel is out, and a tap on it closes the
-            // panel. It sits above the pad, so that tap never reaches the laptop
-            // as a click. A faded alpha rather than AnimatedVisibility: inside this
-            // Row the RowScope overload wins resolution and won't compile here.
-            // Dropped from composition once faded out, so it never eats touches.
-            val scrimAlpha by animateFloatAsState(
-                targetValue = if (panel != null) 0.32f else 0f,
-                label = "scrim",
-            )
-            if (scrimAlpha > 0f) {
-                Box(
-                    Modifier
-                        .fillMaxSize()
-                        .background(MaterialTheme.colorScheme.scrim.copy(alpha = scrimAlpha))
-                        .clickable(
-                            interactionSource = remember { MutableInteractionSource() },
-                            indication = null,
-                        ) { onPanel(null) },
-                )
-            }
-
-            // Slides in from the rail edge. Switching Media ↔ Keyboard cross-fades
-            // in place rather than sliding out and back in.
-            AnimatedContent(
-                targetState = panel,
-                transitionSpec = {
-                    val swap = if (initialState != null && targetState != null) {
-                        fadeIn() togetherWith fadeOut()
-                    } else {
-                        (slideInHorizontally { -it } + fadeIn()) togetherWith
-                            (slideOutHorizontally { -it } + fadeOut())
-                    }
-                    swap using SizeTransform(clip = false)
-                },
-                modifier = Modifier.fillMaxHeight(),
-                label = "deckPanel",
-            ) { p ->
-                if (p != null) DeckPanelSheet(p, state, a, onClose = { onPanel(null) })
+                // With a panel open the pad is narrower, so the bar drops its words
+                // for L / M / R and a drag glyph instead of squeezing the labels.
+                ClickBar(a, compact = panel != null)
             }
         }
     }
@@ -1120,53 +1123,45 @@ private fun DeckRail(
     }
 }
 
-/** The slide-out itself: the same Media and Keyboard panels as portrait, at
+/** The docked panel: the same Media and Keyboard panels as portrait, at
  *  portrait's content width (360dp less padding), so neither needed a second
- *  layout. While the phone's keyboard is up it widens to the full area and drops
- *  its header — the IME covers over half a landscape screen, and what's left
- *  belongs to the text field. */
-@OptIn(ExperimentalLayoutApi::class)
+ *  layout. [wide] = typing with the phone's keyboard up: it fills the row and
+ *  drops its header, since what's left of the screen belongs to the text field. */
 @Composable
-private fun DeckPanelSheet(
+private fun DockedPanel(
     panel: DeckPanel,
     state: UiState,
     a: ControlActions,
+    wide: Boolean,
     onClose: () -> Unit,
 ) {
-    val typing = panel == DeckPanel.Keyboard && WindowInsets.isImeVisible
-    Surface(
-        modifier = Modifier
+    Column(
+        Modifier
             .fillMaxHeight()
-            .then(if (typing) Modifier.fillMaxWidth() else Modifier.width(360.dp)),
-        shape = RoundedCornerShape(topEnd = 28.dp, bottomEnd = 28.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-        shadowElevation = 6.dp,
+            .then(if (wide) Modifier.fillMaxWidth() else Modifier.width(344.dp))
+            .imePadding()
+            .verticalScroll(rememberScrollState())
+            .padding(start = 4.dp, end = 16.dp, top = 4.dp, bottom = 12.dp),
     ) {
-        Column(
-            Modifier
-                .verticalScroll(rememberScrollState())
-                .padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 16.dp),
-        ) {
-            if (!typing) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        if (panel == DeckPanel.Media) "Media" else "Keyboard",
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.weight(1f),
-                    )
-                    IconButton(onClick = onClose) {
-                        Icon(Icons.Filled.Close, contentDescription = "Close panel")
-                    }
+        if (!wide) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    if (panel == DeckPanel.Media) "Media" else "Keyboard",
+                    style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f).padding(start = 4.dp),
+                )
+                IconButton(onClick = onClose) {
+                    Icon(Icons.Filled.Close, contentDescription = "Close panel")
                 }
-            } else {
-                Spacer(Modifier.height(8.dp))
             }
-            // KeyboardPanel takes no UiState on purpose — see ControlsPanel.
-            if (panel == DeckPanel.Media) MediaPanel(state, a) else KeyboardPanel(a)
+        } else {
+            Spacer(Modifier.height(8.dp))
         }
+        // KeyboardPanel takes no UiState on purpose; see ControlsPanel.
+        if (panel == DeckPanel.Media) MediaPanel(state, a) else KeyboardPanel(a)
     }
 }
 
