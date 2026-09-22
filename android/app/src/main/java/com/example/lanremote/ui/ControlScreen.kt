@@ -33,7 +33,7 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
-import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.layout.findRootCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
@@ -955,13 +955,17 @@ private fun Modifier.clearOfBackGesture(): Modifier {
     val gestures = WindowInsets.systemGestures
     val zoneLeft = gestures.getLeft(density, LayoutDirection.Ltr)
     val zoneRight = gestures.getRight(density, LayoutDirection.Ltr)
-    var clearance by remember { mutableStateOf(0 to 0) }
+    // Where the element sits (left, right, root width; px), not the answer: the zones
+    // can change without it moving (Back sensitivity), and the answer must follow.
+    var span by remember { mutableStateOf<Triple<Float, Float, Float>?>(null) }
+    val clearance = span?.let { (l, r, w) -> backZoneClearance(l, r, w, zoneLeft, zoneRight) }
+        ?: (0 to 0)
     return this
         // Measured outside the padding it adds, so the padding can't feed back into it.
+        // Root-relative and unclipped; the root is the window (edge to edge).
         .onGloballyPositioned { c ->
-            val b = c.boundsInWindow()
-            clearance = backZoneClearance(b.left, b.right,
-                c.findRootCoordinates().size.width.toFloat(), zoneLeft, zoneRight)
+            val x = c.positionInRoot().x
+            span = Triple(x, x + c.size.width, c.findRootCoordinates().size.width.toFloat())
         }
         .absolutePadding(
             left = with(density) { clearance.first.toDp() },
