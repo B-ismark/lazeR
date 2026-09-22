@@ -1699,6 +1699,28 @@ def singleton_acquire(poke=True):
         return "solo", None
 
 
+def _reclaim_singleton_port(dead):
+    """Re-bind the single-instance port after its socket died. Retries until it
+    succeeds or we are stopping (returns None then)."""
+    try:
+        dead.close()
+    except OSError:
+        pass
+    while not _stop.is_set():
+        lsock = None
+        try:
+            lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            lsock.bind(("127.0.0.1", SINGLETON_PORT))
+            lsock.listen(1)
+            lsock.settimeout(0.5)
+            return lsock
+        except OSError:
+            if lsock is not None:
+                lsock.close()
+            _stop.wait(0.5)
+    return None
+
+
 def singleton_serve(lsock, eq):
     """Accept loopback pokes from later launches: SHOW surfaces the window;
     RESUME clears a panic latch (the terminal has no Resume button — --resume)."""
@@ -1708,7 +1730,14 @@ def singleton_serve(lsock, eq):
         except socket.timeout:
             continue
         except OSError:
-            break
+            # The listening socket died under us. This used to `break`, closing
+            # the port for good, and the next launch found it free, became the
+            # owner, and opened a second server next to this one. Seen on a copy
+            # that had been up for two days. Take the port back instead.
+            lsock = _reclaim_singleton_port(lsock)
+            if lsock is None:
+                return
+            continue
         cmd = b""
         try:
             cmd = conn.recv(16)
@@ -3898,13 +3927,43 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
         pass
     finally:
         _stop.set()
-        if net["zc"]:
-            try:
-                net["zc"].unregister_service(net["info"])
-                net["zc"].close()
-            except Exception:
-                pass
+        _stop_mdns(net)
     print("\nServer stopped.")
+    _exit_process(0)
+
+
+def _stop_mdns(net):
+    """Withdraw our mDNS announcement, on a time limit. A zeroconf call that
+    blocks here must not keep a quitting process alive."""
+    if not net["zc"]:
+        return
+
+    def work():
+        try:
+            net["zc"].unregister_service(net["info"])
+            net["zc"].close()
+        except Exception:
+            pass
+    w = threading.Thread(target=work, daemon=True)
+    w.start()
+    w.join(timeout=3)
+
+
+def _exit_process(code=0):
+    """End the process now, once shutdown cleanup has run.
+
+    A normal return leaves exit to interpreter finalization, and a copy of the
+    server was found still running two days after it had stopped serving: no
+    window, neither port held, yet the process never ended. The cause wasn't
+    reproduced (a plain quit, one with a phone's audio reads, and one with input
+    flowing through the hooks all exited cleanly), so this closes off the
+    outcome: after our own cleanup nothing is left worth waiting for."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(code)
 
 
 # ── local-takeover event helpers (shared by GUI + terminal) ──────────────────
@@ -4076,14 +4135,9 @@ def main():
             finally:
                 _stop.set()
                 t.join(timeout=2)
-                if net["zc"]:
-                    try:
-                        net["zc"].unregister_service(net["info"])
-                        net["zc"].close()
-                    except Exception:
-                        pass
+                _stop_mdns(net)
                 print("Server stopped.")
-            return
+            _exit_process(0)
 
     run_terminal(token, key, ip, require_secure,
                  update_check=not args.no_update_check)

@@ -1543,6 +1543,54 @@ class LoopSupervision(unittest.TestCase):
         self.assertEqual(len(calls), 1, "a normal shutdown was treated as a crash")
 
 
+class SingletonGuardSurvivesSocketLoss(unittest.TestCase):
+    """The loopback single-instance port must stay claimed while we run.
+
+    singleton_serve used to stop for good on the first socket error from accept()
+    and close the port. That left a running copy that no longer said "I'm here":
+    the next launch found the port free, became the owner, and a second server
+    opened next to the first. Seen after two days of uptime, with the old copy
+    holding neither 50505 nor the guard port."""
+
+    def setUp(self):
+        rs._stop.clear()
+        self.addCleanup(rs._stop.clear)
+        # A free loopback port, so the test never touches a real install's 50506.
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        patcher = mock.patch.object(rs, "SINGLETON_PORT", port)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_guard_reclaims_its_port_after_the_socket_dies(self):
+        kind, lsock = rs.singleton_acquire(poke=False)
+        self.assertEqual(kind, "owner")
+        t = threading.Thread(target=rs.singleton_serve, args=(lsock, mock.Mock()),
+                             daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        self.addCleanup(rs._stop.set)
+
+        lsock.close()   # the listening socket dies under the serving thread
+
+        # A later launch must still see us, within a few seconds. Give the
+        # serving thread a moment first so our probe doesn't race its rebind.
+        time.sleep(1.0)
+        deadline = time.monotonic() + 5
+        kind = None
+        while time.monotonic() < deadline:
+            kind, other = rs.singleton_acquire(poke=False)
+            if other is not None:
+                other.close()   # we accidentally became owner; release and retry
+            if kind == "existing":
+                break
+            time.sleep(0.2)
+        self.assertEqual(kind, "existing",
+                         "the guard port was dropped, so a second copy could start")
+
+
 class PublishableAddress(unittest.TestCase):
     """lan_ip() falls back to 127.0.0.1 so the GUI always has something to draw.
 
