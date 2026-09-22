@@ -571,7 +571,7 @@ class Dispatch(unittest.TestCase):
                                  "<Key.shift>", "<Key.ctrl>"])
 
     def test_combo_special_target(self):
-        rs.do_combo("shift enter")           # the KeyboardPanel's "new line" key
+        rs.do_combo("shift enter")           # a line break typed in the phone's text field
         self.assertEqual(rs.keyboard.calls[1], ("press", "<Key.enter>"))
 
     def test_combo_with_no_target_is_a_noop(self):

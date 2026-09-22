@@ -809,10 +809,27 @@ internal fun keyboardDelta(old: String, new: String): Pair<Int, String> {
     // commonPrefixWith never ends on half a surrogate pair, so an emoji is
     // always deleted and retyped whole.
     val common = old.commonPrefixWith(new).length
-    // Count characters, not UTF-16 units: one backspace on the laptop removes a
-    // whole emoji, which is two units here.
+    // Count code points, not UTF-16 units: one backspace on the laptop removes a
+    // single-code-point emoji (two units here) whole. Emoji built from several
+    // code points (flags, skin tones, ZWJ families) are where targets disagree:
+    // Chromium-based apps delete the whole cluster with one backspace, so there
+    // the extra backspaces eat into the text before it. No single count fits
+    // every app; per code point is right for the common case.
     return old.codePointCount(common, old.length) to new.substring(common)
 }
+
+/** [s] minus its last character, never splitting a surrogate pair. The
+ *  on-screen Backspace trims the buffer with this, so the buffer and the laptop
+ *  lose the same thing: half an emoji left behind would cost one more backspace
+ *  later and leave the two out of step. */
+internal fun dropLastCodePoint(s: String): String =
+    if (s.isEmpty()) s else s.substring(0, s.offsetByCodePoints(s.length, -1))
+
+/** Line breaks in one form. A paste from a CRLF source carries "\r\n", and a
+ *  bare '\r' typed as text reaches the laptop as Enter: the submit that the
+ *  Shift+Enter mapping exists to avoid. */
+private fun normalizeLineBreaks(s: String): String =
+    if ('\r' !in s) s else s.replace("\r\n", "\n").replace('\r', '\n')
 
 /** One thing to send the laptop while mirroring the phone's text field. */
 internal sealed interface KeyOp {
@@ -828,10 +845,10 @@ internal sealed interface KeyOp {
  * typed as text it arrives as Enter, which submits in chat apps and many forms.
  * Shift+Enter is the near-universal "new line without sending". Backspacing
  * over a line break needs nothing special: one backspace removes it on the
- * laptop too.
+ * laptop too, including one that arrived as "\r\n".
  */
 internal fun keyboardOps(old: String, new: String): List<KeyOp> {
-    val (backspaces, typed) = keyboardDelta(old, new)
+    val (backspaces, typed) = keyboardDelta(normalizeLineBreaks(old), normalizeLineBreaks(new))
     return buildList {
         repeat(backspaces) { add(KeyOp.Backspace) }
         typed.split('\n').forEachIndexed { i, part ->

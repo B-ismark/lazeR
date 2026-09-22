@@ -55,4 +55,25 @@ class KeyboardDeltaTest {
 
     @Test fun backspacingOverALineBreakIsOneBackspace() =
         assertEquals(listOf(KeyOp.Backspace, KeyOp.Backspace), keyboardOps("a\nb", "a"))
+
+    // A CRLF paste: the '\r' would otherwise be typed, and arrive as Enter.
+    @Test fun pastedCrlfIsOneNewLineAndNoEnter() =
+        assertEquals(
+            listOf(KeyOp.Type("a"), KeyOp.NewLine, KeyOp.Type("b")),
+            keyboardOps("", "a\r\nb"),
+        )
+
+    @Test fun backspacingOverACrlfIsOneBackspace() =
+        assertEquals(listOf(KeyOp.Backspace, KeyOp.Backspace), keyboardOps("a\r\nb", "a"))
+
+    // --- dropLastCodePoint: the on-screen Backspace's edit of the buffer ---
+
+    @Test fun onScreenBackspaceDropsOneLetter() =
+        assertEquals("ok", dropLastCodePoint("oka"))
+
+    @Test fun onScreenBackspaceDropsAWholeEmoji() =
+        assertEquals("ok", dropLastCodePoint("ok😀"))
+
+    @Test fun onScreenBackspaceOnEmptyIsEmpty() =
+        assertEquals("", dropLastCodePoint(""))
 }

@@ -114,6 +114,7 @@ import androidx.compose.material3.toShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -134,6 +135,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.lanremote.UiState
+import com.example.lanremote.dropLastCodePoint
 import kotlin.math.abs
 import kotlin.math.hypot
 
@@ -195,6 +197,15 @@ fun ControlScreen(state: UiState, a: ControlActions) {
     // layout without recreating anything or touching the session.
     val config = LocalConfiguration.current
     val landscape = config.screenWidthDp > config.screenHeightDp
+
+    // The Keys text lives here, not in KeyboardPanel: portrait and the deck call
+    // KeyboardPanel from different places, so a buffer kept inside it was thrown
+    // away on every rotation while the laptop kept the text. The phone's delete
+    // key on the emptied field then had nothing to delete. See KeyboardPanel for
+    // why it is a TextFieldValue.
+    val keysBuffer = rememberSaveable(stateSaver = TextFieldValue.Saver) {
+        mutableStateOf(TextFieldValue(""))
+    }
 
     val view = LocalView.current
     val context = LocalContext.current
@@ -275,6 +286,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
             state = state,
             a = a,
             natural = naturalScrollState,
+            keysBuffer = keysBuffer,
             panel = deckPanel,
             onPanel = { deckPanel = it },
             onAdvanced = { showAdvanced = true },
@@ -316,7 +328,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
                     .imePadding()
                     .padding(horizontal = 16.dp, vertical = 8.dp),
             ) {
-                ControlsPanel(state, a)
+                ControlsPanel(state, a, keysBuffer)
                 Spacer(Modifier.height(12.dp))
                 TrackpadCard(
                     modifier = Modifier.fillMaxWidth().weight(1f).heightIn(min = 220.dp),
@@ -343,7 +355,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
 // ---------------------------------------------------------------------------
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun ControlsPanel(state: UiState, a: ControlActions) {
+private fun ControlsPanel(state: UiState, a: ControlActions, keysBuffer: MutableState<TextFieldValue>) {
     var tab by rememberSaveable { mutableIntStateOf(0) } // 0 = Media, 1 = Keyboard
 
     Column {
@@ -381,7 +393,7 @@ private fun ControlsPanel(state: UiState, a: ControlActions) {
             // KeyboardPanel takes no UiState on purpose — it owns its own text, so
             // nothing an unrelated state change does can disturb the IME session.
             if (which == 0) MediaPanel(state, a)
-            else KeyboardPanel(a)
+            else KeyboardPanel(a, keysBuffer, maxFieldLines = 3)
         }
     }
 }
@@ -504,8 +516,12 @@ private fun PressIconButton(
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun KeyboardPanel(a: ControlActions) {
-    // The text field owns its editing state, as a TextFieldValue rather than a String.
+private fun KeyboardPanel(
+    a: ControlActions,
+    bufferState: MutableState<TextFieldValue>,
+    maxFieldLines: Int,
+) {
+    // The text field has its own editing state, as a TextFieldValue rather than a String.
     //
     // This is the fix for text vanishing from the phone while the laptop kept it.
     // The value used to come from the shared UiState, which the health loop rewrites
@@ -514,11 +530,10 @@ private fun KeyboardPanel(a: ControlActions) {
     // re-fed the field and Gboard's uncommitted (underlined) text was discarded —
     // while onKeyboardInput had already put those characters on the wire.
     //
-    // Keeping the state local and typed means recomposition is now a no-op for the
-    // field: it re-reads the same object, so the IME session is left untouched.
-    var buffer by rememberSaveable(stateSaver = TextFieldValue.Saver) {
-        mutableStateOf(TextFieldValue(""))
-    }
+    // Keeping the state separate and typed means recomposition is now a no-op for
+    // the field: it re-reads the same object, so the IME session is left untouched.
+    // ControlScreen holds it, so it survives rotating between layouts.
+    var buffer by bufferState
 
     /** Replace the buffer, keeping the caret at the end. */
     fun setBuffer(text: String) {
@@ -527,9 +542,10 @@ private fun KeyboardPanel(a: ControlActions) {
 
     // The buffer is a staging copy of what we've sent since the last commit, so the
     // diff in onKeyboardInput always has a truthful `old`. Keys that can be
-    // represented as text edit it; keys that can't (enter/tab/esc/newline move focus
-    // or commit) reset it, because after those the laptop's caret is somewhere the
-    // buffer can no longer describe. Previously none of these touched it at all, so
+    // represented as text edit it; keys that can't (Enter/Tab/Esc submit or move
+    // focus) reset it, because after those the laptop's caret is somewhere the
+    // buffer can no longer describe. A line break from the phone's own keyboard is
+    // text, so it stays in the buffer. Previously none of these touched it at all, so
     // the buffer drifted and the next keystroke diffed against a stale string —
     // firing a spurious backspace-and-retype burst.
     fun backspace() {
@@ -537,7 +553,7 @@ private fun KeyboardPanel(a: ControlActions) {
         // Always send, even when our buffer is already empty: after an Enter the
         // buffer is cleared but the laptop still has text the user may want to delete.
         a.onSpecialKey("backspace")
-        if (buffer.text.isNotEmpty()) setBuffer(buffer.text.dropLast(1))
+        if (buffer.text.isNotEmpty()) setBuffer(dropLastCodePoint(buffer.text))
     }
 
     fun space() {
@@ -555,9 +571,8 @@ private fun KeyboardPanel(a: ControlActions) {
     SectionCard {
         // Long text wraps and the field grows, rather than one line sliding
         // sideways out of view. Capped so it can't eat the screen: sideways there
-        // is room for two lines above the phone's keyboard, upright for three.
-        val config = LocalConfiguration.current
-        val maxFieldLines = if (config.screenWidthDp > config.screenHeightDp) 2 else 3
+        // is room for two lines above the phone's keyboard, upright for three
+        // (the caller passes [maxFieldLines], since it knows which layout it is).
         OutlinedTextField(
             value = buffer,
             onValueChange = { next ->
@@ -663,6 +678,13 @@ private fun HoldDragButton(
         if (pressed) { onDragStart(); wasPressed = true }
         else if (wasPressed) { onDragEnd(); wasPressed = false }
     }
+    // Rotating rebuilds the click bar in the other layout, and the deck drops it
+    // while typing. Leaving mid-hold must still let go of the laptop's button,
+    // or it stays down until the next click.
+    val latestDragEnd by rememberUpdatedState(onDragEnd)
+    DisposableEffect(Unit) {
+        onDispose { if (wasPressed) latestDragEnd() }
+    }
     OutlinedButton(
         onClick = {},
         interactionSource = src,
@@ -718,7 +740,9 @@ private fun Modifier.trackpadInput(
     var evGap = 0f                  // decaying evidence: net spread (gap) change
     var evPanX = 0f                 // decaying evidence: net centroid x-travel
     var evPanY = 0f                 // decaying evidence: net centroid y-travel
-    awaitPointerEventScope {
+    // The pad can leave mid-gesture (rotating swaps layouts). An open app switch
+    // must still commit, or the laptop keeps Alt held.
+    try { awaitPointerEventScope {
         while (true) {
             val event = awaitPointerEvent()
             val pressed = event.changes.filter { it.pressed }
@@ -831,6 +855,8 @@ private fun Modifier.trackpadInput(
                 }
             }
         }
+    } } finally {
+        if (switching) onSwitchEnd()
     }
 }
 
@@ -999,6 +1025,7 @@ private fun LandscapeDeck(
     state: UiState,
     a: ControlActions,
     natural: State<Boolean>,
+    keysBuffer: MutableState<TextFieldValue>,
     panel: DeckPanel?,
     onPanel: (DeckPanel?) -> Unit,
     onAdvanced: () -> Unit,
@@ -1011,12 +1038,7 @@ private fun LandscapeDeck(
     // pad steps aside and the Keys panel takes the whole width above it.
     val typing = panel == DeckPanel.Keyboard && WindowInsets.isImeVisible
 
-    // The panel keeps showing its last content while it collapses, so closing
-    // doesn't blank it mid-animation.
-    var lastPanel by remember { mutableStateOf(DeckPanel.Media) }
-    if (panel != null) lastPanel = panel
-
-    Row(
+    BoxWithConstraints(
         Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.surface)
@@ -1025,48 +1047,73 @@ private fun LandscapeDeck(
             .systemBarsPadding()
             .displayCutoutPadding(),
     ) {
-        DeckRail(
-            panel = panel,
-            onToggle = { toggle(it) },
-            onBack = a.onDisconnect,
-            onAdvanced = onAdvanced,
-            onSettings = onSettings,
-            onFullscreen = onFullscreen,
-        )
+        // Wider than tall isn't always wide: half a split screen, or a phone set to a
+        // large display size, can leave the pad next to a docked panel too narrow to
+        // use. Then the panel fills the row the way it does while typing.
+        val roomy = maxWidth - DECK_RAIL_WIDTH - DOCKED_PANEL_WIDTH >= DECK_MIN_PAD_WIDTH
+        val fill = panel != null && (typing || !roomy)
 
-        // A plain, quick width change: the pad is pushed over, nothing slides on
-        // top of it and nothing bounces.
-        AnimatedVisibility(
-            visible = panel != null,
-            enter = expandHorizontally(tween(180)),
-            exit = shrinkHorizontally(tween(160)),
-            modifier = if (typing) Modifier.weight(1f) else Modifier,
-        ) {
-            DockedPanel(lastPanel, state, a, wide = typing, onClose = { onPanel(null) })
-        }
+        // The panel keeps its last content AND its last shape while it collapses, so
+        // closing neither blanks it nor snaps it to another layout mid-animation.
+        var lastPanel by remember { mutableStateOf(DeckPanel.Media) }
+        var lastFill by remember { mutableStateOf(false) }
+        var lastTyping by remember { mutableStateOf(false) }
+        if (panel != null) { lastPanel = panel; lastFill = fill; lastTyping = typing }
 
-        if (!typing) {
-            Column(
-                Modifier
-                    .weight(1f)
-                    .fillMaxHeight()
-                    .imePadding()
-                    .padding(top = 8.dp, end = 16.dp, bottom = 12.dp),
+        Row(Modifier.fillMaxSize()) {
+            DeckRail(
+                panel = panel,
+                onToggle = { toggle(it) },
+                onBack = a.onDisconnect,
+                onAdvanced = onAdvanced,
+                onSettings = onSettings,
+                onFullscreen = onFullscreen,
+            )
+
+            // A plain, quick width change: the pad is pushed over, nothing slides on
+            // top of it and nothing bounces. Unweighted, so a filling panel takes
+            // what the rail leaves and, as it collapses, hands it back to the pad.
+            AnimatedVisibility(
+                visible = panel != null,
+                enter = expandHorizontally(tween(180)),
+                exit = shrinkHorizontally(tween(160)),
             ) {
-                TrackpadCard(
-                    modifier = Modifier.fillMaxWidth().weight(1f),
-                    a = a,
-                    natural = natural,
-                    stripLeft = state.settings.scrollStripLeft,
-                )
-                Spacer(Modifier.height(10.dp))
-                // With a panel open the pad is narrower, so the bar drops its words
-                // for L / M / R and a drag glyph instead of squeezing the labels.
-                ClickBar(a, compact = panel != null)
+                DockedPanel(lastPanel, state, a, keysBuffer, wide = lastFill,
+                    header = !lastTyping, onClose = { onPanel(null) })
+            }
+
+            if (!fill) {
+                Column(
+                    Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .imePadding()
+                        .padding(top = 8.dp, end = 16.dp, bottom = 12.dp),
+                ) {
+                    TrackpadCard(
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        a = a,
+                        natural = natural,
+                        stripLeft = state.settings.scrollStripLeft,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    // With a panel open the pad is narrower, so the bar drops its words
+                    // for L / M / R and a drag glyph instead of squeezing the labels.
+                    ClickBar(a, compact = panel != null)
+                }
             }
         }
     }
 }
+
+private val DECK_RAIL_WIDTH = 80.dp
+/** 324dp of content plus the panel's own 4 + 16dp edge padding: about the
+ *  portrait column on a 360dp phone (328dp), which the Media and Keys panels
+ *  were laid out for. */
+private val DOCKED_PANEL_WIDTH = 344.dp
+/** Below this the pad beside a docked panel is too narrow to point with, and the
+ *  compact click bar's four buttons fall under touch-target size. */
+private val DECK_MIN_PAD_WIDTH = 240.dp
 
 /** Back on top; the panel toggles under it; the sheet shortcuts pinned to the
  *  bottom. Scrolls if the window is too short (split screen), so nothing is ever
@@ -1080,7 +1127,7 @@ private fun DeckRail(
     onSettings: () -> Unit,
     onFullscreen: () -> Unit,
 ) {
-    BoxWithConstraints(Modifier.width(80.dp).fillMaxHeight()) {
+    BoxWithConstraints(Modifier.width(DECK_RAIL_WIDTH).fillMaxHeight()) {
         Column(
             modifier = Modifier
                 .verticalScroll(rememberScrollState())
@@ -1125,27 +1172,29 @@ private fun DeckRail(
     }
 }
 
-/** The docked panel: the same Media and Keyboard panels as portrait, at
- *  portrait's content width (360dp less padding), so neither needed a second
- *  layout. [wide] = typing with the phone's keyboard up: it fills the row and
- *  drops its header, since what's left of the screen belongs to the text field. */
+/** The docked panel: the same Media and Keyboard panels as portrait, at about
+ *  portrait's content width, so neither needed a second layout. [wide] = it fills
+ *  the row (typing, or no room for the pad beside it). [header] = false while
+ *  typing: what's left above the phone's keyboard belongs to the text field. */
 @Composable
 private fun DockedPanel(
     panel: DeckPanel,
     state: UiState,
     a: ControlActions,
+    keysBuffer: MutableState<TextFieldValue>,
     wide: Boolean,
+    header: Boolean,
     onClose: () -> Unit,
 ) {
     Column(
         Modifier
             .fillMaxHeight()
-            .then(if (wide) Modifier.fillMaxWidth() else Modifier.width(344.dp))
+            .then(if (wide) Modifier.fillMaxWidth() else Modifier.width(DOCKED_PANEL_WIDTH))
             .imePadding()
             .verticalScroll(rememberScrollState())
             .padding(start = 4.dp, end = 16.dp, top = 4.dp, bottom = 12.dp),
     ) {
-        if (!wide) {
+        if (header) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1163,7 +1212,8 @@ private fun DockedPanel(
             Spacer(Modifier.height(8.dp))
         }
         // KeyboardPanel takes no UiState on purpose; see ControlsPanel.
-        if (panel == DeckPanel.Media) MediaPanel(state, a) else KeyboardPanel(a)
+        if (panel == DeckPanel.Media) MediaPanel(state, a)
+        else KeyboardPanel(a, keysBuffer, maxFieldLines = 2)
     }
 }
 
@@ -1178,7 +1228,14 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
     // pointerInput coroutine started.
     val naturalScrollState = rememberUpdatedState(state.settings.naturalScroll)
     // Frame tone matches the compact card so the recessed pad reads the same way.
-    Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surfaceContainerHighest)) {
+    // Cutout padding keeps a left-side strip (and the pad's edge) out from under a
+    // camera hole when the phone is sideways; the frame colour still runs full-bleed.
+    Column(
+        Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+            .displayCutoutPadding(),
+    ) {
         // Same tactile pad + real scrollbar as the compact view, now full-bleed. (Two-finger
         // drag still scrolls too — the strip is just an explicit alternative.)
         PadWithStrip(
