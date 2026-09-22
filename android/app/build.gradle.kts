@@ -60,6 +60,17 @@ android {
             // installed release on the same phone.
             manifestPlaceholders["appLabel"] = "LazeR Test"
         }
+        // Phone testing at release speed. Debug Compose is visibly janky on the
+        // trackpad, so hand-testing a debug APK misjudges how the app feels. This
+        // is the release build (R8, not debuggable), labelled and packaged like
+        // debug: same package and signing key, so it upgrades an installed test
+        // build in place and keeps its pairing and settings.
+        create("preview") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".debug"
+            manifestPlaceholders["appLabel"] = "LazeR Test"
+            matchingFallbacks += listOf("release")
+        }
     }
 
     lint {
