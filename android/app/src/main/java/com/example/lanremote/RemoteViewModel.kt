@@ -750,19 +750,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun onKeyboardInput(old: String, new: String) {
         touch()
-        when {
-            new == old -> Unit
-            new.length > old.length && new.startsWith(old) ->
-                client.key(new.substring(old.length))
-            new.length < old.length && old.startsWith(new) ->
-                repeat(old.length - new.length) { client.keySpecial("backspace") }
-            else -> {
-                // Neither a pure append nor a pure delete (autocorrect or a swipe
-                // replacing a whole word): rewind what we sent and retype it.
-                repeat(old.length) { client.keySpecial("backspace") }
-                if (new.isNotEmpty()) client.key(new)
-            }
-        }
+        val (backspaces, typed) = keyboardDelta(old, new)
+        repeat(backspaces) { client.keySpecial("backspace") }
+        if (typed.isNotEmpty()) client.key(typed)
     }
 
     fun specialKey(name: String) {
@@ -800,4 +790,24 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             if (_state.compareAndSet(snapshot, block(snapshot))) return
         }
     }
+}
+
+/**
+ * What to send the laptop to turn [old] into [new], as (backspaces, text to type).
+ *
+ * The laptop's caret sits at the end of what we've sent, so an edit becomes:
+ * delete back to the last character the two strings share, then type the rest.
+ * Autocorrect or a swipe suggestion replacing the last word therefore costs a
+ * word's worth of backspaces. It used to rewind the WHOLE field and retype it on
+ * any edit that wasn't a pure append or delete: dozens of one-per-packet
+ * backspaces the user watched scrub across the laptop, and losing the single
+ * retype packet on the lossy wire could erase everything they had typed.
+ */
+internal fun keyboardDelta(old: String, new: String): Pair<Int, String> {
+    // commonPrefixWith never ends on half a surrogate pair, so an emoji is
+    // always deleted and retyped whole.
+    val common = old.commonPrefixWith(new).length
+    // Count characters, not UTF-16 units: one backspace on the laptop removes a
+    // whole emoji, which is two units here.
+    return old.codePointCount(common, old.length) to new.substring(common)
 }
