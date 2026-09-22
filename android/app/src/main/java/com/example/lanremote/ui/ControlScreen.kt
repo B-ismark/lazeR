@@ -558,15 +558,33 @@ private fun KeyboardPanel(a: ControlActions) {
     }
 
     SectionCard {
+        // Long text wraps and the field grows, rather than one line sliding
+        // sideways out of view. Capped so it can't eat the screen: sideways there
+        // is room for two lines above the phone's keyboard, upright for three.
+        val config = LocalConfiguration.current
+        val maxFieldLines = if (config.screenWidthDp > config.screenHeightDp) 2 else 3
         OutlinedTextField(
             value = buffer,
             onValueChange = { next ->
-                // Send the delta first, then adopt the new value verbatim so
-                // selection and composition are preserved exactly as the IME set them.
-                a.onKeyboardInput(buffer.text, next.text)
-                buffer = next
+                if ('\n' in next.text) {
+                    // Multi-line, so the phone keyboard's Enter key now inserts a
+                    // newline. Treat it as the laptop's Enter, same as the Enter
+                    // button: type whatever else changed, press Enter, start fresh.
+                    // A pasted multi-line block arrives joined into one line.
+                    a.onKeyboardInput(buffer.text, next.text.replace("\n", ""))
+                    commitKey("enter")
+                } else {
+                    // Send the delta first, then adopt the new value verbatim so
+                    // selection and composition are preserved exactly as the IME
+                    // set them.
+                    a.onKeyboardInput(buffer.text, next.text)
+                    buffer = next
+                }
             },
-            label = { Text("Type on laptop") }, singleLine = true,
+            label = { Text("Type on laptop") },
+            singleLine = false,
+            minLines = 1,
+            maxLines = maxFieldLines,
             keyboardOptions = KeyboardOptions(autoCorrectEnabled = false),
             modifier = Modifier.fillMaxWidth(),
         )
