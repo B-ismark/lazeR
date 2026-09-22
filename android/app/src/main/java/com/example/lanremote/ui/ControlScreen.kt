@@ -5,7 +5,6 @@ import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
@@ -22,6 +21,7 @@ import androidx.compose.foundation.layout.displayCutoutPadding
 import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.offset
 import androidx.compose.material.icons.filled.KeyboardDoubleArrowLeft
@@ -1022,12 +1022,18 @@ private fun LandscapeDeck(
 
             // Scrim: dims the pad while a panel is out, and a tap on it closes the
             // panel. It sits above the pad, so that tap never reaches the laptop
-            // as a click.
-            AnimatedVisibility(visible = panel != null, enter = fadeIn(), exit = fadeOut()) {
+            // as a click. A faded alpha rather than AnimatedVisibility: inside this
+            // Row the RowScope overload wins resolution and won't compile here.
+            // Dropped from composition once faded out, so it never eats touches.
+            val scrimAlpha by animateFloatAsState(
+                targetValue = if (panel != null) 0.32f else 0f,
+                label = "scrim",
+            )
+            if (scrimAlpha > 0f) {
                 Box(
                     Modifier
                         .fillMaxSize()
-                        .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.32f))
+                        .background(MaterialTheme.colorScheme.scrim.copy(alpha = scrimAlpha))
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null,
