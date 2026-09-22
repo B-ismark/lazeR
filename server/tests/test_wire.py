@@ -1590,6 +1590,28 @@ class SingletonGuardSurvivesSocketLoss(unittest.TestCase):
         self.assertEqual(kind, "existing",
                          "the guard port was dropped, so a second copy could start")
 
+    def test_a_caller_that_hangs_up_leaves_the_listener_alone(self):
+        # Windows accept() raises a reset for a queued caller that went away.
+        # That says nothing about our socket, and reclaiming it would free the
+        # port for a moment: room for a launch to become a second owner.
+        lsock = mock.Mock()
+        closed_at_retry = []
+
+        def accept():
+            if not closed_at_retry and lsock.accept.call_count == 1:
+                raise ConnectionResetError(10054, "reset by peer")
+            closed_at_retry.append(lsock.close.called)
+            rs._stop.set()      # one retry is enough; closing at stop is normal
+            raise socket.timeout()
+
+        lsock.accept.side_effect = accept
+        with mock.patch.object(rs, "_reclaim_singleton_port",
+                               return_value=None) as reclaim:
+            rs.singleton_serve(lsock, mock.Mock())
+        reclaim.assert_not_called()
+        self.assertEqual(closed_at_retry, [False],
+                         "the listener was closed, or never asked again, after a reset")
+
 
 class PublishableAddress(unittest.TestCase):
     """lan_ip() falls back to 127.0.0.1 so the GUI always has something to draw.

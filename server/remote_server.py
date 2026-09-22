@@ -1729,6 +1729,11 @@ def singleton_serve(lsock, eq):
             conn, _ = lsock.accept()
         except socket.timeout:
             continue
+        except (ConnectionResetError, ConnectionAbortedError):
+            # One queued caller hung up before we accepted it (Windows reports a
+            # reset there). The listener is fine; reclaiming it would free the port
+            # for a moment, long enough for a launch to slip in as a second owner.
+            continue
         except OSError:
             # The listening socket died under us. This used to `break`, closing
             # the port for good, and the next launch found it free, became the
@@ -1737,6 +1742,9 @@ def singleton_serve(lsock, eq):
             lsock = _reclaim_singleton_port(lsock)
             if lsock is None:
                 return
+            # If a fresh socket fails the same way, retry at this pace rather
+            # than spinning a core on close/rebind.
+            _stop.wait(0.5)
             continue
         cmd = b""
         try:
@@ -2884,6 +2892,7 @@ class LazeRWindow:
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._tray = None
+        self._tray_thread = None
         self._setup_tray()
         self._log("Server started", "ok")
         self._poll()
@@ -2908,7 +2917,8 @@ class LazeRWindow:
             pystray.MenuItem("Quit", self._tray_quit),
         )
         self._tray = pystray.Icon("LazeR", img, "LazeR — LAN remote", menu)
-        threading.Thread(target=self._tray.run, daemon=True).start()
+        self._tray_thread = threading.Thread(target=self._tray.run, daemon=True)
+        self._tray_thread.start()
 
     def _tray_show(self, icon=None, item=None):
         self._root.after(0, self._restore)
@@ -3800,6 +3810,11 @@ class LazeRWindow:
 
     def run(self):
         self._root.mainloop()
+        # Icon.stop() only asks the tray thread to remove the icon. The process is
+        # ended outright after this, so wait for the removal, or a dead LazeR icon
+        # stays in the notification area until the mouse passes over it.
+        if self._tray_thread is not None:
+            self._tray_thread.join(timeout=1)
 
 
 # ── terminal mode ─────────────────────────────────────────────────────────────
@@ -3926,8 +3941,12 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
     except KeyboardInterrupt:
         pass
     finally:
-        _stop.set()
-        _stop_mdns(net)
+        _exit_watchdog()
+        try:
+            _stop.set()
+            _stop_mdns(net)
+        except KeyboardInterrupt:
+            pass    # a second Ctrl+C during cleanup still ends in _exit_process
     print("\nServer stopped.")
     _exit_process(0)
 
@@ -3964,6 +3983,16 @@ def _exit_process(code=0):
         except Exception:
             pass
     os._exit(code)
+
+
+def _exit_watchdog(seconds=10.0):
+    """Backstop for the one way out that skips _exit_process: an exception on
+    its way up, left to propagate so its traceback (or the exe's error dialog)
+    still appears. If the process is still alive [seconds] later, end it. Longer
+    than the cleanup's own limits (2s serve join + 3s mDNS)."""
+    t = threading.Timer(seconds, os._exit, args=(1,))
+    t.daemon = True
+    t.start()
 
 
 # ── local-takeover event helpers (shared by GUI + terminal) ──────────────────
@@ -4133,10 +4162,14 @@ def main():
             except KeyboardInterrupt:
                 pass
             finally:
-                _stop.set()
-                t.join(timeout=2)
-                _stop_mdns(net)
-                print("Server stopped.")
+                _exit_watchdog()
+                try:
+                    _stop.set()
+                    t.join(timeout=2)
+                    _stop_mdns(net)
+                    print("Server stopped.")
+                except KeyboardInterrupt:
+                    pass
             _exit_process(0)
 
     run_terminal(token, key, ip, require_secure,
