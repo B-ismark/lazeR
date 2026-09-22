@@ -33,9 +33,13 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.findRootCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.IntOffset
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -56,7 +60,9 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.absolutePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.systemGestures
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
@@ -137,6 +143,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import com.example.lanremote.UiState
 import com.example.lanremote.dropLastCodePoint
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.hypot
 
 private const val SCROLL_STEP_PX = 16f   // smaller = finer scroll + more haptic detents
@@ -910,7 +917,7 @@ private fun PadWithStrip(
     stripLeft: Boolean,
     padCorner: Dp,
 ) {
-    Row(modifier) {
+    Row(modifier.clearOfBackGesture()) {
         if (stripLeft) {
             ScrollStrip(a.onScroll, { natural.value })
             Spacer(Modifier.width(14.dp))
@@ -933,6 +940,47 @@ private fun PadWithStrip(
         }
     }
 }
+
+/** With gesture navigation, a swipe that starts within a few dp of the screen's side
+ *  edge is Back, and the system takes it before the app sees it: a pad that reaches
+ *  into that zone turns a stroke started at its edge into leaving the screen. This
+ *  pads the element in from whichever side actually overlaps the zone, by exactly
+ *  the overlap. It is measured from where the element sits in the window, so it
+ *  holds for every layout (portrait, the deck, fullscreen, split screen) and adds
+ *  nothing with three-button navigation, where the zone is zero. Excluding the zone
+ *  instead is capped by Android at 200dp per edge and would take Back away there. */
+@Composable
+private fun Modifier.clearOfBackGesture(): Modifier {
+    val density = LocalDensity.current
+    val gestures = WindowInsets.systemGestures
+    val zoneLeft = gestures.getLeft(density, LayoutDirection.Ltr)
+    val zoneRight = gestures.getRight(density, LayoutDirection.Ltr)
+    var clearance by remember { mutableStateOf(0 to 0) }
+    return this
+        // Measured outside the padding it adds, so the padding can't feed back into it.
+        .onGloballyPositioned { c ->
+            val b = c.boundsInWindow()
+            clearance = backZoneClearance(b.left, b.right,
+                c.findRootCoordinates().size.width.toFloat(), zoneLeft, zoneRight)
+        }
+        .absolutePadding(
+            left = with(density) { clearance.first.toDp() },
+            right = with(density) { clearance.second.toDp() },
+        )
+}
+
+/** How far (px) an element spanning [left]..[right] in a window [windowWidth] wide
+ *  must pull in from each side to stay out of back-gesture zones [zoneLeft] and
+ *  [zoneRight] wide at the window's left and right edges. */
+internal fun backZoneClearance(
+    left: Float,
+    right: Float,
+    windowWidth: Float,
+    zoneLeft: Int,
+    zoneRight: Int,
+): Pair<Int, Int> =
+    ceil(zoneLeft - left).toInt().coerceAtLeast(0) to
+        ceil(right - (windowWidth - zoneRight)).toInt().coerceAtLeast(0)
 
 /** A real scrollbar: a recessed track with a raised thumb that follows the drag and
  *  springs back to centre on release. It's a RATE scroller (the laptop's scroll
