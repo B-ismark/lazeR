@@ -53,7 +53,7 @@ override coexists with the BOM cleanly.
 | Click bar (main) | `Row` of `FilledTonalButton` | `ButtonGroup { clickableItem }` (Left/Middle/Right) + hold-drag |
 | Media transport, ±nudges, paste | hand-rolled `PressIconButton` (scale-on-press) | expressive `FilledIconButton`/`FilledTonalIconButton` with `IconButtonShapes(shape, pressedShape = Circle)` — the container morphs its corners on press |
 | Spinners (Scan, Connect&save, Reconnecting) | `CircularProgressIndicator` | `LoadingIndicator` (morphing polygon) |
-| Keyboard keys (Space/Tab/Esc/Enter/**New line**/backspace), chips, fullscreen clicks | plain | expressive pill `FilledTonalButton(shapes = ButtonDefaults.shapes())`. Backspace is a pill (not a shrunk icon-button — that clipped the glyph off-centre). **New line** = `COMBO shift enter` (soft newline). |
+| Keyboard keys (backspace/Space/Tab/Esc/Enter), chips, fullscreen clicks | plain | expressive pill `FilledTonalButton(shapes = ButtonDefaults.shapes())`; **Enter** is the one filled `Button`, wider than the rest. Backspace is a pill (not a shrunk icon-button — that clipped the glyph off-centre). There is no New line key: the phone keyboard's own return key types a line break, which goes out as `COMBO shift enter` (soft newline; see `keyboardOps`). |
 | Scan-QR primary button | `Button(shape=…)` | `Button(shapes = ButtonDefaults.shapes())` |
 | Fullscreen bottom controls | separate exit button + full-width click row | `HorizontalFloatingToolbar` (clicks + hold + exit float below the pad) |
 | Volume/brightness icon | bare glyph | `MaterialShapes.Cookie9Sided.toShape()` tonal badge |

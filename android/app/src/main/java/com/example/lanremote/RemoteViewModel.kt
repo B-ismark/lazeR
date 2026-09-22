@@ -181,6 +181,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     // --- settings ---
     fun setSensitivity(v: Float) = updateSettings { it.copy(sensitivity = v) }
     fun setNaturalScroll(v: Boolean) = updateSettings { it.copy(naturalScroll = v) }
+    fun setScrollStripLeft(v: Boolean) = updateSettings { it.copy(scrollStripLeft = v) }
     fun setHaptics(v: Boolean) = updateSettings { it.copy(haptics = v) }
     fun setAcceleration(v: Boolean) = updateSettings { it.copy(acceleration = v) }
 
@@ -749,18 +750,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun onKeyboardInput(old: String, new: String) {
         touch()
-        when {
-            new == old -> Unit
-            new.length > old.length && new.startsWith(old) ->
-                client.key(new.substring(old.length))
-            new.length < old.length && old.startsWith(new) ->
-                repeat(old.length - new.length) { client.keySpecial("backspace") }
-            else -> {
-                // Neither a pure append nor a pure delete (autocorrect or a swipe
-                // replacing a whole word): rewind what we sent and retype it.
-                repeat(old.length) { client.keySpecial("backspace") }
-                if (new.isNotEmpty()) client.key(new)
-            }
+        for (op in keyboardOps(old, new)) when (op) {
+            KeyOp.Backspace -> client.keySpecial("backspace")
+            KeyOp.NewLine -> client.combo("shift enter")
+            is KeyOp.Type -> client.key(op.text)
         }
     }
 
@@ -797,6 +790,70 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             // Not named `current` — that's the connected-Device member field.
             val snapshot = _state.value
             if (_state.compareAndSet(snapshot, block(snapshot))) return
+        }
+    }
+}
+
+/**
+ * What to send the laptop to turn [old] into [new], as (backspaces, text to type).
+ *
+ * The laptop's caret sits at the end of what we've sent, so an edit becomes:
+ * delete back to the last character the two strings share, then type the rest.
+ * Autocorrect or a swipe suggestion replacing the last word therefore costs a
+ * word's worth of backspaces. It used to rewind the WHOLE field and retype it on
+ * any edit that wasn't a pure append or delete: dozens of one-per-packet
+ * backspaces the user watched scrub across the laptop, and losing the single
+ * retype packet on the lossy wire could erase everything they had typed.
+ */
+internal fun keyboardDelta(old: String, new: String): Pair<Int, String> {
+    // commonPrefixWith never ends on half a surrogate pair, so an emoji is
+    // always deleted and retyped whole.
+    val common = old.commonPrefixWith(new).length
+    // Count code points, not UTF-16 units: one backspace on the laptop removes a
+    // single-code-point emoji (two units here) whole. Emoji built from several
+    // code points (flags, skin tones, ZWJ families) are where targets disagree:
+    // Chromium-based apps delete the whole cluster with one backspace, so there
+    // the extra backspaces eat into the text before it. No single count fits
+    // every app; per code point is right for the common case.
+    return old.codePointCount(common, old.length) to new.substring(common)
+}
+
+/** [s] minus its last character, never splitting a surrogate pair. The
+ *  on-screen Backspace trims the buffer with this, so the buffer and the laptop
+ *  lose the same thing: half an emoji left behind would cost one more backspace
+ *  later and leave the two out of step. */
+internal fun dropLastCodePoint(s: String): String =
+    if (s.isEmpty()) s else s.substring(0, s.offsetByCodePoints(s.length, -1))
+
+/** Line breaks in one form. A paste from a CRLF source carries "\r\n", and a
+ *  bare '\r' typed as text reaches the laptop as Enter: the submit that the
+ *  Shift+Enter mapping exists to avoid. */
+private fun normalizeLineBreaks(s: String): String =
+    if ('\r' !in s) s else s.replace("\r\n", "\n").replace('\r', '\n')
+
+/** One thing to send the laptop while mirroring the phone's text field. */
+internal sealed interface KeyOp {
+    data object Backspace : KeyOp
+    data object NewLine : KeyOp
+    data class Type(val text: String) : KeyOp
+}
+
+/**
+ * [keyboardDelta] as the keystrokes that carry it out.
+ *
+ * A line break typed on the phone becomes Shift+Enter, not a literal newline:
+ * typed as text it arrives as Enter, which submits in chat apps and many forms.
+ * Shift+Enter is the near-universal "new line without sending". Backspacing
+ * over a line break needs nothing special: one backspace removes it on the
+ * laptop too, including one that arrived as "\r\n".
+ */
+internal fun keyboardOps(old: String, new: String): List<KeyOp> {
+    val (backspaces, typed) = keyboardDelta(normalizeLineBreaks(old), normalizeLineBreaks(new))
+    return buildList {
+        repeat(backspaces) { add(KeyOp.Backspace) }
+        typed.split('\n').forEachIndexed { i, part ->
+            if (i > 0) add(KeyOp.NewLine)
+            if (part.isNotEmpty()) add(KeyOp.Type(part))
         }
     }
 }

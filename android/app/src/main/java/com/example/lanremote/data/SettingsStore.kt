@@ -9,6 +9,9 @@ data class Settings(
     // the scroll runs INVERSE to finger movement. Natural (touchscreen) scrolling,
     // where content follows the fingers, is the opt-in.
     val naturalScroll: Boolean = false,
+    // Which side of the trackpad the scroll strip sits on. Default right (thumb side
+    // for most right-handed grips); left is there for left-handed use.
+    val scrollStripLeft: Boolean = false,
     val haptics: Boolean = true,
     val acceleration: Boolean = true,   // fast flicks travel farther (pointer accel curve)
     // The only setting that governs internet access: everything else in the app is
@@ -24,6 +27,7 @@ class SettingsStore(context: Context) {
     fun load() = Settings(
         sensitivity = prefs.getFloat("sensitivity", 1.6f),
         naturalScroll = prefs.getBoolean("naturalScroll", false),
+        scrollStripLeft = prefs.getBoolean("scrollStripLeft", false),
         haptics = prefs.getBoolean("haptics", true),
         acceleration = prefs.getBoolean("acceleration", true),
         updateCheck = prefs.getBoolean("updateCheck", true),
@@ -33,6 +37,7 @@ class SettingsStore(context: Context) {
         prefs.edit()
             .putFloat("sensitivity", s.sensitivity)
             .putBoolean("naturalScroll", s.naturalScroll)
+            .putBoolean("scrollStripLeft", s.scrollStripLeft)
             .putBoolean("haptics", s.haptics)
             .putBoolean("acceleration", s.acceleration)
             .putBoolean("updateCheck", s.updateCheck)

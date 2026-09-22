@@ -47,7 +47,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # packages: '' — the action's default installs the obsolete `tools`
+      # package, which Google removed from the SDK repo, so sdkmanager exits 1
+      # before Gradle ever runs. The step below installs what the build needs.
       - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
       # Pinned toolchain — see android/EXPRESSIVE_MIGRATION.md. material3 is held
       # at 1.5.0-alpha12, which keeps compileSdk 35 / AGP 8.7.3 / Gradle 8.9.

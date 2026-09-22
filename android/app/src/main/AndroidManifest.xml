@@ -16,7 +16,7 @@
         android:fullBackupContent="false"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
-        android:label="LazeR"
+        android:label="${appLabel}"
         android:supportsRtl="true"
         android:theme="@style/Theme.LanRemote">
 
@@ -29,6 +29,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:configChanges="orientation|screenSize|keyboardHidden"
+            android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.LanRemote">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

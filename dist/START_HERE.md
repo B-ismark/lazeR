@@ -68,9 +68,12 @@ token is persistent, so it keeps working across restarts).
 - **Two fingers**: scroll on both axes, like a real trackpad — vertical scrolls,
   and horizontal becomes back / forward in a browser (the app you're in decides).
   **Three fingers** left/right = switch apps.
-- **Scroll strip** on the trackpad's right edge.
+- **Scroll strip** on the trackpad's right edge — or the left, via **Settings →
+  Scroll bar on the left**.
 - **Volume** slider — synced both ways with the laptop.
 - **Media / Keyboard** — toggle between them with the buttons up top.
+- **Turn the phone sideways** for a wide trackpad: Media and Keys move to a rail on
+  the left edge, and tapping one opens its panel beside the pad.
 
 ## Notes
 - A **window opens** showing the QR, IP, port, token (with a Copy button), a live

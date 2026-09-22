@@ -20,6 +20,7 @@ android {
         // publish_release.ps1 now asserts -Tag matches versionName.
         versionCode = 20101
         versionName = "2.1.1"
+        manifestPlaceholders["appLabel"] = "LazeR"
     }
 
     signingConfigs {
@@ -55,6 +56,20 @@ android {
             // Make the debug build's package distinct so a debuggable build can't
             // silently sit where users expect the hardened release.
             applicationIdSuffix = ".debug"
+            // ...and a distinct launcher name, so it's easy to find next to the
+            // installed release on the same phone.
+            manifestPlaceholders["appLabel"] = "LazeR Test"
+        }
+        // Phone testing at release speed. Debug Compose is visibly janky on the
+        // trackpad, so hand-testing a debug APK misjudges how the app feels. This
+        // is the release build (R8, not debuggable), labelled and packaged like
+        // debug: same package and signing key, so it upgrades an installed test
+        // build in place and keeps its pairing and settings.
+        create("preview") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".debug"
+            manifestPlaceholders["appLabel"] = "LazeR Test"
+            matchingFallbacks += listOf("release")
         }
     }
 
