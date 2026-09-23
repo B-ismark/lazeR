@@ -41,6 +41,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.IntOffset
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -90,12 +91,15 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ButtonGroup
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledIconButton
@@ -114,6 +118,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.toShape
@@ -123,6 +128,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -141,6 +147,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.lanremote.UiState
+import com.example.lanremote.UpdateStatus
 import com.example.lanremote.dropLastCodePoint
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -186,6 +193,8 @@ class ControlActions(
     val onHaptics: (Boolean) -> Unit,
     val onAcceleration: (Boolean) -> Unit,
     val onUpdateCheck: (Boolean) -> Unit,
+    val onCheckUpdateNow: () -> Unit,   // Settings: ask GitHub now, skipping the daily throttle
+    val onOpenRelease: () -> Unit,      // open the release page in the browser
     val onButtonTap: () -> Unit,        // light haptic for generic button presses
     val onDisconnect: () -> Unit,
 )
@@ -316,7 +325,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
                             Icon(Icons.Filled.Tune, contentDescription = "Advanced")
                         }
                         IconButton(onClick = { showSettings = true }) {
-                            Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                            SettingsIcon(updateAvailable = state.updateTag != null)
                         }
                         IconButton(onClick = { fullscreen = true }) {
                             Icon(Icons.Filled.Fullscreen, contentDescription = "Expand trackpad")
@@ -1120,6 +1129,7 @@ private fun LandscapeDeck(
                 onAdvanced = onAdvanced,
                 onSettings = onSettings,
                 onFullscreen = onFullscreen,
+                updateAvailable = state.updateTag != null,
             )
 
             // A plain, quick width change: the pad is pushed over, nothing slides on
@@ -1178,6 +1188,7 @@ private fun DeckRail(
     onAdvanced: () -> Unit,
     onSettings: () -> Unit,
     onFullscreen: () -> Unit,
+    updateAvailable: Boolean,
 ) {
     BoxWithConstraints(Modifier.width(DECK_RAIL_WIDTH).fillMaxHeight()) {
         Column(
@@ -1214,7 +1225,7 @@ private fun DeckRail(
                     Icon(Icons.Filled.Tune, contentDescription = "Advanced")
                 }
                 IconButton(onClick = onSettings) {
-                    Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                    SettingsIcon(updateAvailable)
                 }
                 IconButton(onClick = onFullscreen) {
                     Icon(Icons.Filled.Fullscreen, contentDescription = "Expand trackpad")
@@ -1379,7 +1390,14 @@ private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
 private fun SettingsSheet(state: UiState, a: ControlActions, onDismiss: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-        Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 28.dp)) {
+        // Scrolls: sideways, or on a short phone, the sheet is taller than the window,
+        // and Updates (where the Settings badge sends people) is at the very bottom.
+        Column(
+            Modifier
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 28.dp),
+        ) {
             // Pointer — everything that shapes cursor motion.
             SheetTitle("Pointer")
             Text("Cursor speed  ${"%.1f".format(state.settings.sensitivity)}×",
@@ -1418,7 +1436,135 @@ private fun SettingsSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
                     "anything; it just shows a link.",
                 state.settings.updateCheck, a.onUpdateCheck,
             )
+            // No version, nothing to compare: the check can't run, so offer no button.
+            if (state.settings.updateCheck && state.appVersion.isNotBlank()) {
+                UpdateStatusLine(state, a)
+            }
         }
+    }
+}
+
+/**
+ * The Settings gear, with a small dot when a newer release is out.
+ *
+ * The connect-screen card alone wasn't enough: the app reconnects to the last laptop
+ * on launch, so people who use it daily go straight to the pad and never see that
+ * screen. The dot sits on the way to the one place that explains it (Settings →
+ * Updates) and goes away once they've updated or switched checks off.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsIcon(updateAvailable: Boolean) {
+    BadgedBox(badge = { if (updateAvailable) Badge() }) {
+        Icon(
+            Icons.Filled.Settings,
+            contentDescription = if (updateAvailable) "Settings, update available" else "Settings",
+        )
+    }
+}
+
+/**
+ * What the update check actually found, under its switch. Four states:
+ * available (with a link), checking, couldn't reach GitHub (with Try again), and
+ * up to date (with when, and Check now). Before this the switch said nothing at all,
+ * so a check blocked by the network looked exactly like being current.
+ */
+@Composable
+private fun UpdateStatusLine(state: UiState, a: ControlActions) {
+    val tag = state.updateTag
+    val version = "You have ${state.appVersion}"
+    if (tag != null) {
+        Card(
+            shape = RoundedCornerShape(20.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.secondaryContainer),
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        ) {
+            Column(Modifier.padding(16.dp)) {
+                Text("LazeR $tag is available",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer)
+                Text(
+                    "$version. Update the laptop app too — they ship together.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+                Spacer(Modifier.height(12.dp))
+                Button(onClick = a.onOpenRelease) { Text("Open release page") }
+            }
+        }
+        return
+    }
+
+    // Re-read the clock every half minute so "checked just now" doesn't stay frozen
+    // while the sheet is open.
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000)
+            now = System.currentTimeMillis()
+        }
+    }
+
+    val failed = state.updateStatus == UpdateStatus.Failed
+    val (line, detail, action) = when {
+        state.updateStatus == UpdateStatus.Checking ->
+            Triple("Checking…", version, null)
+        // Also covers GitHub answering with an error (rate limit, no release), so
+        // it doesn't claim the network is at fault.
+        failed ->
+            Triple(
+                "Couldn't check for updates",
+                "No usable answer from GitHub. Your network may be blocking it, or " +
+                    "GitHub is busy. Nothing is wrong with this phone.",
+                "Try again",
+            )
+        state.lastUpdateCheckMs > 0L ->
+            Triple(
+                "You're up to date",
+                "$version · checked ${checkedAgo(state.lastUpdateCheckMs, now)}",
+                "Check now",
+            )
+        else -> Triple("Not checked yet", version, "Check now")
+    }
+    Row(
+        Modifier.fillMaxWidth().padding(bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(line, style = MaterialTheme.typography.bodyMedium,
+                color = if (failed)
+                    MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
+            Text(detail, style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (action != null) {
+            TextButton(onClick = a.onCheckUpdateNow) { Text(action) }
+        } else {
+            CircularProgressIndicator(Modifier.padding(end = 12.dp).size(20.dp), strokeWidth = 2.dp)
+        }
+    }
+}
+
+/**
+ * "just now", "5 min ago", "3 hours ago", "yesterday", "12 days ago".
+ *
+ * Written out rather than DateUtils: the rest of the app's copy is English, and
+ * DateUtils switches to an absolute date after a week and to "in 3 hours" when the
+ * clock has moved backwards, neither of which reads after "checked". A timestamp in
+ * the future (clock corrected backwards) counts as just now.
+ */
+internal fun checkedAgo(atMs: Long, nowMs: Long): String {
+    val min = (nowMs - atMs) / 60_000
+    val hours = min / 60
+    val days = hours / 24
+    return when {
+        min < 1 -> "just now"
+        min < 60 -> "$min min ago"
+        hours == 1L -> "an hour ago"
+        hours < 24 -> "$hours hours ago"
+        days == 1L -> "yesterday"
+        else -> "$days days ago"
     }
 }
 
