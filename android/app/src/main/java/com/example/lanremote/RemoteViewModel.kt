@@ -81,11 +81,20 @@ data class UiState(
     val discovered: List<DiscoveredHost> = emptyList(),
     val settings: Settings = Settings(),
     // Tag of a newer release, or null when we're current / haven't found out / the
-    // check is switched off. One nullable field rather than a status enum: "up to
-    // date" and "couldn't reach GitHub" both render as nothing at all, so the UI
-    // has no reason to tell them apart.
+    // check is switched off. Drives the connect-screen card and the Settings badge.
     val updateTag: String? = null,
+    // How the last update check went, for the Settings sheet only. The connect
+    // screen still stays quiet on failure, but Settings must say what happened:
+    // a bare switch made "up to date" and "couldn't reach GitHub" look identical,
+    // so a user on an old version had no way to tell the check wasn't working.
+    val updateCheck: UpdateCheck = UpdateCheck.Idle,
+    val lastUpdateCheckMs: Long = 0L,   // last SUCCESSFUL check, epoch millis; 0 = never
+    val appVersion: String = "",        // installed versionName, shown next to the status
 )
+
+/** Idle covers both "never checked" and "checked fine" — [UiState.lastUpdateCheckMs]
+ *  tells those apart. Failed means the most recent attempt didn't get an answer. */
+enum class UpdateCheck { Idle, Checking, Failed }
 
 class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -138,7 +147,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private fun touch() { lastInteractionMs = System.currentTimeMillis() }
 
     private val _state = MutableStateFlow(
-        UiState(savedDevices = store.load(), settings = settingsStore.load())
+        UiState(
+            savedDevices = store.load(),
+            settings = settingsStore.load(),
+            lastUpdateCheckMs = settingsStore.lastUpdateCheckMs,
+        )
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
 
@@ -190,8 +203,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
      *  rather than waiting out the throttle, so the toggle gives visible feedback. */
     fun setUpdateCheck(v: Boolean) {
         updateSettings { it.copy(updateCheck = v) }
-        if (v) checkForUpdate(force = true) else update { it.copy(updateTag = null) }
+        if (v) checkForUpdate(force = true)
+        else update { it.copy(updateTag = null, updateCheck = UpdateCheck.Idle) }
     }
+
+    /** Settings' "Check now" / "Try again": ask GitHub immediately, skipping the
+     *  once-a-day throttle. Only reachable by a tap, so it can't hammer the API. */
+    fun checkForUpdatesNow() = checkForUpdate(force = true)
 
     /** The app's own versionName, read from the installed package.
      *
@@ -215,19 +233,38 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private fun checkForUpdate(force: Boolean = false) {
         if (!_state.value.settings.updateCheck) return
         val mine = installedVersion() ?: return
+        update { it.copy(appVersion = mine) }
         // Cached result: instant, offline-safe, and re-validated below if due.
         settingsStore.lastKnownTag?.let { cached ->
             if (UpdateChecker.isNewer(cached, mine)) update { it.copy(updateTag = cached) }
         }
         val now = System.currentTimeMillis()
         if (!force && !settingsStore.updateCheckDue(now)) return
+        if (_state.value.updateCheck == UpdateCheck.Checking) return   // one at a time
+        update { it.copy(updateCheck = UpdateCheck.Checking) }
         viewModelScope.launch {
-            val tag = UpdateChecker.latestTag() ?: return@launch   // silent on failure
-            settingsStore.lastUpdateCheckMs = System.currentTimeMillis()
+            val tag = UpdateChecker.latestTag()
+            // Switched off while the request was in flight: drop the answer, or it
+            // would put a badge back up right after the user turned checks off.
+            if (!_state.value.settings.updateCheck) return@launch
+            if (tag == null) {
+                // Silent everywhere except the Settings status line. The throttle
+                // stamp is left alone, so the next launch tries again.
+                update { it.copy(updateCheck = UpdateCheck.Failed) }
+                return@launch
+            }
+            val at = System.currentTimeMillis()
+            settingsStore.lastUpdateCheckMs = at
             settingsStore.lastKnownTag = tag
             // Recompute rather than trusting the cache: this also CLEARS the banner
             // once the user has actually updated, which is the only way it goes away.
-            update { it.copy(updateTag = if (UpdateChecker.isNewer(tag, mine)) tag else null) }
+            update {
+                it.copy(
+                    updateTag = if (UpdateChecker.isNewer(tag, mine)) tag else null,
+                    updateCheck = UpdateCheck.Idle,
+                    lastUpdateCheckMs = at,
+                )
+            }
         }
     }
 

@@ -2,6 +2,7 @@ package com.example.lanremote.ui
 
 import android.app.Activity
 import android.os.SystemClock
+import android.text.format.DateUtils
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
@@ -90,12 +91,15 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ButtonGroup
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CenterAlignedTopAppBar
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledIconButton
@@ -114,6 +118,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.toShape
@@ -141,6 +146,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.lanremote.UiState
+import com.example.lanremote.UpdateCheck
 import com.example.lanremote.dropLastCodePoint
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -186,6 +192,8 @@ class ControlActions(
     val onHaptics: (Boolean) -> Unit,
     val onAcceleration: (Boolean) -> Unit,
     val onUpdateCheck: (Boolean) -> Unit,
+    val onCheckUpdateNow: () -> Unit,   // Settings: ask GitHub now, skipping the daily throttle
+    val onOpenRelease: () -> Unit,      // open the release page in the browser
     val onButtonTap: () -> Unit,        // light haptic for generic button presses
     val onDisconnect: () -> Unit,
 )
@@ -316,7 +324,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
                             Icon(Icons.Filled.Tune, contentDescription = "Advanced")
                         }
                         IconButton(onClick = { showSettings = true }) {
-                            Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                            SettingsIcon(updateAvailable = state.updateTag != null)
                         }
                         IconButton(onClick = { fullscreen = true }) {
                             Icon(Icons.Filled.Fullscreen, contentDescription = "Expand trackpad")
@@ -1120,6 +1128,7 @@ private fun LandscapeDeck(
                 onAdvanced = onAdvanced,
                 onSettings = onSettings,
                 onFullscreen = onFullscreen,
+                updateAvailable = state.updateTag != null,
             )
 
             // A plain, quick width change: the pad is pushed over, nothing slides on
@@ -1178,6 +1187,7 @@ private fun DeckRail(
     onAdvanced: () -> Unit,
     onSettings: () -> Unit,
     onFullscreen: () -> Unit,
+    updateAvailable: Boolean,
 ) {
     BoxWithConstraints(Modifier.width(DECK_RAIL_WIDTH).fillMaxHeight()) {
         Column(
@@ -1214,7 +1224,7 @@ private fun DeckRail(
                     Icon(Icons.Filled.Tune, contentDescription = "Advanced")
                 }
                 IconButton(onClick = onSettings) {
-                    Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                    SettingsIcon(updateAvailable)
                 }
                 IconButton(onClick = onFullscreen) {
                     Icon(Icons.Filled.Fullscreen, contentDescription = "Expand trackpad")
@@ -1418,8 +1428,110 @@ private fun SettingsSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
                     "anything; it just shows a link.",
                 state.settings.updateCheck, a.onUpdateCheck,
             )
+            if (state.settings.updateCheck) UpdateStatus(state, a)
         }
     }
+}
+
+/**
+ * The Settings gear, with a small dot when a newer release is out.
+ *
+ * The connect-screen card alone wasn't enough: the app reconnects to the last laptop
+ * on launch, so people who use it daily go straight to the pad and never see that
+ * screen. The dot sits on the way to the one place that explains it (Settings →
+ * Updates) and goes away once they've updated or switched checks off.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsIcon(updateAvailable: Boolean) {
+    BadgedBox(badge = { if (updateAvailable) Badge() }) {
+        Icon(
+            Icons.Filled.Settings,
+            contentDescription = if (updateAvailable) "Settings, update available" else "Settings",
+        )
+    }
+}
+
+/**
+ * What the update check actually found, under its switch. Four states:
+ * available (with a link), checking, couldn't reach GitHub (with Try again), and
+ * up to date (with when, and Check now). Before this the switch said nothing at all,
+ * so a check blocked by the network looked exactly like being current.
+ */
+@Composable
+private fun UpdateStatus(state: UiState, a: ControlActions) {
+    val tag = state.updateTag
+    val version = state.appVersion.takeIf { it.isNotBlank() }?.let { "You have $it" }
+    if (tag != null) {
+        Card(
+            shape = RoundedCornerShape(20.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.secondaryContainer),
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        ) {
+            Column(Modifier.padding(16.dp)) {
+                Text("LazeR $tag is available",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer)
+                Text(
+                    listOfNotNull(version, "Update the laptop app too — they ship together.")
+                        .joinToString(". "),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                )
+                Spacer(Modifier.height(12.dp))
+                Button(onClick = a.onOpenRelease) { Text("Open release page") }
+            }
+        }
+        return
+    }
+
+    val (line, detail, action) = when {
+        state.updateCheck == UpdateCheck.Checking ->
+            Triple("Checking…", version, null)
+        state.updateCheck == UpdateCheck.Failed ->
+            Triple(
+                "Couldn't reach GitHub",
+                "Your network may be blocking it, or GitHub is busy. Nothing is broken " +
+                    "on this phone.",
+                "Try again",
+            )
+        state.lastUpdateCheckMs > 0L ->
+            Triple(
+                "You're up to date",
+                listOfNotNull(version, "checked ${checkedAgo(state.lastUpdateCheckMs)}")
+                    .joinToString(" · "),
+                "Check now",
+            )
+        else -> Triple("Not checked yet", version, "Check now")
+    }
+    Row(
+        Modifier.fillMaxWidth().padding(bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(line, style = MaterialTheme.typography.bodyMedium,
+                color = if (state.updateCheck == UpdateCheck.Failed)
+                    MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
+            detail?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        if (action != null) {
+            TextButton(onClick = a.onCheckUpdateNow) { Text(action) }
+        } else {
+            CircularProgressIndicator(Modifier.padding(end = 12.dp).size(20.dp), strokeWidth = 2.dp)
+        }
+    }
+}
+
+/** "just now", "5 minutes ago", "yesterday" — the platform's own wording. */
+private fun checkedAgo(atMs: Long): String {
+    val now = System.currentTimeMillis()
+    if (now - atMs in 0 until DateUtils.MINUTE_IN_MILLIS) return "just now"
+    return DateUtils.getRelativeTimeSpanString(atMs, now, DateUtils.MINUTE_IN_MILLIS)
+        .toString().lowercase()
 }
 
 @Composable

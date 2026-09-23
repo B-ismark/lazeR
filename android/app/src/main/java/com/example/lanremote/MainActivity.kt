@@ -76,6 +76,17 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
     val context = LocalContext.current
     val haptics = remember { Haptics(context) }
 
+    // Shared by the connect-screen card and the Settings sheet. Hands off to the
+    // browser; we never fetch or install the APK ourselves. A device with no browser
+    // at all would throw, so the failure is reported rather than crashing the app.
+    val openRelease: () -> Unit = {
+        try {
+            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(vm.releasesUrl())))
+        } catch (e: Exception) {
+            vm.reportError("Couldn't open the browser to show the release.")
+        }
+    }
+
     when (state.conn) {
         ConnState.Connected -> ControlScreen(
             state = state,
@@ -124,6 +135,8 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
                 onHaptics = vm::setHaptics,
                 onAcceleration = vm::setAcceleration,
                 onUpdateCheck = vm::setUpdateCheck,
+                onCheckUpdateNow = vm::checkForUpdatesNow,
+                onOpenRelease = openRelease,
                 onButtonTap = { if (state.settings.haptics) haptics.tap() },
                 onDisconnect = vm::disconnect,
             ),
@@ -158,18 +171,7 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
                 )
             },
             onRescan = vm::rescan,
-            onOpenRelease = {
-                // Hand off to the browser; we never fetch or install the APK
-                // ourselves. A device with no browser at all would throw, so the
-                // failure is reported rather than crashing the app.
-                try {
-                    context.startActivity(
-                        Intent(Intent.ACTION_VIEW, Uri.parse(vm.releasesUrl()))
-                    )
-                } catch (e: Exception) {
-                    vm.reportError("Couldn't open the browser to show the release.")
-                }
-            },
+            onOpenRelease = openRelease,
         )
     }
 }
