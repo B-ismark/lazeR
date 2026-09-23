@@ -132,6 +132,23 @@ jobs:
         with:
           python-version: '3.14'
 
+      # build_exe.ps1 compresses with UPX only when tools/upx/upx.exe exists (it's
+      # gitignored), so without this the runner's exe came out ~5 MB larger than the
+      # laptop's. Same version as the laptop copy, pinned by the zip's SHA-256.
+      - name: Install UPX
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP/upx.zip"
+          Invoke-WebRequest https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip -OutFile $zip
+          $sha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($sha -ne '22e9ef20e4c72aad85e32c71cbc9c086436c179456382aa75c0c24868456a671') {
+            Write-Error "UPX zip SHA-256 mismatch: $sha"; exit 1
+          }
+          Expand-Archive $zip "$env:RUNNER_TEMP/upx" -Force
+          New-Item -ItemType Directory -Force tools/upx | Out-Null
+          Copy-Item "$env:RUNNER_TEMP/upx/upx-4.2.4-win64/upx.exe" tools/upx/upx.exe
+          tools/upx/upx.exe --version | Select-Object -First 1
+
       - name: Build exe
         shell: pwsh
         run: |
