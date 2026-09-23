@@ -36,7 +36,30 @@ A "major release" = a meaningful user-facing milestone (new headline feature set
 protocol change phones must adopt, or an explicit version bump the user asks for).
 When in doubt, ask the user before publishing — don't release on every change.
 
-To publish a major release, use the helper (builds both artifacts, handles the
+**Preferred: push a version tag.** `.github/workflows/release.yml` builds `LazeR.exe`
+(windows runner) and the signed `LazeR.apk` (ubuntu runner), then creates or refreshes
+the release with notes from `tools/release-notes/<tag>.md` if present. Any laptop can
+publish this way — no Android SDK, no signing key, no OneDrive locks:
+
+```
+git tag v2.3.0 && git push origin v2.3.0
+```
+
+It fails before building unless tag = `versionName` = `APP_VERSION`, and fails before
+publishing unless the APK's signer SHA-256 equals the pinned `SIGNER_SHA256`. The key
+lives in the `release` environment secret `LAZER_KEYSTORE_B64` (only `v*` tags and
+`main` may use that environment). Running the workflow manually (Actions → Release →
+Run workflow) is a dry run: builds and verifies, keeps the files as artifacts, publishes
+nothing.
+
+**Signing key.** Every published APK is signed by cert SHA-256
+`4ac2b3b56c7288999370596d11f489874d87b6fda54bd0de81a80d2bd42849dc`. Phones refuse an
+update signed by anything else, so users would have to uninstall. A GitHub secret can't
+be read back — keep an offline copy of that `debug.keystore`. Before a *local* publish,
+check the laptop's `~/.android/debug.keystore` has that fingerprint (`keytool -list -v
+-keystore %USERPROFILE%\.android\debug.keystore -storepass android`).
+
+Fallback, from the laptop holding the key: the helper (builds both artifacts, handles the
 OneDrive build-lock, creates or refreshes the release) — **run it from the repo
 root**, since `-File` resolves against the current directory and PowerShell starts
 in `%USERPROFILE%`, where `tools\` doesn't exist:

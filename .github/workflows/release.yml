@@ -1,0 +1,179 @@
+name: Release
+
+# Builds and signs both halves on GitHub's machines, so no laptop needs the signing
+# key or an Android toolchain to publish:
+#   git tag v2.3.0 && git push origin v2.3.0
+# Major releases only (see CLAUDE.md) — pushing a version tag IS the publish step.
+#
+# workflow_dispatch is a dry run: it builds, signs and verifies both apps and keeps
+# them as workflow artifacts, but never touches a GitHub Release.
+#
+# The APK is signed with the key in the `release` environment's LAZER_KEYSTORE_B64
+# secret (base64 of the debug.keystore that signed every published APK). That
+# environment only admits v* tags and main, so PR and branch runs can't read it.
+# tools/publish_release.ps1 remains the manual fallback from the key-holding laptop.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # SHA-256 of the certificate every published LazeR.apk is signed with. Phones only
+  # accept an update signed by the same key, so a build signed by anything else must
+  # never ship — it would force every user to uninstall first.
+  SIGNER_SHA256: 4ac2b3b56c7288999370596d11f489874d87b6fda54bd0de81a80d2bd42849dc
+
+jobs:
+  version:
+    name: version check
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tag, the APK's versionName and the server's APP_VERSION must agree: the
+      # update check compares the tag against both, so a mismatch either nags forever
+      # or never nags.
+      - id: v
+        run: |
+          vn=$(sed -nE 's/^\s*versionName\s*=\s*"([^"]+)".*/\1/p' android/app/build.gradle.kts | head -1)
+          av=$(sed -nE 's/^APP_VERSION\s*=\s*"([^"]+)".*/\1/p' server/remote_server.py | head -1)
+          echo "versionName=$vn APP_VERSION=$av ref=$GITHUB_REF"
+          [ -n "$vn" ] && [ -n "$av" ] || { echo "::error::could not read versionName / APP_VERSION"; exit 1; }
+          [ "$vn" = "$av" ] || { echo "::error::versionName $vn != APP_VERSION $av"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$vn" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version v$vn"; exit 1
+          fi
+          echo "version=$vn" >> "$GITHUB_OUTPUT"
+
+  apk:
+    name: android — signed release APK
+    needs: version
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # packages: '' — see ci.yml; the default installs a package Google removed.
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+
+      - name: Install SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      # No Gradle cache in the signing job: caches are shared with PR builds, and a
+      # job holding the release key shouldn't run anything a PR could have planted.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: true
+
+      # build.gradle.kts signs release builds with ~/.android/debug.keystore, so the
+      # key goes exactly there and the build needs no CI-specific config.
+      - name: Install signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.LAZER_KEYSTORE_B64 }}
+        run: |
+          [ -n "$KEYSTORE_B64" ] || { echo "::error::LAZER_KEYSTORE_B64 secret is not set on the release environment"; exit 1; }
+          mkdir -p ~/.android
+          printf '%s' "$KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
+
+      - name: Unit tests
+        working-directory: android
+        run: ./gradlew :app:testDebugUnitTest --no-daemon
+
+      - name: Release build
+        working-directory: android
+        run: ./gradlew :app:assembleRelease --no-daemon
+
+      - name: Remove signing key
+        if: always()
+        run: rm -f ~/.android/debug.keystore
+
+      - name: Verify signer
+        run: |
+          apk=android/app/build/outputs/apk/release/app-release.apk
+          [ -f "$apk" ] || { echo "::error::no signed APK at $apk"; ls -R android/app/build/outputs/apk || true; exit 1; }
+          got=$("$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$apk" \
+                | sed -nE 's/^Signer #1 certificate SHA-256 digest: ([0-9a-f]+)$/\1/p')
+          echo "signer: $got"
+          [ "$got" = "$SIGNER_SHA256" ] || { echo "::error::APK signed by $got, expected $SIGNER_SHA256"; exit 1; }
+          mkdir -p out && cp "$apk" out/LazeR.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LazeR.apk
+          path: out/LazeR.apk
+          if-no-files-found: error
+
+  exe:
+    name: windows — LazeR.exe
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same interpreter line as the laptop build (server/.venv), so the bundled
+      # runtime matches what the exe has been shipping with.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Build exe
+        shell: pwsh
+        run: |
+          ./tools/build_exe.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not (Test-Path dist/LazeR.exe)) { Write-Error "dist/LazeR.exe not built"; exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LazeR.exe
+          path: dist/LazeR.exe
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    if: github.ref_type == 'tag'
+    needs: [version, apk, exe]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      # Notes come from tools/release-notes/<tag>.md when it exists. A release that
+      # already exists keeps its title and gets its assets replaced.
+      - name: Create or refresh release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l out
+          notes="tools/release-notes/$TAG.md"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/LazeR.exe out/LazeR.apk --clobber
+            if [ -f "$notes" ]; then gh release edit "$TAG" --notes-file "$notes"; fi
+          elif [ -f "$notes" ]; then
+            gh release create "$TAG" out/LazeR.exe out/LazeR.apk --verify-tag --title "LazeR $TAG" --notes-file "$notes"
+          else
+            gh release create "$TAG" out/LazeR.exe out/LazeR.apk --verify-tag --title "LazeR $TAG" --generate-notes
+          fi
