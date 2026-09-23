@@ -84,6 +84,11 @@ token is persistent, so it keeps working across restarts).
   itself automatically (if your IP changed, the window shows the new QR — just rescan).
 - Volume on Windows uses `pycaw` (installed by the script); macOS uses `osascript`;
   Linux uses `amixer`/`pactl`.
+- **New versions** — a dot on the phone's **Settings** button means one is out;
+  **Settings → Updates** says what it found and has a **Check now** button. The
+  laptop window's **Version** line in Show details does the same. Neither downloads
+  anything: grab `LazeR.exe` and `LazeR.apk` from the release page yourself, and
+  update both together.
 
 ## If the phone won't connect
 

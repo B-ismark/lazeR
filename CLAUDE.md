@@ -51,6 +51,20 @@ matters; the script resolves everything it touches from its own location.
 It prompts for confirmation (major-only policy) unless `-Yes`, and needs `gh`
 authenticated (`gh auth login`). It re-runs `--clobber` if the tag already exists.
 
+Release notes live in `tools/release-notes/<tag>.md`; pass them with
+`-Notes (Get-Content -Raw tools\release-notes\v1.2.0.md)` when creating a release.
+
+**Refreshing a release in place** (only when nobody has downloaded it yet — check
+the assets' `download_count`; otherwise bump the version instead). The script's
+existing-release path re-uploads both assets and nothing else: it leaves the tag
+on the old commit and the notes as they were. So:
+
+1. Move the tag to the new commit: `git tag -f v1.2.0 origin/main` then
+   `git push -f origin refs/tags/v1.2.0`.
+2. On an up-to-date `main`, run the script as above. It rebuilds both artifacts from
+   the working tree and clobbers the old assets.
+3. Refresh the notes: `gh release edit v1.2.0 --notes-file tools\release-notes\v1.2.0.md`.
+
 ## Build artifacts
 
 - **Windows server exe:** `tools/build_exe.ps1` → `dist/LazeR.exe` (PyInstaller
