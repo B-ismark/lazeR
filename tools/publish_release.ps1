@@ -101,18 +101,28 @@ if (-not (Test-Path $exe)) { Write-Host "exe build failed." -ForegroundColor Red
 # build/ mid-compile even after we kill it, which fails the ART-profile/dex tasks.
 Write-Host "Building release APK ..." -ForegroundColor Cyan
 $env:JAVA_HOME = [Environment]::GetEnvironmentVariable("JAVA_HOME", "Machine")
-$buildBase = (Join-Path $env:TEMP "lazeR-build") -replace '\\', '/'
-$initGradle = Join-Path $env:TEMP "lazeR-offsync-init.gradle"
+# LONG form of %TEMP%, never the raw value. With a profile name over 8 characters
+# Windows sets TEMP to the 8.3 short form (C:\Users\BISMAR~1\...). The first time
+# Gradle creates a project cache there, it clears the folder but skips its own lock
+# file by comparing paths, and the short and long spellings don't match. It then
+# tries to delete the lock it is holding, and the build dies in seconds with
+# "Cannot delete file: ...\buildOutputCleanup\buildOutputCleanup.lock". It looks like
+# another process holds the lock; killing java or deleting the folder can't help,
+# and deleting the folder guarantees the next run hits it again.
+# Get-Item's FullName expands 8.3 names; Resolve-Path and [IO.Path] don't.
+$tempDir = (Get-Item -LiteralPath $env:TEMP).FullName
+$buildBase = (Join-Path $tempDir "lazeR-build") -replace '\\', '/'
+$initGradle = Join-Path $tempDir "lazeR-offsync-init.gradle"
 # ASCII, NOT utf8: PowerShell 5.1's -Encoding utf8 writes a BOM, and Gradle refuses
 # to compile an init script that starts with one ("Could not compile init script").
 "allprojects { p -> p.layout.buildDirectory.set(new File('$buildBase/' + p.name)) }" |
     Set-Content -Path $initGradle -Encoding ascii
-$gradleCache = Join-Path $env:TEMP "lazeR-gradle-cache"
+$gradleCache = Join-Path $tempDir "lazeR-gradle-cache"
 Push-Location "$root\android"
 & "$root\android\gradlew.bat" assembleRelease --no-daemon --init-script $initGradle --project-cache-dir $gradleCache
 $apkCode = $LASTEXITCODE
 Pop-Location
-$apk = Join-Path $env:TEMP "lazeR-build\app\outputs\apk\release\app-release.apk"
+$apk = Join-Path $tempDir "lazeR-build\app\outputs\apk\release\app-release.apk"
 if ($apkCode -ne 0 -or -not (Test-Path $apk)) { Write-Host "APK build failed." -ForegroundColor Red; Resume-OneDrive; exit 1 }
 Copy-Item $apk (Join-Path $root "dist\LazeR.apk") -Force
 $apkOut = Join-Path $root "dist\LazeR.apk"

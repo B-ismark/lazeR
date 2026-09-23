@@ -59,6 +59,14 @@ the assets' `download_count`; otherwise bump the version instead). The script's
 existing-release path re-uploads both assets and nothing else: it leaves the tag
 on the old commit and the notes as they were. So:
 
+0. **Build on the laptop whose `~/.android/debug.keystore` signed the release.**
+   The APK is signed with the local debug keystore, and more than one exists across
+   the machines this repo is built on. An APK signed by a different key won't install
+   over the published one; users would have to uninstall and lose their pairings.
+   Compare the release's signer with the local key before building:
+   `apksigner verify --print-certs LazeR.apk` (from the release) against
+   `keytool -list -v -keystore %USERPROFILE%\.android\debug.keystore -storepass android`.
+   v2.0.0 through v2.2.0 are signed with SHA-1 `45e9b7d6…52267d4`.
 1. Move the tag to the new commit: `git tag -f v1.2.0 origin/main` then
    `git push -f origin refs/tags/v1.2.0`.
 2. On an up-to-date `main`, run the script as above. It rebuilds both artifacts from
@@ -165,6 +173,15 @@ recovery above into a no-op until it was caught.
     build back inside the synced tree. Paths resolve from the script's own location,
     so the invocation directory doesn't matter.
   The APK then lands under `%TEMP%\lazeR-build\app\outputs\apk\release\`, not `android/app/build/`.
+- **Never hand Gradle the raw `%TEMP%`.** With a profile name over 8 characters,
+  Windows sets `TEMP` to the 8.3 short form (`C:\Users\BISMAR~1\...`). Gradle's first
+  use of a `--project-cache-dir` there fails within seconds: `Cannot delete file:
+  ...\buildOutputCleanup\buildOutputCleanup.lock` ("being used by another process").
+  It's Gradle tripping over its own lock (it compares short and long spellings of
+  the lock's path, misses, and tries to delete it), so killing `java.exe` does
+  nothing, and deleting the cache folder guarantees the next run fails the same way.
+  Both build scripts expand it with `(Get-Item -LiteralPath $env:TEMP).FullName`;
+  `Resolve-Path`, `[IO.Path]` and cmd's `%~f` all keep the short form.
 - **Python:** use the uv-managed venv at `server/.venv` (bare `python` is the broken
   MS Store stub). Create/refresh: `cd server && uv venv && uv pip install -r requirements.txt`.
 - **PowerShell 5.1 + native tools:** don't run build CLIs under
