@@ -3,6 +3,7 @@ package com.example.lanremote
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -67,6 +68,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         vm.kickReconnect()
+        vm.onForeground()   // update check; throttled to once a day
     }
 }
 
@@ -78,12 +80,14 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
 
     // Shared by the connect-screen card and the Settings sheet. Hands off to the
     // browser; we never fetch or install the APK ourselves. A device with no browser
-    // at all would throw, so the failure is reported rather than crashing the app.
+    // at all would throw. A toast rather than the error slot: the control screen has
+    // no error banner, so from Settings that report would never be seen.
     val openRelease: () -> Unit = {
         try {
             context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(vm.releasesUrl())))
         } catch (e: Exception) {
-            vm.reportError("Couldn't open the browser to show the release.")
+            Toast.makeText(context, "Couldn't open a browser to show the release.",
+                Toast.LENGTH_LONG).show()
         }
     }
 

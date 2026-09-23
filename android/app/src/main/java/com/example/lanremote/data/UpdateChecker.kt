@@ -20,9 +20,10 @@ import java.net.URL
  *    verify — a much bigger trust ask than the feature is worth.
  *  * **Anonymous.** No token, no cookie, no device identifier. A plain GET whose
  *    only header is the User-Agent that GitHub requires.
- *  * **Silent on failure.** Offline, rate-limited, GitHub down, garbled JSON — all
- *    mean "we don't know", which shows nothing rather than an error. An update
- *    check is not something the user asked for, so it must never interrupt them.
+ *  * **Quiet on failure.** Offline, rate-limited, GitHub down, garbled JSON — all
+ *    mean "we don't know". An update check is not something the user asked for, so
+ *    it must never interrupt them: the only trace of a failure is the status line
+ *    in Settings → Updates, which the user has to go and look at.
  *  * **Throttled.** At most one request per [MIN_INTERVAL_MS]; see [SettingsStore].
  */
 object UpdateChecker {
@@ -79,8 +80,8 @@ object UpdateChecker {
      * The newest release's tag, or null if we couldn't find out. Runs on IO.
      *
      * Every failure collapses to null on purpose — see the class doc. The caller
-     * cannot distinguish "up to date" from "couldn't check", and doesn't need to:
-     * both mean show nothing.
+     * can't tell "unreachable" from "GitHub said no" (rate limit, no release), so
+     * Settings words a null as "couldn't check", without blaming either side.
      */
     suspend fun latestTag(): String? = withContext(Dispatchers.IO) {
         var conn: HttpURLConnection? = null

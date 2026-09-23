@@ -12,8 +12,11 @@ See [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md) for the full picture.
 
 Both halves check GitHub's public releases API for a newer tag and show a
 notice (server: a "Version" pill in Details; phone: a card on the connect
-screen). **Notify-only** — never downloads or installs. Anonymous GET, no token,
-silent on any failure. Off via `--no-update-check` / **Advanced → Updates**.
+screen, a dot on the Settings button, and a status line under **Settings →
+Updates**). **Notify-only** — never downloads or installs. Anonymous GET, no token.
+A failure never interrupts; on the phone its only trace is that Settings status
+line ("Couldn't check for updates"). Off via `--no-update-check` (server) /
+**Settings → Updates** (phone).
 
 `APP_VERSION` in `remote_server.py` **must match** `versionName` in
 `android/app/build.gradle.kts` — a test asserts it, since a stale value would

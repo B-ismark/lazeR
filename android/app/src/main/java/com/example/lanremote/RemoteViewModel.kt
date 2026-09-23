@@ -55,6 +55,9 @@ private const val RECONNECT_EXPLAIN_MS = 90_000L
 // battery overnight, brisk enough that a laptop waking up is picked up promptly —
 // and the foreground/network hints in kickReconnect short-circuit the wait anyway.
 private const val RETRY_MAX_MS = 15_000L
+// Automatic update checks: after a failed attempt, wait this long before the next
+// one. Taps on Check now / Try again skip it.
+private const val RETRY_AFTER_FAILURE_MS = 60 * 60_000L
 // Speed-adaptive delta smoothing (one-euro style): near-still input is low-pass
 // filtered to kill capacitive jitter; fast flicks pass straight through so the cursor
 // never lags. Blend ramps from SMOOTH_FLOOR (slow) to 1.0 (fast).
@@ -87,14 +90,16 @@ data class UiState(
     // screen still stays quiet on failure, but Settings must say what happened:
     // a bare switch made "up to date" and "couldn't reach GitHub" look identical,
     // so a user on an old version had no way to tell the check wasn't working.
-    val updateCheck: UpdateCheck = UpdateCheck.Idle,
+    // Named "status", not "check", so it can't be confused with the on/off switch
+    // in settings.updateCheck.
+    val updateStatus: UpdateStatus = UpdateStatus.Idle,
     val lastUpdateCheckMs: Long = 0L,   // last SUCCESSFUL check, epoch millis; 0 = never
-    val appVersion: String = "",        // installed versionName, shown next to the status
+    val appVersion: String = "",        // installed versionName; blank if unreadable
 )
 
 /** Idle covers both "never checked" and "checked fine" — [UiState.lastUpdateCheckMs]
- *  tells those apart. Failed means the most recent attempt didn't get an answer. */
-enum class UpdateCheck { Idle, Checking, Failed }
+ *  tells those apart. Failed means the most recent attempt got no usable answer. */
+enum class UpdateStatus { Idle, Checking, Failed }
 
 class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -151,6 +156,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             savedDevices = store.load(),
             settings = settingsStore.load(),
             lastUpdateCheckMs = settingsStore.lastUpdateCheckMs,
+            appVersion = installedVersion().orEmpty(),
         )
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -170,6 +176,15 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // "try again right now" signal this callback exists to deliver.
         override fun onAvailable(network: Network) = kickReconnect()
     }
+
+    // The update check in flight, if any. Declared above init on purpose: init starts
+    // the launch check, and an initializer written below it would run afterwards and
+    // null the job out.
+    private var updateJob: Job? = null
+    // When the last automatic attempt started, successful or not. A failure doesn't
+    // stamp the daily throttle, so without this a network that blocks GitHub would
+    // be asked again every time the app came back to the front.
+    private var lastUpdateAttemptMs = 0L
 
     init {
         discovery.start { hosts ->
@@ -203,13 +218,23 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
      *  rather than waiting out the throttle, so the toggle gives visible feedback. */
     fun setUpdateCheck(v: Boolean) {
         updateSettings { it.copy(updateCheck = v) }
-        if (v) checkForUpdate(force = true)
-        else update { it.copy(updateTag = null, updateCheck = UpdateCheck.Idle) }
+        if (v) {
+            checkForUpdate(force = true)
+        } else {
+            // Stop a request that's still out, so its answer can't put a badge back
+            // up after the user switched checks off.
+            updateJob?.cancel()
+            update { it.copy(updateTag = null, updateStatus = UpdateStatus.Idle) }
+        }
     }
 
     /** Settings' "Check now" / "Try again": ask GitHub immediately, skipping the
      *  once-a-day throttle. Only reachable by a tap, so it can't hammer the API. */
     fun checkForUpdatesNow() = checkForUpdate(force = true)
+
+    /** App came to the front. Launch alone isn't enough: a phone that keeps LazeR in
+     *  memory for days would never check again. The daily throttle still applies. */
+    fun onForeground() = checkForUpdate()
 
     /** The app's own versionName, read from the installed package.
      *
@@ -227,30 +252,31 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
      * Check GitHub for a newer release, if enabled and the throttle allows.
      *
      * Shows the cached answer first so a known update appears immediately on launch
-     * instead of only after a network round trip. Failures are silent by design —
-     * see [UpdateChecker].
+     * instead of only after a network round trip. A failure never interrupts: it
+     * only shows as the status line in Settings → Updates.
      */
     private fun checkForUpdate(force: Boolean = false) {
         if (!_state.value.settings.updateCheck) return
-        val mine = installedVersion() ?: return
-        update { it.copy(appVersion = mine) }
+        // Unreadable version: nothing to compare against. Settings hides the status
+        // line in this case, so there's no Check now button left doing nothing.
+        val mine = _state.value.appVersion.ifBlank { return }
         // Cached result: instant, offline-safe, and re-validated below if due.
         settingsStore.lastKnownTag?.let { cached ->
             if (UpdateChecker.isNewer(cached, mine)) update { it.copy(updateTag = cached) }
         }
         val now = System.currentTimeMillis()
         if (!force && !settingsStore.updateCheckDue(now)) return
-        if (_state.value.updateCheck == UpdateCheck.Checking) return   // one at a time
-        update { it.copy(updateCheck = UpdateCheck.Checking) }
-        viewModelScope.launch {
+        if (!force && now - lastUpdateAttemptMs in 0 until RETRY_AFTER_FAILURE_MS) return
+        if (updateJob?.isActive == true) return   // one request at a time
+        lastUpdateAttemptMs = now
+        update { it.copy(updateStatus = UpdateStatus.Checking) }
+        updateJob = viewModelScope.launch {
+            // Cancelled (checks switched off) → latestTag's withContext throws on
+            // return, so nothing below runs.
             val tag = UpdateChecker.latestTag()
-            // Switched off while the request was in flight: drop the answer, or it
-            // would put a badge back up right after the user turned checks off.
-            if (!_state.value.settings.updateCheck) return@launch
             if (tag == null) {
-                // Silent everywhere except the Settings status line. The throttle
-                // stamp is left alone, so the next launch tries again.
-                update { it.copy(updateCheck = UpdateCheck.Failed) }
+                // The throttle stamp is left alone, so the next launch tries again.
+                update { it.copy(updateStatus = UpdateStatus.Failed) }
                 return@launch
             }
             val at = System.currentTimeMillis()
@@ -261,7 +287,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             update {
                 it.copy(
                     updateTag = if (UpdateChecker.isNewer(tag, mine)) tag else null,
-                    updateCheck = UpdateCheck.Idle,
+                    updateStatus = UpdateStatus.Idle,
                     lastUpdateCheckMs = at,
                 )
             }

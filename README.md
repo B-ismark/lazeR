@@ -202,14 +202,15 @@ otherwise sit on a stale version indefinitely.
   installing a binary it can't verify, which is a much larger trust ask.
 - **Quiet on failure:** offline, rate-limited or GitHub down all mean "don't know",
   which never interrupts you. On the phone, **Settings → Updates** is the one place
-  that says so ("Couldn't reach GitHub", with **Try again**), so a blocked check
+  that says so ("Couldn't check for updates", with **Try again**), so a blocked check
   can't pass for being up to date.
 - **Where the phone shows it:** a card on the connect screen, a dot on the Settings
   button (the app usually reconnects straight to the pad, so the card alone was easy
   to miss), and the status line under **Settings → Updates**, which also offers
   **Check now**.
-- **Frequency:** server, once per launch. Phone, at most once a day on its own, or
-  whenever you tap **Check now**.
+- **Frequency:** server, once per launch. Phone, at most once a day on its own
+  (checked on launch and whenever the app comes back to the front), or whenever you
+  tap **Check now**.
 - **Turning it off:** server — `--no-update-check`. Phone — **Settings → Updates →
   Check for new versions**. Off means the code is never called at all.
 

@@ -2,7 +2,6 @@ package com.example.lanremote.ui
 
 import android.app.Activity
 import android.os.SystemClock
-import android.text.format.DateUtils
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
@@ -42,6 +41,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.IntOffset
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -128,6 +128,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -146,7 +147,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.example.lanremote.UiState
-import com.example.lanremote.UpdateCheck
+import com.example.lanremote.UpdateStatus
 import com.example.lanremote.dropLastCodePoint
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -1389,7 +1390,14 @@ private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
 private fun SettingsSheet(state: UiState, a: ControlActions, onDismiss: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-        Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 28.dp)) {
+        // Scrolls: sideways, or on a short phone, the sheet is taller than the window,
+        // and Updates (where the Settings badge sends people) is at the very bottom.
+        Column(
+            Modifier
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 28.dp),
+        ) {
             // Pointer — everything that shapes cursor motion.
             SheetTitle("Pointer")
             Text("Cursor speed  ${"%.1f".format(state.settings.sensitivity)}×",
@@ -1428,7 +1436,10 @@ private fun SettingsSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
                     "anything; it just shows a link.",
                 state.settings.updateCheck, a.onUpdateCheck,
             )
-            if (state.settings.updateCheck) UpdateStatus(state, a)
+            // No version, nothing to compare: the check can't run, so offer no button.
+            if (state.settings.updateCheck && state.appVersion.isNotBlank()) {
+                UpdateStatusLine(state, a)
+            }
         }
     }
 }
@@ -1459,9 +1470,9 @@ private fun SettingsIcon(updateAvailable: Boolean) {
  * so a check blocked by the network looked exactly like being current.
  */
 @Composable
-private fun UpdateStatus(state: UiState, a: ControlActions) {
+private fun UpdateStatusLine(state: UiState, a: ControlActions) {
     val tag = state.updateTag
-    val version = state.appVersion.takeIf { it.isNotBlank() }?.let { "You have $it" }
+    val version = "You have ${state.appVersion}"
     if (tag != null) {
         Card(
             shape = RoundedCornerShape(20.dp),
@@ -1474,8 +1485,7 @@ private fun UpdateStatus(state: UiState, a: ControlActions) {
                     style = MaterialTheme.typography.titleSmall,
                     color = MaterialTheme.colorScheme.onSecondaryContainer)
                 Text(
-                    listOfNotNull(version, "Update the laptop app too — they ship together.")
-                        .joinToString(". "),
+                    "$version. Update the laptop app too — they ship together.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSecondaryContainer,
                 )
@@ -1486,21 +1496,33 @@ private fun UpdateStatus(state: UiState, a: ControlActions) {
         return
     }
 
+    // Re-read the clock every half minute so "checked just now" doesn't stay frozen
+    // while the sheet is open.
+    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(30_000)
+            now = System.currentTimeMillis()
+        }
+    }
+
+    val failed = state.updateStatus == UpdateStatus.Failed
     val (line, detail, action) = when {
-        state.updateCheck == UpdateCheck.Checking ->
+        state.updateStatus == UpdateStatus.Checking ->
             Triple("Checking…", version, null)
-        state.updateCheck == UpdateCheck.Failed ->
+        // Also covers GitHub answering with an error (rate limit, no release), so
+        // it doesn't claim the network is at fault.
+        failed ->
             Triple(
-                "Couldn't reach GitHub",
-                "Your network may be blocking it, or GitHub is busy. Nothing is broken " +
-                    "on this phone.",
+                "Couldn't check for updates",
+                "No usable answer from GitHub. Your network may be blocking it, or " +
+                    "GitHub is busy. Nothing is wrong with this phone.",
                 "Try again",
             )
         state.lastUpdateCheckMs > 0L ->
             Triple(
                 "You're up to date",
-                listOfNotNull(version, "checked ${checkedAgo(state.lastUpdateCheckMs)}")
-                    .joinToString(" · "),
+                "$version · checked ${checkedAgo(state.lastUpdateCheckMs, now)}",
                 "Check now",
             )
         else -> Triple("Not checked yet", version, "Check now")
@@ -1511,12 +1533,10 @@ private fun UpdateStatus(state: UiState, a: ControlActions) {
     ) {
         Column(Modifier.weight(1f)) {
             Text(line, style = MaterialTheme.typography.bodyMedium,
-                color = if (state.updateCheck == UpdateCheck.Failed)
+                color = if (failed)
                     MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
-            detail?.let {
-                Text(it, style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
+            Text(detail, style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         if (action != null) {
             TextButton(onClick = a.onCheckUpdateNow) { Text(action) }
@@ -1526,12 +1546,26 @@ private fun UpdateStatus(state: UiState, a: ControlActions) {
     }
 }
 
-/** "just now", "5 minutes ago", "yesterday" — the platform's own wording. */
-private fun checkedAgo(atMs: Long): String {
-    val now = System.currentTimeMillis()
-    if (now - atMs in 0 until DateUtils.MINUTE_IN_MILLIS) return "just now"
-    return DateUtils.getRelativeTimeSpanString(atMs, now, DateUtils.MINUTE_IN_MILLIS)
-        .toString().lowercase()
+/**
+ * "just now", "5 min ago", "3 hours ago", "yesterday", "12 days ago".
+ *
+ * Written out rather than DateUtils: the rest of the app's copy is English, and
+ * DateUtils switches to an absolute date after a week and to "in 3 hours" when the
+ * clock has moved backwards, neither of which reads after "checked". A timestamp in
+ * the future (clock corrected backwards) counts as just now.
+ */
+internal fun checkedAgo(atMs: Long, nowMs: Long): String {
+    val min = (nowMs - atMs) / 60_000
+    val hours = min / 60
+    val days = hours / 24
+    return when {
+        min < 1 -> "just now"
+        min < 60 -> "$min min ago"
+        hours == 1L -> "an hour ago"
+        hours < 24 -> "$hours hours ago"
+        days == 1L -> "yesterday"
+        else -> "$days days ago"
+    }
 }
 
 @Composable
