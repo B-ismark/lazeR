@@ -48,6 +48,11 @@ class SettingsStore(context: Context) {
         get() = prefs.getString("lastDeviceId", null)
         set(v) { prefs.edit().putString("lastDeviceId", v).apply() }
 
+    /** The control screen's one-time gesture hint was closed. */
+    var gestureHintSeen: Boolean
+        get() = prefs.getBoolean("gestureHintSeen", false)
+        set(v) { prefs.edit().putBoolean("gestureHintSeen", v).apply() }
+
     // --- update check bookkeeping ---
     // Persisted so the throttle survives a restart: the app is opened many times a
     // day, and re-checking on every launch would be a request per launch for an

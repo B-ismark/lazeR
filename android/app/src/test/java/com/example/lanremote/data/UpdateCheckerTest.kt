@@ -12,8 +12,8 @@ import org.junit.Test
  * Mirrors `UpdateCheck` in `server/tests/test_wire.py`: the two implementations must
  * agree on what counts as a newer release, or the phone and the laptop would
  * disagree about whether an update exists. Nothing here touches the network —
- * `latestTag()` needs a real HTTP stack, so it is covered by the Python side's
- * stubbed-transport tests plus manual verification.
+ * `latestRelease()` needs a real HTTP stack; what it parses is covered by
+ * ReleaseParsingTest, and the fetch itself only by manual verification.
  */
 class UpdateCheckerTest {
 

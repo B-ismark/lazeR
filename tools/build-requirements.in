@@ -1,0 +1,5 @@
+# Build inputs for LazeR.exe: the server's runtime deps plus PyInstaller.
+# Compile to build-requirements.lock (hashed) with:
+#   uv pip compile tools/build-requirements.in --generate-hashes --python-platform windows --python-version 3.14 -o tools/build-requirements.lock
+-r ../server/requirements.txt
+pyinstaller

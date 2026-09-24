@@ -16,7 +16,7 @@ import org.junit.Test
  * either side and exactly one of the two suites goes red, so the skew is caught in
  * CI instead of on a user's phone.
  *
- * The legacy L2 dialect was accepted through v2.x and is now removed; its golden
+ * The legacy L2 dialect was accepted until 2.2.0 and is now removed; its golden
  * vector was deleted from BOTH suites together (the documented procedure). One L2
  * packet is kept inline below purely to prove open() refuses it.
  *
@@ -105,6 +105,33 @@ class SecureChannelTest {
         assertNotEquals(golden.copyOfRange(2, 10).toList(),
                         impostor.copyOfRange(2, 10).toList())
         assertNull(ch.open(impostor, impostor.size))
+    }
+
+    @Test
+    fun `peek authenticates without pinning, and pin decides the session`() {
+        // The handshake peeks at replies and pins only one that echoes its own
+        // nonce, so a replayed reply from an earlier session can't claim the pin.
+        val ch = SecureChannel(KEY)
+        val stale = SecureChannel(KEY).seal("OK old")
+        val live = SecureChannel(KEY)
+        val ok = live.seal("OK mine")
+        assertEquals("OK old", ch.peek(stale, stale.size)?.text)   // authentic...
+        ch.pin(ch.peek(ok, ok.size)!!)                             // ...but live is pinned
+        assertNull("a stale session got through after the pin", ch.open(stale, stale.size))
+        val pong = live.seal("PONG")
+        assertEquals("PONG", ch.open(pong, pong.size))
+        assertNull("the pinned OK replayed", ch.open(ok, ok.size))
+    }
+
+    @Test
+    fun `a reused cipher still seals every packet correctly`() {
+        // seal() keeps one Cipher and re-inits it per packet; each must still open.
+        val tx = SecureChannel(KEY)
+        val rx = SecureChannel(KEY)
+        repeat(50) { i ->
+            val pkt = tx.seal("MOVE $i -$i")
+            assertEquals("MOVE $i -$i", rx.open(pkt, pkt.size))
+        }
     }
 
     @Test

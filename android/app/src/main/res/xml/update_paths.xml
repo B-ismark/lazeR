@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The only files LazeR ever shares: a downloaded update, handed to the
+     package installer by data/ApkUpdater. -->
+<paths>
+    <cache-path name="update" path="update/" />
+</paths>

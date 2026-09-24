@@ -2,22 +2,20 @@ package com.example.lanremote.data
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
 /**
  * Asks GitHub whether a newer LazeR release exists.
  *
- * This is the ONLY outbound internet request the app makes. Everything else is
- * LAN-only by design — v2.0 removed off-LAN access entirely — so it is deliberately
- * narrow:
+ * One of the app's only two kinds of internet request (the other is [ApkUpdater]'s
+ * download, which the user starts). Everything else is LAN-only by design, so this
+ * is deliberately narrow:
  *
  *  * **Opt-out.** [Settings.updateCheck]; off means this class is never called.
- *  * **Notify-only.** Never downloads or installs anything. The UI links to the
- *    release page and the user takes it from there. Self-updating an APK would mean
- *    asking for install permissions to fetch a binary over a channel the app can't
- *    verify — a much bigger trust ask than the feature is worth.
+ *  * **Checks only.** This reads the release's tag and asset links; it never
+ *    fetches the APK. Downloading happens in [ApkUpdater], and only when the user
+ *    taps Download & install.
  *  * **Anonymous.** No token, no cookie, no device identifier. A plain GET whose
  *    only header is the User-Agent that GitHub requires.
  *  * **Quiet on failure.** Offline, rate-limited, GitHub down, garbled JSON — all
@@ -35,7 +33,39 @@ object UpdateChecker {
     const val MIN_INTERVAL_MS = 24L * 60 * 60 * 1000
 
     private const val TIMEOUT_MS = 6_000
-    private const val MAX_BODY = 64_000   // we need one short field; cap the read
+    // The fields we need sit near the top of GitHub's answer; the release notes
+    // come last and can be long. Read at most this much, and parse what we got
+    // even when the cut leaves the JSON unfinished.
+    private const val MAX_BODY = 256_000
+
+    /** The published asset names (release.yml). */
+    const val APK_ASSET = "LazeR.apk"
+    const val SHA_ASSET = "LazeR.apk.sha256"
+
+    /** A release: its tag and, when it has them, the APK and its checksum. */
+    data class Release(val tag: String, val apkUrl: String?, val shaUrl: String?)
+
+    private val TAG_RE = Regex(""""tag_name"\s*:\s*"([^"\\]{1,64})"""")
+    private val URL_RE = Regex(""""browser_download_url"\s*:\s*"([^"\\]{1,512})"""")
+
+    /**
+     * The tag and asset links from a releases-API body.
+     *
+     * By pattern, not by JSON parser, on purpose: a body cut off at [MAX_BODY]
+     * leaves invalid JSON (see there).
+     * (It is also plain JVM, so it is unit-tested; org.json is an Android stub
+     * there.) The first tag_name is the release's own — nothing above it has one.
+     */
+    fun parseRelease(body: String): Release? {
+        val tag = TAG_RE.find(body)?.groupValues?.get(1)?.trim()
+        if (tag.isNullOrBlank()) return null
+        val urls = URL_RE.findAll(body).map { it.groupValues[1] }.toList()
+        return Release(
+            tag = tag,
+            apkUrl = urls.firstOrNull { it.endsWith("/$APK_ASSET") },
+            shaUrl = urls.firstOrNull { it.endsWith("/$SHA_ASSET") },
+        )
+    }
 
     /**
      * Parse a release tag into comparable numbers. `"v2.1"` → `[2, 1, 0]`.
@@ -55,7 +85,9 @@ object UpdateChecker {
         if (parts.size > 4) return null
         val out = ArrayList<Int>(4)
         for (p in parts) {
-            if (p.isEmpty() || !p.all { it.isDigit() }) return null
+            // ASCII digits only: isDigit() and toIntOrNull() also accept other
+            // scripts' digits ("٢"), which no tag of ours contains.
+            if (p.isEmpty() || !p.all { it in '0'..'9' }) return null
             out.add(p.toIntOrNull() ?: return null)
         }
         while (out.size < 3) out.add(0)
@@ -77,13 +109,13 @@ object UpdateChecker {
     }
 
     /**
-     * The newest release's tag, or null if we couldn't find out. Runs on IO.
+     * The newest release, or null if we couldn't find out. Runs on IO.
      *
      * Every failure collapses to null on purpose — see the class doc. The caller
      * can't tell "unreachable" from "GitHub said no" (rate limit, no release), so
      * Settings words a null as "couldn't check", without blaming either side.
      */
-    suspend fun latestTag(): String? = withContext(Dispatchers.IO) {
+    suspend fun latestRelease(): Release? = withContext(Dispatchers.IO) {
         var conn: HttpURLConnection? = null
         try {
             conn = (URL(API).openConnection() as HttpURLConnection).apply {
@@ -105,8 +137,7 @@ object UpdateChecker {
                 }
                 String(buf, 0, n, Charsets.UTF_8)
             }
-            val tag = JSONObject(body).optString("tag_name", "")
-            if (tag.isBlank()) null else tag
+            parseRelease(body)
         } catch (e: Exception) {
             null
         } finally {

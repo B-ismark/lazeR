@@ -7,8 +7,11 @@
     <!-- Required to acquire a low-latency WifiLock (keeps the radio awake during a
          session; acquireWifiLock enforces WAKE_LOCK). -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- In-app updates (data/ApkUpdater): hand a downloaded, checksum-verified
+         release APK to Android's installer. Android still refuses any APK not
+         signed by LazeR's own key. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:allowBackup="false"
@@ -24,6 +27,17 @@
         <meta-data
             android:name="com.google.mlkit.vision.DEPENDENCIES"
             android:value="barcode_ui" />
+
+        <!-- Serves only cache/update/ (res/xml/update_paths.xml) to the installer. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_paths" />
+        </provider>
 
         <activity
             android:name=".MainActivity"

@@ -4,19 +4,32 @@ import android.app.Application
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
-import android.net.Uri
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.lanremote.data.ApkUpdater
 import com.example.lanremote.data.Device
 import com.example.lanremote.data.DeviceStore
 import com.example.lanremote.data.DiscoveredHost
 import com.example.lanremote.data.Discovery
+import com.example.lanremote.data.DiscoveryStatus
 import com.example.lanremote.data.Settings
 import com.example.lanremote.data.SettingsStore
 import com.example.lanremote.data.UpdateChecker
+import com.example.lanremote.data.savedMatch
+import com.example.lanremote.net.ConnectOutcome
+import com.example.lanremote.net.ConnectResult
+import com.example.lanremote.net.PairingError
+import com.example.lanremote.net.PairingException
+import com.example.lanremote.net.Protocol
 import com.example.lanremote.net.RemoteClient
+import com.example.lanremote.net.SecureChannel
+import com.example.lanremote.net.ipv4Octets
+import com.example.lanremote.net.parsePairingUri
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -33,9 +46,8 @@ enum class ConnState { Disconnected, Connecting, Connected, Reconnecting }
 
 /** Dotted-quad to a 32-bit int, or null if it isn't a plain IPv4 literal. */
 private fun ipv4ToInt(s: String): Int? {
-    val parts = s.split(".").mapNotNull { it.toIntOrNull() }
-    if (parts.size != 4 || parts.any { it !in 0..255 }) return null
-    return (parts[0] shl 24) or (parts[1] shl 16) or (parts[2] shl 8) or parts[3]
+    val o = ipv4Octets(s) ?: return null
+    return (o[0] shl 24) or (o[1] shl 16) or (o[2] shl 8) or o[3]
 }
 
 // Pointer acceleration: smoothed speed at/above which the gain saturates, and the
@@ -63,14 +75,31 @@ private const val RETRY_AFTER_FAILURE_MS = 60 * 60_000L
 // never lags. Blend ramps from SMOOTH_FLOOR (slow) to 1.0 (fast).
 private const val SMOOTH_FLOOR = 0.45f       // min blend at rest — lower = smoother, more lag
 private const val SMOOTH_REF_PX = 7f         // per-event speed at which smoothing fully disengages
+// How long a fresh discovery run shows "Looking for laptops…" before an empty list
+// reads as "none found". NSD answers within a second or two on a healthy LAN.
+private const val DISCOVERY_QUIET_MS = 8_000L
+// A reconnect this soon after the phone put the laptop to sleep is the sleep, not
+// a network problem, and is described that way.
+private const val SLEEP_EXPLAINS_MS = 30 * 60_000L
+
+/** A scanned QR that would replace the pairing of a saved laptop, waiting for the
+ *  user to confirm. [existing] is the saved record it replaces. */
+data class PendingPairing(val existing: Device, val name: String, val ip: String,
+                          val port: Int, val token: String, val key: String)
 
 data class UiState(
+    // The typed-code form only. Deliberately NOT the connected device, or "Enter
+    // manually" would come pre-filled with a QR-paired laptop's token and "Connect &
+    // save" could overwrite its pairing.
     val name: String = "",
     val ip: String = "",
-    val port: String = "50505",
+    val port: String = Protocol.DEFAULT_PORT.toString(),
     val token: String = "",
+    // The laptop being connected to / driven / reconnected to.
+    val deviceName: String = "",
     val conn: ConnState = ConnState.Disconnected,
     val volume: Float = 50f,
+    val muted: Boolean? = null,        // null: the laptop doesn't report it
     val brightness: Float = 50f,
     val brightnessAvailable: Boolean = false,
     // NOTE: the keyboard's staging text deliberately does NOT live here. It used to,
@@ -80,8 +109,15 @@ data class UiState(
     // uncommitted composing text. The field owns its own editing state now — see
     // KeyboardPanel — and the ViewModel keeps only the diff, not the display value.
     val error: String? = null,
+    // A QR that couldn't be used. Kept apart from [error] so a bad scan on the
+    // Reconnecting screen doesn't overwrite its diagnosis.
+    val scanError: String? = null,
+    val pendingReplace: PendingPairing? = null,
     val savedDevices: List<Device> = emptyList(),
     val discovered: List<DiscoveredHost> = emptyList(),
+    val discoveryStatus: DiscoveryStatus = DiscoveryStatus.Idle,
+    // The current run has searched for DISCOVERY_QUIET_MS and found nothing.
+    val discoveryQuiet: Boolean = false,
     val settings: Settings = Settings(),
     // Tag of a newer release, or null when we're current / haven't found out / the
     // check is switched off. Drives the connect-screen card and the Settings badge.
@@ -95,11 +131,25 @@ data class UiState(
     val updateStatus: UpdateStatus = UpdateStatus.Idle,
     val lastUpdateCheckMs: Long = 0L,   // last SUCCESSFUL check, epoch millis; 0 = never
     val appVersion: String = "",        // installed versionName; blank if unreadable
+    val gestureHintSeen: Boolean = true,
+    val download: UpdateDownload = UpdateDownload.Idle,
 )
 
 /** Idle covers both "never checked" and "checked fine" — [UiState.lastUpdateCheckMs]
  *  tells those apart. Failed means the most recent attempt got no usable answer. */
 enum class UpdateStatus { Idle, Checking, Failed }
+
+/** The in-app download of a newer release. */
+sealed interface UpdateDownload {
+    data object Idle : UpdateDownload
+    /** [total] is -1 when the server didn't say. */
+    data class Running(val bytes: Long, val total: Long) : UpdateDownload
+    /** Downloaded and verified; Install hands it to Android. */
+    data object Ready : UpdateDownload
+    /** [canRetry] = false when this release can only be installed from the release
+     *  page (it has no published checksum). */
+    data class Failed(val message: String, val canRetry: Boolean = true) : UpdateDownload
+}
 
 class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -107,9 +157,20 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private val store = DeviceStore(app)
     private val discovery = Discovery(app)
     private val settingsStore = SettingsStore(app)
+    private val updater = ApkUpdater(app)
+    private var latestRelease: UpdateChecker.Release? = null
+    private var downloadJob: Job? = null
+    private var verifiedSha: String? = null
+    private var downloadGen = 0L          // the newest downloadUpdate(); see its set()
+    private var downloadTag: String? = null   // the release the Ready file is
     private var healthJob: Job? = null
     private var reconnectJob: Job? = null
+    private var connectJob: Job? = null
+    private var discoveryQuietJob: Job? = null
+    private var sleepRequestedMs = 0L         // when the phone last sent SYS sleep...
+    private var sleptDeviceId: String? = null //   ...and to which laptop
     private var lastUserVolumeMs: Long = 0
+    private var lastUserMuteMs: Long = 0
     private var lastUserBrightnessMs: Long = 0
     private var lastInteractionMs: Long = 0   // drives adaptive health-poll backoff
     private var current: Device? = null   // device we're connected to / reconnecting
@@ -157,6 +218,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             settings = settingsStore.load(),
             lastUpdateCheckMs = settingsStore.lastUpdateCheckMs,
             appVersion = installedVersion().orEmpty(),
+            gestureHintSeen = settingsStore.gestureHintSeen,
         )
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -177,6 +239,26 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         override fun onAvailable(network: Network) = kickReconnect()
     }
 
+    // The Wi-Fi and Ethernet networks themselves, not the default one: behind a VPN
+    // the default network is the VPN, which doesn't change when Wi-Fi drops or
+    // switches, so watching it left laptops from a network the phone had left on the
+    // list. A default NetworkRequest excludes VPNs.
+    private val lanCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) = kickReconnect()
+        override fun onLost(network: Network) {
+            viewModelScope.launch { forgetDiscovered() }
+        }
+    }
+
+    /** A Wi-Fi or Ethernet network went away, so the laptops found on it are gone
+     *  from here: stop listing them, and look again if a scan was running. */
+    private fun forgetDiscovered() {
+        val scanning = _state.value.discoveryStatus != DiscoveryStatus.Idle
+        stopDiscovery()   // first, so no result from the old network lands after the clear
+        update { it.copy(discovered = emptyList()) }
+        if (scanning) startDiscovery()
+    }
+
     // The update check in flight, if any. Declared above init on purpose: init starts
     // the launch check, and an initializer written below it would run afterwards and
     // null the job out.
@@ -187,23 +269,48 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var lastUpdateAttemptMs = 0L
 
     init {
-        discovery.start { hosts ->
-            update { it.copy(discovered = hosts) }
-        }
+        startDiscovery()
         try {
             connectivity?.registerDefaultNetworkCallback(netCallback)
+            connectivity?.registerNetworkCallback(
+                NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                    .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                    .build(),
+                lanCallback)
         } catch (_: Exception) {
             // Callback registration is best-effort — the timed retry still runs.
         }
-        // Silently re-try the last device on launch, if any.
+        // Silently re-try the last device on launch, if any. A failure that retrying
+        // can fix goes into the reconnect loop: Android often kills the app
+        // overnight, and the laptop may still be waking when the user opens it.
         val lastId = settingsStore.lastDeviceId
-        store.load().firstOrNull { it.id == lastId }?.let { connectSaved(it) }
+        store.load().firstOrNull { it.id == lastId }?.let { connectDevice(it, save = false, auto = true) }
         checkForUpdate()   // no-op when switched off or inside the throttle window
+        // A downloaded APK is only ever known about in memory, so one on disk now is
+        // left over from an install or a killed process: about 10 MB of cache.
+        viewModelScope.launch(Dispatchers.IO) { updater.clear() }
     }
 
     /** Restart mDNS discovery — clears the list and looks again for laptops. */
-    fun rescan() {
-        discovery.start { hosts -> update { it.copy(discovered = hosts) } }
+    fun rescan() = startDiscovery()
+
+    private fun startDiscovery() {
+        discoveryQuietJob?.cancel()
+        update { it.copy(discoveryQuiet = false) }
+        discovery.start(
+            onChange = { hosts -> update { it.copy(discovered = hosts) } },
+            onStatus = { st -> update { it.copy(discoveryStatus = st) } },
+        )
+        discoveryQuietJob = viewModelScope.launch {
+            delay(DISCOVERY_QUIET_MS)
+            update { it.copy(discoveryQuiet = true) }
+        }
+    }
+
+    private fun stopDiscovery() {
+        discoveryQuietJob?.cancel()
+        discovery.stop()
     }
 
     // --- settings ---
@@ -224,6 +331,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             // Stop a request that's still out, so its answer can't put a badge back
             // up after the user switched checks off.
             updateJob?.cancel()
+            cancelDownload()
             update { it.copy(updateTag = null, updateStatus = UpdateStatus.Idle) }
         }
     }
@@ -271,14 +379,21 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         lastUpdateAttemptMs = now
         update { it.copy(updateStatus = UpdateStatus.Checking) }
         updateJob = viewModelScope.launch {
-            // Cancelled (checks switched off) → latestTag's withContext throws on
+            // Cancelled (checks switched off) → latestRelease's withContext throws on
             // return, so nothing below runs.
-            val tag = UpdateChecker.latestTag()
-            if (tag == null) {
+            val release = UpdateChecker.latestRelease()
+            val tag = release?.tag
+            if (release == null || tag == null) {
                 // The throttle stamp is left alone, so the next launch tries again.
                 update { it.copy(updateStatus = UpdateStatus.Failed) }
                 return@launch
             }
+            latestRelease = release
+            // A downloaded file is for the tag it was fetched for. Once the notice
+            // names another (a newer release, or none because this one is now
+            // installed), drop it rather than install the wrong version under it.
+            val shown = if (UpdateChecker.isNewer(tag, mine)) tag else null
+            if (downloadTag != null && downloadTag != shown) cancelDownload()
             val at = System.currentTimeMillis()
             settingsStore.lastUpdateCheckMs = at
             settingsStore.lastKnownTag = tag
@@ -286,7 +401,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             // once the user has actually updated, which is the only way it goes away.
             update {
                 it.copy(
-                    updateTag = if (UpdateChecker.isNewer(tag, mine)) tag else null,
+                    updateTag = shown,
                     updateStatus = UpdateStatus.Idle,
                     lastUpdateCheckMs = at,
                 )
@@ -294,13 +409,117 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Open the releases page. Notify-only: we never download or install an APK. */
+    /** The release page, for a browser: the fallback when the app can't install. */
     fun releasesUrl(): String = UpdateChecker.RELEASES_PAGE
+
+    /**
+     * Download the newer release's APK and verify it against the checksum published
+     * next to it. Only ever on a tap, never automatically: the update CHECK is
+     * automatic, the download is the user's call.
+     */
+    fun downloadUpdate() {
+        if (downloadJob?.isActive == true) return
+        // Every state write below checks this is still the newest download: a
+        // cancelled one can't be interrupted mid-read, so its late progress or
+        // result would overwrite whatever came after it.
+        val gen = ++downloadGen
+        fun set(d: UpdateDownload) {
+            if (gen == downloadGen) update { it.copy(download = d) }
+        }
+        set(UpdateDownload.Running(0, -1))
+        downloadJob = viewModelScope.launch {
+            val release = latestRelease?.takeIf { it.tag == _state.value.updateTag }
+                ?: UpdateChecker.latestRelease()?.also { latestRelease = it }
+            if (release == null) {
+                set(UpdateDownload.Failed(
+                    "Couldn't reach GitHub. Check the connection and try again."))
+                return@launch
+            }
+            // Fetched afresh when the notice came from the cache: make sure it is
+            // still newer than what's installed before downloading it.
+            if (!UpdateChecker.isNewer(release.tag, _state.value.appVersion)) {
+                set(UpdateDownload.Failed("This phone already has the newest LazeR.",
+                    canRetry = false))
+                return@launch
+            }
+            val apk = release.apkUrl
+            val shaUrl = release.shaUrl
+            if (apk == null || shaUrl == null) {
+                set(UpdateDownload.Failed(
+                    "This release can't be installed from inside the app. Open the " +
+                        "release page to download it.", canRetry = false))
+                return@launch
+            }
+            val sha = updater.fetchSha256(shaUrl)
+            if (sha == null) {
+                set(UpdateDownload.Failed(
+                    "Couldn't read the release's checksum. Try again, or open the " +
+                        "release page."))
+                return@launch
+            }
+            val result = updater.download(apk, sha) { bytes, total ->
+                set(UpdateDownload.Running(bytes, total))
+            }
+            if (gen != downloadGen) return@launch
+            when (result) {
+                ApkUpdater.Download.Ok -> {
+                    verifiedSha = sha
+                    downloadTag = release.tag
+                    set(UpdateDownload.Ready)
+                }
+                is ApkUpdater.Download.Failed -> set(
+                    if (result.reason == "cancelled") UpdateDownload.Idle
+                    else UpdateDownload.Failed(downloadFailureMessage(result.reason)))
+            }
+        }
+    }
+
+    fun cancelDownload() {
+        downloadGen++
+        downloadTag = null
+        verifiedSha = null
+        updater.cancel()
+        downloadJob?.cancel()
+        updater.clear()
+        update { it.copy(download = UpdateDownload.Idle) }
+    }
+
+    /** What the activity should launch to install: Android's installer, or first
+     *  the "allow installs from LazeR" screen. Null means there's nothing to do
+     *  (the state already says why). */
+    suspend fun installIntent(): android.content.Intent? {
+        val sha = verifiedSha ?: return null
+        return when (val r = updater.installIntent(sha)) {
+            is ApkUpdater.Install.Launch -> r.intent
+            is ApkUpdater.Install.NeedsPermission -> r.intent
+            is ApkUpdater.Install.Failed -> {
+                verifiedSha = null
+                update { it.copy(download = UpdateDownload.Failed(
+                    "The downloaded file changed or went missing. Download it again.")) }
+                null
+            }
+        }
+    }
+
+    private fun downloadFailureMessage(reason: String): String = when (reason) {
+        "digest", "short" ->
+            "The download didn't match the release's checksum, so it was thrown away. " +
+                "Try again."
+        "too-big" -> "The download was larger than any LazeR release, so it was stopped."
+        "slow" -> "The download was too slow and was stopped. Try again on a better connection."
+        "network" -> "The download was interrupted. Check the connection and try again."
+        else -> "Couldn't download the update ($reason). Try again, or open the release page."
+    }
 
     private inline fun updateSettings(block: (Settings) -> Settings) {
         val s = block(_state.value.settings)
         settingsStore.save(s)
         update { it.copy(settings = s) }
+    }
+
+    fun dismissGestureHint() {
+        settingsStore.gestureHintSeen = true
+        update { it.copy(gestureHintSeen = true) }
     }
 
     // --- form fields ---
@@ -331,87 +550,160 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
     // --- connect entry points ---
     fun connectManual() {
-        // Manual code entry has no key ⇒ legacy plaintext (trusted networks only).
+        // Typed code has no key ⇒ legacy plaintext, which the laptop refuses unless
+        // it allows it. The saved record keeps any key it already had (mergeDevice).
         val s = _state.value
-        connect(s.name, s.ip, s.port.toIntOrNull() ?: 50505, s.token, "", save = true)
-    }
-
-    fun connectSaved(device: Device) {
-        update { it.copy(name = device.name, ip = device.ip,
-            port = device.port.toString(), token = device.token) }
-        connect(device.name, device.ip, device.port, device.token, device.key,
-            save = false)
-    }
-
-    fun useDiscovered(host: DiscoveredHost) {
-        // Fill IP/port from discovery; token still required (then saved).
-        update {
-            it.copy(name = host.name, ip = host.ip, port = host.port.toString(),
-                error = "Enter the token for ${host.name}")
+        val ip = s.ip.trim()
+        if (ip.isBlank() || s.token.isBlank()) {
+            update { it.copy(error = "Enter the laptop's IP and its pairing code.") }
+            return
         }
+        val port = s.port.toIntOrNull() ?: Protocol.DEFAULT_PORT
+        connectDevice(newDevice(s.name, ip, port, s.token, ""), save = true)
     }
 
-    /** Parse a scanned `lazer://ip:port/?token=..&name=..&k=..&r=..` URI and connect. */
+    fun connectSaved(device: Device) = connectDevice(device, save = false)
+
+    /** Parse a scanned `lazer://ip:port/?token=..&name=..&k=..` URI and connect. */
     fun applyScannedUri(raw: String) {
-        val uri = try { Uri.parse(raw.trim()) } catch (e: Exception) { null }
-        if (uri == null || uri.scheme != "lazer" || uri.host.isNullOrBlank()) {
-            update { it.copy(error = "Unrecognized QR code") }
+        val p = parsePairingUri(raw).getOrElse { e ->
+            val msg = when ((e as? PairingException)?.error) {
+                PairingError.NoToken -> "That QR code has no pairing code in it."
+                PairingError.BadHost ->
+                    "That QR code doesn't name a laptop's address, so LazeR won't use it."
+                else -> "Unrecognized QR code — scan the one in the LazeR window on the laptop."
+            }
+            update { it.copy(scanError = msg) }
             return
         }
-        val ip = uri.host!!
-        val port = if (uri.port > 0) uri.port else 50505
-        val token = uri.getQueryParameter("token")?.uppercase().orEmpty()
-        val name = uri.getQueryParameter("name") ?: ip
-        val key = uri.getQueryParameter("k").orEmpty()   // 256-bit secret ⇒ encrypted wire
-        if (token.isBlank()) {
-            update { it.copy(error = "QR code has no token") }
+        // A key that is present but unreadable must not fall back to the plaintext
+        // wire: that would put the pairing code on the air in the clear.
+        if (p.key.isNotBlank() && SecureChannel.keyFromBase64(p.key) == null) {
+            update { it.copy(scanError = "Unrecognized QR code — its encryption key is damaged.") }
             return
         }
-        update { it.copy(name = name, ip = ip, port = port.toString(), token = token) }
-        connect(name, ip, port, token, key, save = true)
+        update { it.copy(scanError = null) }
+        val dev = newDevice(p.name, p.host, p.port, p.token, p.key)
+        val existing = savedMatch(_state.value.savedDevices, dev)
+        if (existing != null && existing.key.isNotBlank() && existing.key != p.key) {
+            // Someone could have planted this QR; don't silently swap a saved
+            // laptop's pairing for it.
+            update {
+                it.copy(pendingReplace = PendingPairing(existing, p.name, p.host, p.port,
+                    p.token, p.key))
+            }
+            return
+        }
+        connectDevice(dev, save = true, auto = scannedWhileReconnecting(), scanned = true)
     }
 
-    private fun connect(name: String, ip: String, port: Int, token: String,
-                        key: String, save: Boolean) {
-        if (ip.isBlank() || token.isBlank()) {
-            update { it.copy(error = "Need an IP and token") }
-            return
-        }
-        val dev = Device(id = "$ip:$port", name = name.ifBlank { ip },
-            ip = ip, port = port, token = token, key = key)
+    fun confirmReplace() {
+        val p = _state.value.pendingReplace ?: return
+        update { it.copy(pendingReplace = null) }
+        connectDevice(Device(id = p.existing.id, name = p.name, ip = p.ip, port = p.port,
+            token = p.token, key = p.key), save = true, auto = scannedWhileReconnecting(),
+            scanned = true)
+    }
+
+    /** A QR scanned from the Reconnecting screen must not turn the retry-forever
+     *  loop into one attempt: if the laptop is still asleep, keep retrying. */
+    private fun scannedWhileReconnecting() = _state.value.conn == ConnState.Reconnecting
+
+    fun cancelReplace() = update { it.copy(pendingReplace = null) }
+
+    /** Stop a connect in progress (the Cancel button while connecting). */
+    fun cancelConnect() {
+        // A tap on a Cancel button still on screen after the connect landed.
+        if (_state.value.conn != ConnState.Connecting) return
+        connectJob?.cancel()
+        // disconnect, not just cancelConnect: a handshake that finished on the IO
+        // thread just before the cancel has already installed its session.
+        client.disconnect()
+        current = null
+        // The Reconnecting screen may have been holding the radio awake, and its
+        // long tail stops discovery between attempts.
+        holdWifi(false)
+        update { it.copy(conn = ConnState.Disconnected) }
+        startDiscovery()
+    }
+
+    private fun newDevice(name: String, ip: String, port: Int, token: String, key: String) =
+        Device(id = "$ip:$port", name = name.ifBlank { ip }, ip = ip, port = port,
+            token = token, key = key)
+
+    private fun connectDevice(
+        dev0: Device, save: Boolean, auto: Boolean = false, scanned: Boolean = false,
+    ) {
+        // Keep the saved record's id and bound flag, so lastDeviceId and the
+        // downgrade guard follow the laptop rather than its address. A scan drops
+        // the flag: see mergeDevice's rescanned.
+        val existing = savedMatch(_state.value.savedDevices, dev0)
+        val dev = if (existing != null) {
+            // A typed code for a laptop already paired by QR, with the same code:
+            // use the saved key rather than dropping to the plaintext wire.
+            val key = if (dev0.key.isBlank() && existing.token == dev0.token) existing.key
+            else dev0.key
+            dev0.copy(id = existing.id, key = key,
+                bound = !scanned && existing.bound && existing.key == key)
+        } else dev0
+        // Another laptop's mute state isn't this one's; the first VGET fills it in.
+        val keepMute = current?.id == dev.id
         current = dev
         reconnectJob?.cancel()
-        // Cancel the watchdog too — this used to cancel only the reconnect job, and a
-        // health loop left alive shares ONE DatagramSocket with the handshake below.
-        // awaitReply discards any reply that isn't the prefix it wants, so a lingering
-        // queryVolume would swallow the CHAL or the OK the handshake was waiting for,
-        // and the connect timed out for no visible reason. Tapping the device again
-        // just re-ran the same race. It could also declare the link dead mid-connect
-        // and drag us into beginReconnect on top of the attempt in flight.
+        // Cancel the watchdog too: a health loop left alive could declare the link
+        // dead mid-connect and drag us into beginReconnect on top of the attempt.
         healthJob?.cancel()
-        update { it.copy(conn = ConnState.Connecting, error = null) }
-        viewModelScope.launch {
-            val connected = connectResolving(dev, 2000)
+        connectJob?.cancel()
+        // Clear an old scan error too: it outranks the connect's own diagnosis on the
+        // connect screen, so a stale "Unrecognized QR code" would hide it.
+        update { it.copy(conn = ConnState.Connecting, error = null, scanError = null,
+            deviceName = dev.name, muted = if (keepMute) it.muted else null) }
+        connectJob = viewModelScope.launch {
+            val (connected, outcome) = connectResolving(dev, 2000)
+            if (outcome.result == ConnectResult.Cancelled) return@launch
             if (connected != null) {
-                current = connected
-                // Persist when explicitly saving, OR when the stored address was
-                // stale and we reached the laptop at a new IP via mDNS — so next
-                // tap dials the right place instead of failing again.
-                val moved = connected.ip != dev.ip || connected.port != dev.port
-                if (save || moved) update { it.copy(savedDevices = store.upsert(connected)) }
-                settingsStore.lastDeviceId = connected.id
-                discovery.stop()   // no need to keep scanning Wi-Fi while controlling
-                holdWifi(true)     // pin the radio low-latency for the session
-                touch()
-                update { it.copy(conn = ConnState.Connected) }
-                startHealthLoop()
+                onConnected(dev, connected, persist = save, rescanned = scanned)
+            } else if (auto && outcome.result == ConnectResult.NoAnswer) {
+                // A scan handed to the retry loop is still a scan: save it when it lands.
+                beginReconnect(persist = save, rescanned = scanned)
             } else {
+                // The Reconnecting screen may have been holding the radio awake.
+                holdWifi(false)
                 update {
                     it.copy(conn = ConnState.Disconnected,
-                        error = connectFailureMessage(dev))
+                        error = connectFailureMessage(dev, outcome.result))
                 }
             }
         }
+    }
+
+    /** A connect or reconnect succeeded: remember what changed and go live. */
+    private fun onConnected(
+        asked: Device, connected0: Device, persist: Boolean, rescanned: Boolean = false,
+    ) {
+        var connected = connected0
+        // Persist when explicitly saving, when the stored address was stale and we
+        // reached the laptop at a new IP via mDNS (so the next tap dials the right
+        // place), or when it has just shown it binds its handshake.
+        val moved = connected.ip != asked.ip || connected.port != asked.port
+        val learned = connected.bound && !asked.bound
+        if (persist || moved || learned) {
+            // Outside update{}: its lambda re-runs on a lost race, and this is a
+            // Keystore round trip and a prefs write.
+            val list = store.upsert(connected, rescanned)
+            update { it.copy(savedDevices = list) }
+            // The merge may have folded this into a record with another id; follow
+            // it, or lastDeviceId points at nothing and the next launch can't find it.
+            savedMatch(list, connected)?.let { connected = connected.copy(id = it.id) }
+        }
+        current = connected
+        settingsStore.lastDeviceId = connected.id
+        if (connected.id == sleptDeviceId) sleptDeviceId = null   // it's awake again
+        stopDiscovery()    // no need to keep scanning Wi-Fi while controlling
+        holdWifi(true)     // pin the radio low-latency for the session
+        touch()
+        update { it.copy(conn = ConnState.Connected, error = null, deviceName = connected.name) }
+        startHealthLoop()
     }
 
     /**
@@ -423,23 +715,43 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
      * phone and the laptop never share a subnet. We already know our own addresses,
      * so we can tell that apart from "same network, nothing answered".
      */
-    private fun connectFailureMessage(dev: Device): String {
+    private fun connectFailureMessage(dev: Device, result: ConnectResult): String {
+        when (result) {
+            ConnectResult.NeedsQr -> return "${dev.name} only accepts QR pairing, because " +
+                "it requires encryption. Scan the QR code in the LazeR window on the laptop."
+            ConnectResult.WrongKey -> return "${dev.name} has been re-paired since this " +
+                "phone last connected. Scan the new QR code in the LazeR window."
+            ConnectResult.Outdated -> return "${dev.name} answered in an older format. " +
+                "Update LazeR on the laptop, or scan its QR code to keep using that version."
+            else -> {}
+        }
         val mine = localIPv4s()
+        val tail = if (dev.key.isBlank()) " A typed code only works while the laptop " +
+            "allows unencrypted pairing — scanning its QR is more reliable."
+        else " If the laptop was re-paired, scan its new QR code."
+        // The phone's own network first: a Sleep explains silence, not a phone that
+        // has left the laptop's Wi-Fi. Only an IPv4 literal can be subnet-checked.
         return when {
             mine.isEmpty() ->
                 "This phone has no Wi-Fi address — join the laptop's network and retry."
-            mine.none { it.sharesSubnetWith(dev.ip) } ->
+            ipv4ToInt(dev.ip) != null && mine.none { it.sharesSubnetWith(dev.ip) } ->
                 "Your phone is on ${mine.first().address} but ${dev.ip} is on a " +
                     "different network, so they can't reach each other. Put both on the " +
                     "same Wi-Fi — note that a router's 2.4 GHz and 5 GHz names are " +
                     "sometimes separate networks, and guest networks always are."
+            sleptRecently(dev) ->
+                "${dev.name} is asleep. Wake it and LazeR reconnects by itself."
             else ->
-                "${dev.ip} is on your network but didn't answer. Check LazeR is running " +
+                "${dev.ip}${if (ipv4ToInt(dev.ip) != null) " is on your network but" else ""}" +
+                    " didn't answer. Check LazeR is running " +
                     "on the laptop and that you allowed its firewall prompt — the LazeR " +
                     "window warns when inbound UDP is blocked. Some routers also block " +
-                    "device-to-device traffic (\"client isolation\")."
+                    "device-to-device traffic (\"client isolation\")." + tail
         }
     }
+
+    private fun sleptRecently(dev: Device) = dev.id == sleptDeviceId &&
+        System.currentTimeMillis() - sleepRequestedMs < SLEEP_EXPLAINS_MS
 
     private data class LocalV4(val address: String, val prefix: Int) {
         /** True if [target] falls inside this interface's subnet. Uses the interface's
@@ -465,14 +777,26 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         return a != 127 && a != 0 && !(a == 169 && b == 254)
     }
 
+    /** This phone's IPv4 addresses on Wi-Fi or Ethernet, whatever their range (a
+     *  campus LAN can be public or CGNAT space). Chosen by the network's transport,
+     *  not the interface name or address range: mobile data and VPNs aren't a LAN
+     *  the laptop is on, even when they hand out 10.x addresses. */
+    @Suppress("DEPRECATION")   // allNetworks: its replacement needs a callback
     private fun localIPv4s(): List<LocalV4> = try {
-        java.net.NetworkInterface.getNetworkInterfaces().asSequence()
-            .filter { it.isUp && !it.isLoopback }
-            .flatMap { it.interfaceAddresses.asSequence() }
-            .filter { it.address is java.net.Inet4Address && it.address.isSiteLocalAddress }
-            .mapNotNull { ia ->
-                ia.address.hostAddress?.let { LocalV4(it, ia.networkPrefixLength.toInt()) }
+        val cm = connectivity ?: return emptyList()
+        cm.allNetworks.asSequence()
+            .filter { n ->
+                val c = cm.getNetworkCapabilities(n) ?: return@filter false
+                !c.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                    (c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                        c.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
             }
+            .flatMap { n -> cm.getLinkProperties(n)?.linkAddresses.orEmpty().asSequence() }
+            .filter { la ->
+                val a = la.address
+                a is java.net.Inet4Address && !a.isLoopbackAddress && !a.isLinkLocalAddress
+            }
+            .mapNotNull { la -> la.address.hostAddress?.let { LocalV4(it, la.prefixLength) } }
             .toList()
     } catch (e: Exception) {
         emptyList()
@@ -480,12 +804,31 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Connect to [dev]'s stored address; if that fails, try every laptop currently
-     * visible via mDNS (its IP may have moved on a DHCP lease / reboot). The wrong
-     * host simply fails the authenticated handshake, so trying them is safe.
-     * @return the device that answered (its id preserved, ip/port refreshed), or null.
+     * visible via mDNS (its IP may have moved on a DHCP lease / reboot).
+     *
+     * Only for a QR-paired device: a wrong host can't complete the keyed handshake,
+     * so trying strangers costs nothing. A typed-code device sends its token in the
+     * clear and accepts a plain OK from anyone, so it never tries a discovered host —
+     * anything on the LAN advertising `_lazer._udp` would otherwise be handed the
+     * token and then every keystroke.
+     *
+     * @return the device that answered (its id preserved, ip/port refreshed, bound
+     *   flag updated) or null, with the outcome that decides the message: the saved
+     *   address's own refusal wins over the discovered hosts' silence, and the same
+     *   laptop's refusal at a new address wins over the saved address's silence.
      */
-    private suspend fun connectResolving(dev: Device, timeoutMs: Long): Device? {
-        if (client.connect(dev.ip, dev.port, dev.token, dev.key, timeoutMs)) return dev
+    private suspend fun connectResolving(dev: Device, timeoutMs: Long): Pair<Device?, ConnectOutcome> {
+        // The QR and the store only hold keys that decoded; a record that no longer
+        // does fails closed instead of going out on the plaintext wire.
+        val raw = if (dev.key.isBlank()) null
+        else SecureChannel.keyFromBase64(dev.key)
+            ?: return null to ConnectOutcome(ConnectResult.WrongKey)
+        fun done(o: ConnectOutcome, ip: String, port: Int) =
+            dev.copy(ip = ip, port = port, bound = dev.bound || o.bound) to o
+        val first = client.connect(dev.ip, dev.port, dev.token, raw, timeoutMs,
+            requireBound = dev.bound)
+        if (first.result == ConnectResult.Connected) return done(first, dev.ip, dev.port)
+        if (first.result == ConnectResult.Cancelled || raw == null) return null to first
         val candidates = _state.value.discovered
             .filterNot { it.ip == dev.ip && it.port == dev.port }
             // Drop addresses that can't be a laptop on this LAN. A server that
@@ -494,12 +837,27 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             // which burns a full handshake timeout per attempt for an address that
             // can never answer. Cheap to skip, and it also filters link-local junk.
             .filter { usableHost(it.ip) }
+        var outcome = first
         for (h in candidates) {
-            if (client.connect(h.ip, h.port, dev.token, dev.key, timeoutMs)) {
-                return dev.copy(ip = h.ip, port = h.port)
-            }
+            val o = client.connect(h.ip, h.port, dev.token, raw, timeoutMs,
+                requireBound = dev.bound)
+            if (o.result == ConnectResult.Connected) return done(o, h.ip, h.port)
+            if (o.result == ConnectResult.Cancelled) return null to o
+            // The saved address was silent, but this laptop, announced under its own
+            // name at a new address, refused (re-paired, say): that refusal is the
+            // diagnosis. Another name's refusal is a stranger's laptop and says
+            // nothing about this one.
+            if (outcome.result == ConnectResult.NoAnswer &&
+                o.result != ConnectResult.NoAnswer && sameLaptop(h.name, dev.name)) outcome = o
         }
-        return null
+        return null to outcome
+    }
+
+    /** [mdnsName] is the laptop's hostname as the server announces it: only letters,
+     *  digits, `-` and `_` survive (`start_mdns` in remote_server.py). */
+    private fun sameLaptop(mdnsName: String, qrName: String): Boolean {
+        val safe = qrName.filter { it.isLetterOrDigit() || it == '-' || it == '_' }
+        return safe.isNotEmpty() && safe.equals(mdnsName, ignoreCase = true)
     }
 
     /** Watchdog: poll volume (doubles as liveness); on repeated misses, reconnect. */
@@ -508,6 +866,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         healthJob = viewModelScope.launch {
             var misses = 0
             var tick = 0
+            // A VGET that timed out can still be answered late, and the next VGET
+            // would read that reply: the laptop's state from before a tap made since.
+            // Each lost VGET yields at most one such reply, so skip one reading.
+            var skipVolReading = false
             while (isActive) {
                 val volTimeout = 400
                 val pingTimeout = 500
@@ -521,11 +883,18 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 val maxMisses = 5
                 val v = client.queryVolume(volTimeout)
                 val alive = if (v != null) {
-                    if (System.currentTimeMillis() - lastUserVolumeMs > 1200) {
-                        update { it.copy(volume = v.toFloat()) }
+                    val now = System.currentTimeMillis()
+                    val use = !skipVolReading
+                    skipVolReading = false
+                    if (use && now - lastUserVolumeMs > 1200) {
+                        update { it.copy(volume = v.level.toFloat()) }
                     }
+                    // Same guard for mute, so a poll answered just before a tap
+                    // reached the laptop doesn't flip the button back.
+                    if (use && now - lastUserMuteMs > 1200) update { it.copy(muted = v.muted) }
                     true
                 } else {
+                    skipVolReading = true
                     client.ping(pingTimeout)   // confirm before declaring it dead
                 }
                 if (alive) {
@@ -564,7 +933,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 // back to 0) or confirmed-dead within ~2.5s — recovery feels instant, not
                 // "came back after a while".
                 val active = System.currentTimeMillis() - lastInteractionMs < 5000
-                delay(if (misses > 0) 500L else if (active) 1500L else 4000L)
+                delay(if (misses > 0) 500L else if (active) 1500L else Protocol.IDLE_POLL_MS)
             }
         }
     }
@@ -587,42 +956,40 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
      *  message on the reconnect screen instead of navigating away. The user keeps the
      *  Cancel button either way, which is the deliberate exit; what's gone is the
      *  automatic one that fired exactly when the laptop was still asleep. */
-    private fun beginReconnect() {
+    private fun beginReconnect(persist: Boolean = false, rescanned: Boolean = false) {
         healthJob?.cancel()
         val dev = current ?: return disconnect()
-        update { it.copy(conn = ConnState.Reconnecting, error = null) }
+        // Straight after a Sleep the phone sent, say so now: that IS the reason, and
+        // waiting 90 s to blame the network would be wrong.
+        update {
+            it.copy(conn = ConnState.Reconnecting, deviceName = dev.name, scanError = null,
+                error = if (sleptRecently(dev)) connectFailureMessage(dev, ConnectResult.NoAnswer)
+                else null)
+        }
         reconnectJob?.cancel()
-        discovery.start { hosts -> update { it.copy(discovered = hosts) } }
+        startDiscovery()
         reconnectJob = viewModelScope.launch {
             val startMs = System.currentTimeMillis()
             var explained = false
+            var lastDefinite: ConnectResult? = null
             while (isActive) {
-                val c = connectResolving(dev, 1200)
+                val (c, outcome) = connectResolving(dev, 1200)
                 if (c != null) {
-                    current = c
-                    if (c.ip != dev.ip || c.port != dev.port) {
-                        update { it.copy(savedDevices = store.upsert(c)) }
-                        settingsStore.lastDeviceId = c.id
-                    }
-                    discovery.stop()
-                    holdWifi(true)
-                    update { it.copy(conn = ConnState.Connected, error = null) }
-                    startHealthLoop()
+                    onConnected(dev, c, persist, rescanned)
                     return@launch
                 }
                 // The attempt is over; don't leave the scan running through the
                 // wait. In the long tail it is restarted just before the next one.
-                if (explained) discovery.stop()
+                if (explained) stopDiscovery()
                 val elapsed = System.currentTimeMillis() - startMs
+                val definite = outcome.result == ConnectResult.WrongKey ||
+                    outcome.result == ConnectResult.NeedsQr ||
+                    outcome.result == ConnectResult.Outdated
                 if (elapsed > RECONNECT_EXPLAIN_MS && !explained) {
                     // Long enough that this isn't a blip: say what's likely wrong and
                     // what would fix it — while STILL retrying underneath, so a laptop
                     // that wakes up an hour later reconnects with nothing to tap.
                     explained = true
-                    update {
-                        it.copy(error = connectFailureMessage(dev) +
-                            " If you re-paired the laptop, scan its new QR.")
-                    }
                     // Stop pinning the radio awake once we're in the long tail —
                     // holding a low-latency Wi-Fi lock through a multi-hour outage
                     // costs real battery for a link that isn't there. Stop the mDNS
@@ -631,7 +998,20 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     // restarted around each attempt below, so a laptop that comes
                     // back at a new address is still found.
                     holdWifi(false)
-                    discovery.stop()
+                    stopDiscovery()
+                }
+                if (definite) lastDefinite = outcome.result
+                if (lastDefinite != null || explained) {
+                    // A definite result is the laptop saying why; retrying can still
+                    // succeed (someone flips its setting back). It stands until another
+                    // one replaces it: a later attempt whose reply was lost says
+                    // nothing new, and letting it win made the banner flicker.
+                    // Otherwise re-derived every attempt, not once: over a long outage
+                    // the cause changes — the Sleep the phone sent stops explaining it,
+                    // the phone changes network — and a message set once would say
+                    // "asleep" all night.
+                    val msg = connectFailureMessage(dev, lastDefinite ?: outcome.result)
+                    if (_state.value.error != msg) update { it.copy(error = msg) }
                 }
                 // Fast while it's likely transient, then ease off. Same shape as the
                 // health loop's backoff, and it keeps a long outage from polling the
@@ -646,7 +1026,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     // window found and the next one benefits from this window —
                     // which converges within a couple of retries while leaving the
                     // radio alone for the ~15s in between.
-                    discovery.start { hosts -> update { it.copy(discovered = hosts) } }
+                    startDiscovery()
                 }
             }
         }
@@ -670,12 +1050,22 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         update { it.copy(savedDevices = store.delete(device.id)) }
     }
 
-    fun reportError(msg: String) = update { it.copy(error = msg) }
+    /** The QR scanner itself failed (no Play services, camera refused, ...). */
+    fun reportScanError(msg: String) = update { it.copy(scanError = msg) }
 
-    fun disconnect() {
+    /** Back on the Reconnecting screen: stop retrying, but — unlike Cancel or
+     *  Disconnect — still reconnect to this laptop on the next launch. Back is also
+     *  how people leave an app, and that shouldn't forget the laptop. */
+    fun stopReconnecting() = disconnect(forget = false)
+
+    fun disconnect() = disconnect(forget = true)
+
+    private fun disconnect(forget: Boolean) {
         healthJob?.cancel()
         reconnectJob?.cancel()
-        settingsStore.lastDeviceId = null   // intentional leave: don't auto-reconnect next launch
+        connectJob?.cancel()
+        // An intentional leave: don't auto-reconnect next launch.
+        if (forget) settingsStore.lastDeviceId = null
         current = null
         client.disconnect()
         holdWifi(false)                     // let the radio power-save again
@@ -684,7 +1074,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // would drop the user onto the device list with a red banner about a
         // device they deliberately left — and it would survive a rescan.
         update { it.copy(conn = ConnState.Disconnected, error = null) }
-        discovery.start { hosts -> update { it.copy(discovered = hosts) } }   // scan again for the connection screen
+        startDiscovery()   // scan again for the connection screen
     }
 
     // --- pointer ---
@@ -738,9 +1128,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val iy = accY.toInt()
         if (ix != 0 || iy != 0) {
             // Send each event's delta immediately. Small, frequent deltas keep the
-            // cursor smooth even under relay jitter; batching them into fewer larger
+            // cursor smooth under network jitter; batching them into fewer, larger
             // sends made the motion *jumpier* (each arriving hop is bigger), so we
-            // don't coalesce — not on LAN (low latency) nor on the relay.
+            // don't coalesce.
             client.move(ix, iy)
             accX -= ix
             accY -= iy
@@ -775,7 +1165,18 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         client.appSwitch("end")
     }
 
-    fun system(action: String) = client.system(action)
+    fun system(action: String) {
+        if (action == "mute") {
+            // Show the toggle at once; the next volume poll confirms it.
+            lastUserMuteMs = System.currentTimeMillis()
+            update { s -> s.copy(muted = s.muted?.let { !it }) }
+        }
+        if (action == "sleep") {
+            sleepRequestedMs = System.currentTimeMillis()
+            sleptDeviceId = current?.id
+        }
+        client.system(action)
+    }
 
     // --- volume ---
     fun setVolume(v: Float) {
@@ -785,8 +1186,6 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         client.setVolume(v.toInt())
     }
 
-    fun nudgeVolume(delta: Float) = setVolume((_state.value.volume + delta).coerceIn(0f, 100f))
-
     // --- brightness ---
     fun setBrightness(v: Float) {
         lastUserBrightnessMs = System.currentTimeMillis()
@@ -794,9 +1193,6 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         update { it.copy(brightness = v) }
         client.setBrightness(v.toInt())
     }
-
-    fun nudgeBrightness(delta: Float) =
-        setBrightness((_state.value.brightness + delta).coerceIn(0f, 100f))
 
     // --- media ---
     fun media(action: String) { touch(); client.media(action) }
@@ -828,13 +1224,18 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         healthJob?.cancel()
         reconnectJob?.cancel()
-        discovery.stop()
+        stopDiscovery()
         client.disconnect()
         holdWifi(false)   // safety net: never leak the Wi-Fi lock if the VM dies mid-session
+        updater.cancel()
         try {
             connectivity?.unregisterNetworkCallback(netCallback)
         } catch (_: Exception) {
             // never registered, or already gone
+        }
+        try {
+            connectivity?.unregisterNetworkCallback(lanCallback)
+        } catch (_: Exception) {
         }
         super.onCleared()
     }
