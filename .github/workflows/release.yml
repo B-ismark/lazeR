@@ -130,11 +130,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
-      # Same interpreter line as the laptop build (server/.venv), so the bundled
-      # runtime matches what the exe has been shipping with.
+      # The same interpreter as the laptop build (server/.venv), to the patch level.
+      # '3.14' floated to 3.14.7, whose Tcl 9 keeps its library inside the DLL;
+      # PyInstaller collected no Tcl data from it, and v2.3.0's first exe died at
+      # startup. 3.14.3 ships Tcl 8.6 with its library on disk. build_exe.ps1 now
+      # starts the exe once, so a bundle that can't start fails this job.
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
         with:
-          python-version: '3.14'
+          python-version: '3.14.3'
 
       # build_exe.ps1 compresses with UPX only when tools/upx/upx.exe exists (it's
       # gitignored), so without this the runner's exe came out ~5 MB larger than the

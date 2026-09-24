@@ -127,10 +127,27 @@ $pyiArgs += @(
 if ($LASTEXITCODE -ne 0) { Write-Host "PyInstaller build failed." -ForegroundColor Red; exit 1 }
 
 $exe = Join-Path $root "dist\LazeR.exe"
-if (Test-Path $exe) {
-    Write-Host ""
-    Write-Host "Built: $exe" -ForegroundColor Green
-    Write-Host "Ship dist\LazeR.exe + LazeR.apk. No Python needed to run it." -ForegroundColor Cyan
-} else {
-    Write-Host "Build finished but LazeR.exe not found - check the output above." -ForegroundColor Yellow
+if (-not (Test-Path $exe)) {
+    Write-Host "Build finished but LazeR.exe not found - check the output above." -ForegroundColor Red
+    exit 1
 }
+
+# Start it once. A bundle that can't start builds cleanly: v2.3.0's first exe
+# came from a Python whose Tcl 9 keeps its library inside the DLL, PyInstaller
+# collected no Tcl data, and its Tk startup hook stopped every launch with an
+# error dialog. --help exits right after the startup hooks, before anything
+# binds a port, so this is safe next to a running LazeR. A crash shows a
+# dialog and never exits, hence the timeout.
+$p = Start-Process -FilePath $exe -ArgumentList "--help" -PassThru -WindowStyle Hidden
+if (-not $p.WaitForExit(60000)) {
+    & taskkill.exe /T /F /PID $p.Id | Out-Null
+    Write-Host "LazeR.exe did not start (no exit within 60 s; likely a startup error dialog)." -ForegroundColor Red
+    exit 1
+}
+if ($p.ExitCode -ne 0) {
+    Write-Host "LazeR.exe --help exited with $($p.ExitCode)." -ForegroundColor Red
+    exit 1
+}
+Write-Host ""
+Write-Host "Built and started: $exe" -ForegroundColor Green
+Write-Host "Ship dist\LazeR.exe + LazeR.apk. No Python needed to run it." -ForegroundColor Cyan
