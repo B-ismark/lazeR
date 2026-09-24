@@ -91,6 +91,14 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material3.AlertDialog
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.customActions
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
@@ -105,6 +113,7 @@ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.FilledTonalIconToggleButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonShapes
@@ -116,7 +125,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
@@ -187,15 +195,9 @@ class ControlActions(
     val onSpecialKey: (String) -> Unit,
     val onCombo: (String) -> Unit,
     val onSystem: (String) -> Unit,
-    val onSensitivity: (Float) -> Unit,
-    val onNaturalScroll: (Boolean) -> Unit,
-    val onScrollStripLeft: (Boolean) -> Unit,
-    val onHaptics: (Boolean) -> Unit,
-    val onAcceleration: (Boolean) -> Unit,
-    val onUpdateCheck: (Boolean) -> Unit,
-    val onCheckUpdateNow: () -> Unit,   // Settings: ask GitHub now, skipping the daily throttle
-    val onOpenRelease: () -> Unit,      // open the release page in the browser
+    val settings: SettingsActions,
     val onButtonTap: () -> Unit,        // light haptic for generic button presses
+    val onDismissGestureHint: () -> Unit,
     val onDisconnect: () -> Unit,
 )
 
@@ -250,7 +252,17 @@ fun ControlScreen(state: UiState, a: ControlActions) {
     // disconnect() clears lastDeviceId, so no auto-reconnect would undo it.
     // The first press explains, the second inside 2s commits. Exiting the
     // expanded trackpad stays a single press — that IS the expected navigation.
+    // The on-screen back arrows go through the same two-step.
     var lastBackMs by remember { mutableStateOf(0L) }
+    val requestDisconnect: (String) -> Unit = { again ->
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastBackMs < 2000) {
+            a.onDisconnect()
+        } else {
+            lastBackMs = now
+            Toast.makeText(context, again, Toast.LENGTH_SHORT).show()
+        }
+    }
     BackHandler(enabled = true) {
         if (fullscreen) {
             fullscreen = false
@@ -258,14 +270,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
             // An open docked panel is the innermost layer — back closes it first.
             deckPanel = null
         } else {
-            val now = SystemClock.elapsedRealtime()
-            if (now - lastBackMs < 2000) {
-                a.onDisconnect()
-            } else {
-                lastBackMs = now
-                Toast.makeText(context, "Press back again to disconnect",
-                    Toast.LENGTH_SHORT).show()
-            }
+            requestDisconnect("Press back again to disconnect")
         }
     }
     // Leaving the screen entirely never flipped `fullscreen` back, so a link that
@@ -308,21 +313,26 @@ fun ControlScreen(state: UiState, a: ControlActions) {
             onAdvanced = { showAdvanced = true },
             onSettings = { showSettings = true },
             onFullscreen = { fullscreen = true },
+            onBack = { requestDisconnect("Tap again to disconnect") },
         )
     } else {
         Scaffold(
             topBar = {
                 CenterAlignedTopAppBar(
-                    title = { Text("LazeR") },
+                    // Which laptop this is driving.
+                    title = {
+                        Text(state.deviceName.ifBlank { "LazeR" }, maxLines = 1,
+                            overflow = TextOverflow.Ellipsis)
+                    },
                     navigationIcon = {
-                        IconButton(onClick = a.onDisconnect) {
+                        IconButton(onClick = { requestDisconnect("Tap again to disconnect") }) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Back · disconnect")
+                                contentDescription = "Disconnect")
                         }
                     },
                     actions = {
                         IconButton(onClick = { showAdvanced = true }) {
-                            Icon(Icons.Filled.Tune, contentDescription = "Advanced")
+                            Icon(Icons.Filled.Tune, contentDescription = "Shortcuts")
                         }
                         IconButton(onClick = { showSettings = true }) {
                             SettingsIcon(updateAvailable = state.updateTag != null)
@@ -346,6 +356,7 @@ fun ControlScreen(state: UiState, a: ControlActions) {
             ) {
                 ControlsPanel(state, a, keysBuffer)
                 Spacer(Modifier.height(12.dp))
+                if (!state.gestureHintSeen) GestureHint(a.onDismissGestureHint)
                 TrackpadCard(
                     modifier = Modifier.fillMaxWidth().weight(1f).heightIn(min = 220.dp),
                     a = a,
@@ -362,7 +373,30 @@ fun ControlScreen(state: UiState, a: ControlActions) {
         AdvancedSheet(state, a, onDismiss = { showAdvanced = false })
     }
     if (showSettings) {
-        SettingsSheet(state, a, onDismiss = { showSettings = false })
+        SettingsSheet(state, a.settings, onDismiss = { showSettings = false })
+    }
+}
+
+/** The pad's gestures, taught once. */
+@Composable
+private fun GestureHint(onDismiss: () -> Unit) {
+    Card(
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer),
+        modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+    ) {
+        Row(Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp, end = 4.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "Two-finger tap = right-click · pinch = zoom · three-finger swipe = " +
+                    "switch apps. Zoom and Switch app are also under Shortcuts.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onDismiss) { Text("Got it") }
+        }
     }
 }
 
@@ -423,6 +457,7 @@ private fun LevelCard(
     value: Float,
     onChange: (Float) -> Unit,
     onStep: (Float) -> Unit,
+    trailing: (@Composable () -> Unit)? = null,
 ) {
     SectionCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -439,7 +474,9 @@ private fun LevelCard(
                     tint = MaterialTheme.colorScheme.onPrimaryContainer,
                     modifier = Modifier.size(20.dp))
             }
-            Text("  $label  ${value.toInt()}%", style = MaterialTheme.typography.titleMedium)
+            Text("  $label  ${value.toInt()}%", style = MaterialTheme.typography.titleMedium,
+                modifier = Modifier.weight(1f))
+            trailing?.invoke()
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -469,6 +506,22 @@ private fun MediaPanel(state: UiState, a: ControlActions) {
             value = state.volume,
             onChange = a.onVolume,
             onStep = { d -> a.onButtonTap(); a.onVolume((state.volume + d).coerceIn(0f, 100f)) },
+            trailing = {
+                val muted = state.muted
+                if (muted == null) {
+                    // An older laptop doesn't say whether it's muted: a plain button.
+                    IconButton(onClick = { a.onButtonTap(); a.onSystem("mute") }) {
+                        Icon(Icons.AutoMirrored.Filled.VolumeOff, contentDescription = "Mute")
+                    }
+                } else {
+                    FilledTonalIconToggleButton(
+                        checked = muted,
+                        onCheckedChange = { a.onButtonTap(); a.onSystem("mute") },
+                    ) {
+                        Icon(Icons.AutoMirrored.Filled.VolumeOff, contentDescription = "Mute")
+                    }
+                }
+            },
         )
         SectionCard {
             Row(
@@ -666,9 +719,32 @@ private fun ClickBar(
             overflowIndicator = { },
             modifier = Modifier.weight(3f),
         ) {
-            clickableItem(onClick = a.onClick, label = if (compact) "L" else "Left", weight = 1f)
-            clickableItem(onClick = a.onMiddleClick, label = if (compact) "M" else "Middle", weight = 1f)
-            clickableItem(onClick = a.onRightClick, label = if (compact) "R" else "Right", weight = 1f)
+            if (compact) {
+                // One letter on screen, the whole name for TalkBack.
+                for ((letter, spoken, onClick) in listOf(
+                    Triple("L", "Left click", a.onClick),
+                    Triple("M", "Middle click", a.onMiddleClick),
+                    Triple("R", "Right click", a.onRightClick),
+                )) {
+                    customItem(
+                        buttonGroupContent = {
+                            val src = remember { MutableInteractionSource() }
+                            Button(
+                                onClick = onClick,
+                                interactionSource = src,
+                                contentPadding = PaddingValues(horizontal = 4.dp),
+                                modifier = Modifier.weight(1f).animateWidth(src)
+                                    .semantics { contentDescription = spoken },
+                            ) { Text(letter) }
+                        },
+                        menuContent = {},
+                    )
+                }
+            } else {
+                clickableItem(onClick = a.onClick, label = "Left", weight = 1f)
+                clickableItem(onClick = a.onMiddleClick, label = "Middle", weight = 1f)
+                clickableItem(onClick = a.onRightClick, label = "Right", weight = 1f)
+            }
         }
         HoldDragButton(a.onDragStart, a.onDragEnd, compact = compact,
             modifier = Modifier.weight(if (compact) 1f else 1.2f))
@@ -1016,6 +1092,18 @@ private fun ScrollStrip(onScroll: (Int, Int) -> Unit, natural: () -> Boolean) {
             .clip(RoundedCornerShape(26.dp))
             .background(MaterialTheme.colorScheme.secondaryContainer)
             .onSizeChanged { boxH = it.height }
+            // The chevrons are decoration; the strip itself offers the actions.
+            .semantics {
+                contentDescription = "Scroll strip"
+                customActions = listOf(
+                    CustomAccessibilityAction("Scroll up") {
+                        onScroll(0, if (natural()) -1 else 1); true
+                    },
+                    CustomAccessibilityAction("Scroll down") {
+                        onScroll(0, if (natural()) 1 else -1); true
+                    },
+                )
+            }
             .pointerInput(Unit) {
                 detectVerticalDragGestures(
                     onDragEnd = { scope.launch { animate(thumbOff, 0f) { v, _ -> thumbOff = v } } },
@@ -1061,9 +1149,9 @@ private fun ScrollStrip(onScroll: (Int, Int) -> Unit, natural: () -> Boolean) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.SpaceBetween,
         ) {
-            Icon(Icons.Filled.KeyboardArrowUp, contentDescription = "Scroll up",
+            Icon(Icons.Filled.KeyboardArrowUp, contentDescription = null,
                 tint = onSecondary.copy(alpha = 0.8f))
-            Icon(Icons.Filled.KeyboardArrowDown, contentDescription = "Scroll down",
+            Icon(Icons.Filled.KeyboardArrowDown, contentDescription = null,
                 tint = onSecondary.copy(alpha = 0.8f))
         }
     }
@@ -1092,6 +1180,7 @@ private fun LandscapeDeck(
     onAdvanced: () -> Unit,
     onSettings: () -> Unit,
     onFullscreen: () -> Unit,
+    onBack: () -> Unit,
 ) {
     fun toggle(p: DeckPanel) { a.onButtonTap(); onPanel(if (panel == p) null else p) }
 
@@ -1125,7 +1214,8 @@ private fun LandscapeDeck(
             DeckRail(
                 panel = panel,
                 onToggle = { toggle(it) },
-                onBack = a.onDisconnect,
+                onBack = onBack,
+                deviceName = state.deviceName,
                 onAdvanced = onAdvanced,
                 onSettings = onSettings,
                 onFullscreen = onFullscreen,
@@ -1189,6 +1279,7 @@ private fun DeckRail(
     onSettings: () -> Unit,
     onFullscreen: () -> Unit,
     updateAvailable: Boolean,
+    deviceName: String,
 ) {
     BoxWithConstraints(Modifier.width(DECK_RAIL_WIDTH).fillMaxHeight()) {
         Column(
@@ -1205,7 +1296,14 @@ private fun DeckRail(
             ) {
                 IconButton(onClick = onBack) {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "Back · disconnect")
+                        contentDescription = "Disconnect")
+                }
+                if (deviceName.isNotBlank()) {
+                    Text(deviceName, style = MaterialTheme.typography.labelSmall,
+                        maxLines = 2, overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 4.dp))
                 }
                 NavigationRailItem(
                     selected = panel == DeckPanel.Media,
@@ -1222,7 +1320,7 @@ private fun DeckRail(
             }
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 IconButton(onClick = onAdvanced) {
-                    Icon(Icons.Filled.Tune, contentDescription = "Advanced")
+                    Icon(Icons.Filled.Tune, contentDescription = "Shortcuts")
                 }
                 IconButton(onClick = onSettings) {
                     SettingsIcon(updateAvailable)
@@ -1331,7 +1429,7 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
 }
 
 // ---------------------------------------------------------------------------
-// Advanced sheet: shortcuts, system, presentation.
+// Shortcuts sheet: brightness, editing, gestures, system.
 // ---------------------------------------------------------------------------
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class,
     ExperimentalMaterial3ExpressiveApi::class)
@@ -1339,10 +1437,16 @@ private fun FullscreenTrackpad(state: UiState, a: ControlActions, onExit: () -> 
 private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Unit) {
     @Composable
     fun chip(label: String, action: () -> Unit) = ChipBtn(label) { a.onButtonTap(); action() }
+    // Sleep asks first: it ends the session and the laptop needs a key press to
+    // come back, so a stray tap costs a trip to the laptop.
+    var confirmSleep by remember { mutableStateOf(false) }
 
     ModalBottomSheet(onDismissRequest = onDismiss,
         sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-        Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 28.dp)) {
+        // Scrolls: a sheet clips what doesn't fit, which in landscape is the last
+        // rows (Lock, Sleep).
+        Column(Modifier.verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp).padding(bottom = 28.dp)) {
             // Display — brightness, only when the laptop reports a backend. Grouped up top
             // as a level control (mirrors Volume's card on the main page).
             if (state.brightnessAvailable) {
@@ -1371,223 +1475,40 @@ private fun AdvancedSheet(state: UiState, a: ControlActions, onDismiss: () -> Un
                 chip("Redo") { a.onCombo("ctrl y") }
             }
 
+            // The two gestures with no button elsewhere.
+            Spacer(Modifier.height(20.dp))
+            SheetTitle("Gestures")
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                chip("Zoom in") { a.onZoom(1) }
+                chip("Zoom out") { a.onZoom(-1) }
+                chip("Switch app") { a.onSwitchStep(true); a.onSwitchEnd() }
+            }
+
             Spacer(Modifier.height(20.dp))
             SheetTitle("System")
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 chip("Lock") { a.onSystem("lock") }
-                chip("Sleep") { a.onSystem("sleep") }
-                chip("Mute") { a.onSystem("mute") }
+                chip("Sleep") { confirmSleep = true }
             }
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Settings sheet.
-// ---------------------------------------------------------------------------
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun SettingsSheet(state: UiState, a: ControlActions, onDismiss: () -> Unit) {
-    ModalBottomSheet(onDismissRequest = onDismiss,
-        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
-        // Scrolls: sideways, or on a short phone, the sheet is taller than the window,
-        // and Updates (where the Settings badge sends people) is at the very bottom.
-        Column(
-            Modifier
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp)
-                .padding(bottom = 28.dp),
-        ) {
-            // Pointer — everything that shapes cursor motion.
-            SheetTitle("Pointer")
-            Text("Cursor speed  ${"%.1f".format(state.settings.sensitivity)}×",
-                style = MaterialTheme.typography.bodyMedium)
-            Slider(
-                value = state.settings.sensitivity,
-                onValueChange = a.onSensitivity,
-                valueRange = 0.6f..3.0f,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(8.dp))
-            ToggleRow("Pointer acceleration", "Fast flicks move the cursor farther",
-                state.settings.acceleration, a.onAcceleration)
-
-            Spacer(Modifier.height(16.dp))
-            SheetTitle("Scrolling")
-            ToggleRow("Natural scrolling", "Content follows your fingers",
-                state.settings.naturalScroll, a.onNaturalScroll)
-            ToggleRow("Scroll bar on the left", "Puts the scroll strip on the left of the " +
-                "trackpad — handy for left-handed use",
-                state.settings.scrollStripLeft, a.onScrollStripLeft)
-
-            Spacer(Modifier.height(16.dp))
-            SheetTitle("Feedback")
-            ToggleRow("Haptic feedback", "Vibrate on clicks and scroll",
-                state.settings.haptics, a.onHaptics)
-
-            // Called out as the internet setting on purpose: LazeR is otherwise
-            // entirely LAN-only, so this is the one thing that leaves the network.
-            Spacer(Modifier.height(20.dp))
-            SheetTitle("Updates")
-            ToggleRow(
-                "Check for new versions",
-                "Asks GitHub once a day whether a newer release exists — the only " +
-                    "time LazeR uses the internet. Never downloads or installs " +
-                    "anything; it just shows a link.",
-                state.settings.updateCheck, a.onUpdateCheck,
-            )
-            // No version, nothing to compare: the check can't run, so offer no button.
-            if (state.settings.updateCheck && state.appVersion.isNotBlank()) {
-                UpdateStatusLine(state, a)
-            }
-        }
-    }
-}
-
-/**
- * The Settings gear, with a small dot when a newer release is out.
- *
- * The connect-screen card alone wasn't enough: the app reconnects to the last laptop
- * on launch, so people who use it daily go straight to the pad and never see that
- * screen. The dot sits on the way to the one place that explains it (Settings →
- * Updates) and goes away once they've updated or switched checks off.
- */
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun SettingsIcon(updateAvailable: Boolean) {
-    BadgedBox(badge = { if (updateAvailable) Badge() }) {
-        Icon(
-            Icons.Filled.Settings,
-            contentDescription = if (updateAvailable) "Settings, update available" else "Settings",
+    if (confirmSleep) {
+        AlertDialog(
+            onDismissRequest = { confirmSleep = false },
+            title = { Text("Put ${state.deviceName.ifBlank { "the laptop" }} to sleep?") },
+            text = { Text("The phone disconnects until the laptop is woken up, then " +
+                "reconnects by itself.") },
+            confirmButton = {
+                TextButton(onClick = { confirmSleep = false; a.onSystem("sleep") }) {
+                    Text("Sleep")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmSleep = false }) { Text("Cancel") }
+            },
         )
     }
-}
-
-/**
- * What the update check actually found, under its switch. Four states:
- * available (with a link), checking, couldn't reach GitHub (with Try again), and
- * up to date (with when, and Check now). Before this the switch said nothing at all,
- * so a check blocked by the network looked exactly like being current.
- */
-@Composable
-private fun UpdateStatusLine(state: UiState, a: ControlActions) {
-    val tag = state.updateTag
-    val version = "You have ${state.appVersion}"
-    if (tag != null) {
-        Card(
-            shape = RoundedCornerShape(20.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.secondaryContainer),
-            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-        ) {
-            Column(Modifier.padding(16.dp)) {
-                Text("LazeR $tag is available",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer)
-                Text(
-                    "$version. Update the laptop app too — they ship together.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                )
-                Spacer(Modifier.height(12.dp))
-                Button(onClick = a.onOpenRelease) { Text("Open release page") }
-            }
-        }
-        return
-    }
-
-    // Re-read the clock every half minute so "checked just now" doesn't stay frozen
-    // while the sheet is open.
-    var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(30_000)
-            now = System.currentTimeMillis()
-        }
-    }
-
-    val failed = state.updateStatus == UpdateStatus.Failed
-    val (line, detail, action) = when {
-        state.updateStatus == UpdateStatus.Checking ->
-            Triple("Checking…", version, null)
-        // Also covers GitHub answering with an error (rate limit, no release), so
-        // it doesn't claim the network is at fault.
-        failed ->
-            Triple(
-                "Couldn't check for updates",
-                "No usable answer from GitHub. Your network may be blocking it, or " +
-                    "GitHub is busy. Nothing is wrong with this phone.",
-                "Try again",
-            )
-        state.lastUpdateCheckMs > 0L ->
-            Triple(
-                "You're up to date",
-                "$version · checked ${checkedAgo(state.lastUpdateCheckMs, now)}",
-                "Check now",
-            )
-        else -> Triple("Not checked yet", version, "Check now")
-    }
-    Row(
-        Modifier.fillMaxWidth().padding(bottom = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(line, style = MaterialTheme.typography.bodyMedium,
-                color = if (failed)
-                    MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
-            Text(detail, style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        if (action != null) {
-            TextButton(onClick = a.onCheckUpdateNow) { Text(action) }
-        } else {
-            CircularProgressIndicator(Modifier.padding(end = 12.dp).size(20.dp), strokeWidth = 2.dp)
-        }
-    }
-}
-
-/**
- * "just now", "5 min ago", "3 hours ago", "yesterday", "12 days ago".
- *
- * Written out rather than DateUtils: the rest of the app's copy is English, and
- * DateUtils switches to an absolute date after a week and to "in 3 hours" when the
- * clock has moved backwards, neither of which reads after "checked". A timestamp in
- * the future (clock corrected backwards) counts as just now.
- */
-internal fun checkedAgo(atMs: Long, nowMs: Long): String {
-    val min = (nowMs - atMs) / 60_000
-    val hours = min / 60
-    val days = hours / 24
-    return when {
-        min < 1 -> "just now"
-        min < 60 -> "$min min ago"
-        hours == 1L -> "an hour ago"
-        hours < 24 -> "$hours hours ago"
-        days == 1L -> "yesterday"
-        else -> "$days days ago"
-    }
-}
-
-@Composable
-private fun ToggleRow(title: String, subtitle: String, checked: Boolean, onChange: (Boolean) -> Unit) {
-    Row(
-        Modifier.fillMaxWidth().padding(vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.bodyLarge)
-            Text(subtitle, style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        Switch(checked = checked, onCheckedChange = onChange)
-    }
-}
-
-@Composable
-private fun SheetTitle(text: String) {
-    Text(text, style = MaterialTheme.typography.titleMedium,
-        color = MaterialTheme.colorScheme.primary,
-        modifier = Modifier.padding(bottom = 10.dp))
 }
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)

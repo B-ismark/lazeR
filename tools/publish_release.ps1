@@ -92,8 +92,14 @@ function Resume-OneDrive {
 # --- build the Windows server exe ---------------------------------------------
 Write-Host "Building LazeR.exe ..." -ForegroundColor Cyan
 & powershell -ExecutionPolicy Bypass -File "$here\build_exe.ps1"
+# The exit code, not only the file: an older dist\LazeR.exe is always there on the
+# laptop, so a build that failed early (e.g. the hash-locked install) would
+# otherwise publish the stale exe.
+$exeBuild = $LASTEXITCODE
 $exe = Join-Path $root "dist\LazeR.exe"
-if (-not (Test-Path $exe)) { Write-Host "exe build failed." -ForegroundColor Red; Resume-OneDrive; exit 1 }
+if ($exeBuild -ne 0 -or -not (Test-Path $exe)) {
+    Write-Host "exe build failed." -ForegroundColor Red; Resume-OneDrive; exit 1
+}
 
 # --- build the hardened release APK -------------------------------------------
 # Redirect Gradle's build dir + cache outside the OneDrive-synced tree (an init
@@ -129,11 +135,45 @@ $apkOut = Join-Path $root "dist\LazeR.apk"
 
 Resume-OneDrive
 
+# --- signer check (same pin as release.yml) -------------------------------------
+# Phones refuse an update signed by any other key, so an APK built on a laptop whose
+# ~/.android/debug.keystore is not THE key must never be published: every user would
+# have to uninstall (and lose their pairings) to take it.
+$signerPin = "4ac2b3b56c7288999370596d11f489874d87b6fda54bd0de81a80d2bd42849dc"
+$sdk = $env:ANDROID_HOME
+if (-not $sdk) { $sdk = $env:ANDROID_SDK_ROOT }
+if (-not $sdk) {
+    $lp = Join-Path $root "android\local.properties"
+    if (Test-Path $lp) {
+        $line = Select-String -Path $lp -Pattern '^sdk\.dir=(.*)$' | Select-Object -First 1
+        if ($line) { $sdk = $line.Matches[0].Groups[1].Value -replace '\\\\', '\' -replace '\\:', ':' }
+    }
+}
+$apksigner = if ($sdk) { Join-Path $sdk "build-tools\35.0.0\apksigner.bat" } else { $null }
+if (-not $apksigner -or -not (Test-Path $apksigner)) {
+    Write-Host "apksigner not found (build-tools 35.0.0 under ANDROID_HOME) - can't verify the signer." -ForegroundColor Red
+    exit 1
+}
+$certs = & $apksigner verify --print-certs $apkOut
+$got = ($certs | Select-String -Pattern 'Signer #1 certificate SHA-256 digest: ([0-9a-f]+)' |
+    Select-Object -First 1).Matches.Groups[1].Value
+if ($LASTEXITCODE -ne 0 -or $got -ne $signerPin) {
+    Write-Host "APK signed by '$got', expected $signerPin. Build on the laptop holding the release key (see CLAUDE.md)." -ForegroundColor Red
+    exit 1
+}
+Write-Host "Signer OK: $got" -ForegroundColor Green
+
+# The phone's in-app updater installs LazeR.apk only if it matches this file.
+# sha256sum format, ASCII, LF - what release.yml publishes too.
+$sha = (Get-FileHash $apkOut -Algorithm SHA256).Hash.ToLower()
+$shaOut = Join-Path $root "dist\LazeR.apk.sha256"
+[IO.File]::WriteAllText($shaOut, "$sha  LazeR.apk`n", [Text.Encoding]::ASCII)
+
 # --- create or refresh the release --------------------------------------------
 & gh release view $Tag --repo $repo *>$null
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Release $Tag exists - uploading assets (--clobber)." -ForegroundColor Cyan
-    & gh release upload $Tag $exe $apkOut --repo $repo --clobber
+    & gh release upload $Tag $exe $apkOut $shaOut --repo $repo --clobber
 } else {
     Write-Host "Creating release $Tag." -ForegroundColor Cyan
     if ($Notes) {
@@ -141,12 +181,12 @@ if ($LASTEXITCODE -eq 0) {
         # --notes as globs and choke ("no matches found for ...").
         $nf = Join-Path $env:TEMP "lazer_release_notes.txt"
         $Notes | Set-Content -Path $nf -Encoding utf8
-        & gh release create $Tag $exe $apkOut --repo $repo --title $Title --notes-file $nf
+        & gh release create $Tag $exe $apkOut $shaOut --repo $repo --title $Title --notes-file $nf
         Remove-Item $nf -ErrorAction SilentlyContinue
     } else {
-        & gh release create $Tag $exe $apkOut --repo $repo --title $Title --generate-notes
+        & gh release create $Tag $exe $apkOut $shaOut --repo $repo --title $Title --generate-notes
     }
 }
 if ($LASTEXITCODE -ne 0) { Write-Host "Release publish failed." -ForegroundColor Red; exit 1 }
-Write-Host "Published $Tag with LazeR.exe + LazeR.apk." -ForegroundColor Green
+Write-Host "Published $Tag with LazeR.exe + LazeR.apk + LazeR.apk.sha256." -ForegroundColor Green
 & gh release view $Tag --repo $repo --web *>$null

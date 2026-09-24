@@ -34,12 +34,14 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedButton
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -60,6 +62,7 @@ import com.example.lanremote.ConnState
 import com.example.lanremote.UiState
 import com.example.lanremote.data.Device
 import com.example.lanremote.data.DiscoveredHost
+import com.example.lanremote.data.DiscoveryStatus
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -71,18 +74,20 @@ fun ConnectionScreen(
     onToken: (String) -> Unit,
     onConnectManual: () -> Unit,
     onConnectSaved: (Device) -> Unit,
-    onUseDiscovered: (DiscoveredHost) -> Unit,
     onDeleteDevice: (Device) -> Unit,
     onScanQr: () -> Unit,
     onRescan: () -> Unit,
-    onOpenRelease: () -> Unit,
+    onCancelConnect: () -> Unit,
+    settings: SettingsActions,
 ) {
     val connecting = state.conn == ConnState.Connecting
 
     // Progressive disclosure: the rare paths start collapsed so the home screen
-    // reads as "scan the QR" and nothing else.
+    // reads as "scan the QR" and nothing else. The network list starts open: with
+    // nothing saved it's the most useful thing on the screen.
     var showDiscovered by rememberSaveable { mutableStateOf(true) }
     var showManual by rememberSaveable { mutableStateOf(false) }
+    var showSettings by rememberSaveable { mutableStateOf(false) }
     // Delete asks before it acts — see the dialog at the bottom of this screen.
     var pendingDelete by remember { mutableStateOf<Device?>(null) }
 
@@ -100,16 +105,24 @@ fun ConnectionScreen(
                 .padding(horizontal = 20.dp)
                 .padding(top = 16.dp),
         ) {
-            Text(
-                "LazeR",
-                style = MaterialTheme.typography.displaySmall,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.primary,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "LazeR",
+                    style = MaterialTheme.typography.displaySmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.weight(1f),
+                )
+                // Settings before pairing too: the update check (the app's only
+                // internet use) can be switched off before it ever runs again.
+                IconButton(onClick = { showSettings = true }) {
+                    SettingsIcon(updateAvailable = state.updateTag != null)
+                }
+            }
 
             // Below the title, above everything actionable: seen on the way to
             // connecting without standing between the user and the QR button.
-            state.updateTag?.let { UpdateCard(it, onOpenRelease) }
+            state.updateTag?.let { UpdateCard(it, state, settings) }
 
             // Saved devices — the fast path, kept visible when present.
             if (state.savedDevices.isNotEmpty()) {
@@ -124,7 +137,7 @@ fun ConnectionScreen(
                 }
             }
 
-            // Discovered laptops — collapsed by default; expand to view + rescan.
+            // Discovered laptops; see [HostRow].
             ExpandHeader(
                 title = "Found on your network" +
                     if (state.discovered.isNotEmpty()) "  (${state.discovered.size})" else "",
@@ -134,7 +147,7 @@ fun ConnectionScreen(
                     TextButton(onClick = { onRescan(); showDiscovered = true }) {
                         Icon(Icons.Filled.Refresh, contentDescription = null,
                             modifier = Modifier.size(18.dp))
-                        Text("  Scan")
+                        Text("  Refresh")
                     }
                 },
             )
@@ -142,40 +155,34 @@ fun ConnectionScreen(
                 Column {
                     if (state.discovered.isNotEmpty()) {
                         state.discovered.forEach { host ->
-                            HostRow(host) { onUseDiscovered(host) }
+                            val saved = state.savedDevices.firstOrNull {
+                                it.ip == host.ip && it.port == host.port
+                            }
+                            HostRow(host, saved != null, enabled = !connecting) {
+                                if (saved != null) onConnectSaved(saved) else onScanQr()
+                            }
                         }
                     } else {
-                        EmptyHint(
-                            "No laptop found yet. Make sure the phone and laptop are on " +
-                                "the same Wi-Fi and the LazeR app is running on the laptop, " +
-                                "then tap Scan. You can also scan the QR below."
-                        )
+                        DiscoveryEmpty(state)
                     }
                 }
             }
 
-            // Manual entry — rarely needed, so tucked behind a collapsed header.
+            // Typed code — works only when the laptop allows unencrypted pairing,
+            // which it doesn't by default, so it's labelled as the exception it is.
             ExpandHeader(
-                title = "Enter manually",
+                title = "Pair with a typed code (advanced)",
                 expanded = showManual,
                 onToggle = { showManual = !showManual },
             )
             AnimatedVisibility(visible = showManual) {
                 ManualCard(state, connecting, onName, onIp, onPort, onToken, onConnectManual)
             }
-
-            if (state.error != null) {
-                Spacer(Modifier.height(12.dp))
-                Text(
-                    state.error,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
             Spacer(Modifier.height(16.dp))
         }
 
-        // Primary action pinned at the bottom — easy thumb reach.
+        // Primary action pinned at the bottom — easy thumb reach. Errors sit right
+        // above it, where they can't scroll off the end of a long saved list.
         Surface(tonalElevation = 3.dp, color = MaterialTheme.colorScheme.surface) {
             Column(
                 Modifier
@@ -184,19 +191,31 @@ fun ConnectionScreen(
                     .padding(horizontal = 20.dp)
                     .padding(top = 12.dp, bottom = 16.dp),
             ) {
-                Button(
-                    onClick = onScanQr,
-                    enabled = !connecting,
-                    shapes = ButtonDefaults.shapes(),
-                    modifier = Modifier.fillMaxWidth().height(56.dp),
-                ) {
-                    if (connecting) {
-                        LoadingIndicator(
-                            modifier = Modifier.size(24.dp),
-                            color = MaterialTheme.colorScheme.onPrimary,
+                val message = state.scanError ?: state.error
+                if (message != null && !connecting) {
+                    Text(
+                        message,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(bottom = 12.dp),
+                    )
+                }
+                if (connecting) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        LoadingIndicator(modifier = Modifier.size(32.dp))
+                        Text(
+                            "  Connecting to ${state.deviceName}…",
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.weight(1f),
                         )
-                        Text("  Connecting…", style = MaterialTheme.typography.titleMedium)
-                    } else {
+                        OutlinedButton(onClick = onCancelConnect) { Text("Cancel") }
+                    }
+                } else {
+                    Button(
+                        onClick = onScanQr,
+                        shapes = ButtonDefaults.shapes(),
+                        modifier = Modifier.fillMaxWidth().height(56.dp),
+                    ) {
                         Icon(Icons.Filled.QrCodeScanner, contentDescription = null,
                             modifier = Modifier.size(22.dp))
                         Text("  Scan QR to connect", style = MaterialTheme.typography.titleMedium)
@@ -225,6 +244,40 @@ fun ConnectionScreen(
             },
         )
     }
+
+    if (showSettings) {
+        SettingsSheet(state, settings, onDismiss = { showSettings = false })
+    }
+}
+
+/** Searching, couldn't search, or searched and found nothing: three states, three messages. */
+@Composable
+private fun DiscoveryEmpty(state: UiState) {
+    when {
+        state.discoveryStatus == DiscoveryStatus.Failed -> EmptyHint(
+            "This phone can't search the network for laptops right now. Scan the QR " +
+                "code in the LazeR window on the laptop instead."
+        )
+        state.discoveryStatus == DiscoveryStatus.Searching && !state.discoveryQuiet ->
+            Card(
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+            ) {
+                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Text("  Looking for laptops…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        else -> EmptyHint(
+            "No laptop found. Make sure the phone and laptop are on the same Wi-Fi " +
+                "and LazeR is running on the laptop, then tap Refresh — or just scan " +
+                "the QR code below. Some networks block this search; the QR still works."
+        )
+    }
 }
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
@@ -245,6 +298,15 @@ private fun ManualCard(
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(16.dp)) {
+            Text(
+                "Only works when the laptop allows unencrypted pairing: in the LazeR " +
+                    "window, Show details → turn Require encryption off. The code travels " +
+                    "unencrypted, so use this only on a network you trust. Scanning the " +
+                    "QR is encrypted and needs no setting.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(12.dp))
             OutlinedTextField(
                 value = state.name, onValueChange = onName,
                 label = { Text("Name (optional)") }, singleLine = true,
@@ -273,20 +335,13 @@ private fun ManualCard(
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(
                 value = state.token, onValueChange = onToken,
-                label = { Text("Token") }, placeholder = { Text("A1B2C3") },
+                label = { Text("Pairing code") }, placeholder = { Text("A1B2C3") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(
                     capitalization = KeyboardCapitalization.Characters,
                     keyboardType = KeyboardType.Text,
                 ),
                 modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "Manual entry is plaintext (no encryption) — use only on a trusted network. " +
-                    "Scan the QR for an encrypted connection.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.height(12.dp))
             ElevatedButton(
@@ -295,12 +350,7 @@ private fun ManualCard(
                 modifier = Modifier.fillMaxWidth().height(50.dp),
                 shape = RoundedCornerShape(16.dp),
             ) {
-                if (connecting) {
-                    LoadingIndicator(modifier = Modifier.size(20.dp))
-                    Text("  Connecting…")
-                } else {
-                    Text("Connect & save")
-                }
+                Text("Connect & save")
             }
         }
     }
@@ -338,17 +388,14 @@ private fun ExpandHeader(
 }
 
 /**
- * "Update available" banner. Same Card shape and container role as the rest of the
- * screen's rows, one step up in emphasis (secondaryContainer) so it reads as
- * information rather than a problem — a pending update is not an error, and the
- * error slot on this screen already belongs to failed connections.
- *
- * Tapping opens the release page in a browser. Deliberately not a download: see
- * [com.example.lanremote.data.UpdateChecker]. Dismissible for the session, because
- * a banner you cannot silence on the app's home screen is a nag.
+ * "Update available" banner, with the in-app Download → Install. Same Card shape
+ * and container role as the rest of the screen's rows, one step up in emphasis
+ * (secondaryContainer) so it reads as information rather than a problem.
+ * Dismissible for the session, because a banner you cannot silence on the app's
+ * home screen is a nag.
  */
 @Composable
-private fun UpdateCard(tag: String, onOpen: () -> Unit) {
+private fun UpdateCard(tag: String, state: UiState, a: SettingsActions) {
     var dismissed by rememberSaveable(tag) { mutableStateOf(false) }
     if (dismissed) return
     Spacer(Modifier.height(16.dp))
@@ -356,10 +403,10 @@ private fun UpdateCard(tag: String, onOpen: () -> Unit) {
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.secondaryContainer),
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onOpen),
+        modifier = Modifier.fillMaxWidth(),
     ) {
         Row(
-            modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 12.dp, end = 4.dp),
+            modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 4.dp, end = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Icon(
@@ -374,8 +421,7 @@ private fun UpdateCard(tag: String, onOpen: () -> Unit) {
                     color = MaterialTheme.colorScheme.onSecondaryContainer,
                 )
                 Text(
-                    "Tap to open the release page. Update the laptop app too — " +
-                        "they ship together.",
+                    "Update the laptop app too — they ship together.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSecondaryContainer,
                 )
@@ -386,6 +432,9 @@ private fun UpdateCard(tag: String, onOpen: () -> Unit) {
                     tint = MaterialTheme.colorScheme.onSecondaryContainer,
                 )
             }
+        }
+        Column(Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp)) {
+            UpdateDownloadControls(state, a, MaterialTheme.colorScheme.onSecondaryContainer)
         }
     }
 }
@@ -418,13 +467,17 @@ private fun SectionLabel(text: String) {
     )
 }
 
+/** A laptop found on the network. [saved] = it's one of the saved devices, so a tap
+ *  connects; otherwise the only way to pair it is its QR, and the row says so
+ *  instead of filling hidden fields for a typed code the laptop would refuse. */
 @Composable
-private fun HostRow(host: DiscoveredHost, onClick: () -> Unit) {
+private fun HostRow(host: DiscoveredHost, saved: Boolean, enabled: Boolean, onClick: () -> Unit) {
     Card(
         shape = RoundedCornerShape(20.dp),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.secondaryContainer),
-        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp).clickable(onClick = onClick),
+        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+            .clickable(enabled = enabled, onClick = onClick),
     ) {
         Row(
             Modifier.padding(16.dp),
@@ -435,12 +488,19 @@ private fun HostRow(host: DiscoveredHost, onClick: () -> Unit) {
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(host.name, style = MaterialTheme.typography.titleMedium)
-                Text("${host.ip}:${host.port}",
+                Text(if (saved) "${host.ip} · saved" else "${host.ip}:${host.port}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSecondaryContainer)
             }
-            Text("Use", color = MaterialTheme.colorScheme.primary,
-                style = MaterialTheme.typography.labelLarge)
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                if (!saved) {
+                    Icon(Icons.Filled.QrCodeScanner, contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                }
+                Text(if (saved) "Connect" else "Scan QR", color = MaterialTheme.colorScheme.primary,
+                    style = MaterialTheme.typography.labelLarge)
+            }
         }
     }
 }
@@ -457,7 +517,7 @@ private fun SavedRow(
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
         modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
-            .clickable(enabled = enabled, onClick = onClick),
+            .clickable(enabled = enabled, onClickLabel = "Connect", onClick = onClick),
     ) {
         Row(
             Modifier.padding(start = 16.dp, top = 8.dp, bottom = 8.dp, end = 8.dp),
@@ -468,14 +528,13 @@ private fun SavedRow(
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(device.name, style = MaterialTheme.typography.titleMedium)
-                Text("${device.ip}:${device.port}",
+                Text("${device.ip}:${device.port}" +
+                    if (device.key.isBlank()) " · typed code" else "",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            Text("Tap to connect", color = MaterialTheme.colorScheme.primary,
-                style = MaterialTheme.typography.labelMedium)
             IconButton(onClick = onDelete) {
-                Icon(Icons.Filled.Delete, contentDescription = "Delete",
+                Icon(Icons.Filled.Delete, contentDescription = "Remove ${device.name}",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }

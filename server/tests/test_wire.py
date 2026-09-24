@@ -8,7 +8,7 @@ and no input backend are required):
 
 Why this file exists
 --------------------
-The v2 secure wire is implemented TWICE — here in Python and again in Kotlin
+The secure (L3) wire is implemented TWICE — here in Python and again in Kotlin
 (`android/.../net/SecureChannel.kt`) — and the two must agree byte for byte or
 pairing silently stops working. Nothing but a test can hold that line, so the
 `GoldenVectorL3` case below pins one exact packet that BOTH implementations assert
@@ -22,6 +22,7 @@ crash-safety of the code that runs on the single UDP thread.
 
 import base64
 import os
+import queue as queue_mod
 import re
 import socket
 import sys
@@ -204,7 +205,7 @@ class GoldenVectorL3(unittest.TestCase):
 
 
 class Dialects(unittest.TestCase):
-    """The L2 legacy dialect was accepted through v2.x so un-updated phones kept
+    """The L2 legacy dialect was accepted until 2.2.0 so un-updated phones kept
     working; it is REMOVED now. An L2 packet must behave exactly like unknown
     magic — never mis-sliced as a secure packet — and every reply stays in L3,
     the only dialect a current phone can read."""
@@ -223,7 +224,7 @@ class Dialects(unittest.TestCase):
 
     def test_only_the_current_magic_is_a_secure_dialect(self):
         # parse() dispatches on WIRE_FORMATS membership, so anything unknown must
-        # fall through to the plaintext path rather than being mis-sliced as v2/v3.
+        # fall through to the plaintext path rather than being mis-sliced as a secure packet.
         for magic in (b"L1", b"L2", b"L4", b"XX", b"\x00\x00"):
             self.assertNotIn(magic, rs.WIRE_FORMATS)
         self.assertIn(rs.MAGIC_V3, rs.WIRE_FORMATS)
@@ -350,7 +351,7 @@ class Handshake(unittest.TestCase):
         self.assertFalse(self.wire.secure_client)
 
     def test_challenge_is_idempotent_per_address(self):
-        # A punch burst or a slow relay makes the phone resend HELLO before the
+        # A lossy or slow link makes the phone resend HELLO (every 250 ms) before the
         # first CHAL lands. Minting a new nonce each time would mean the phone's
         # AUTH echoes a nonce the server has already discarded, and the handshake
         # could never complete. Same address ⇒ same live nonce.
@@ -504,8 +505,8 @@ class PlaintextV1(unittest.TestCase):
         wire = rs.Wire(TOKEN, KEY, require_secure=True)
         self.assertIsNone(wire.parse(f"{TOKEN} CLICK".encode(), CLIENT, CLIENT))
 
-    def test_v2_magic_falls_through_to_v1_when_no_key(self):
-        # No key ⇒ aes is None ⇒ a v2-looking packet is just junk on the v1 path.
+    def test_secure_magic_falls_through_to_plaintext_when_no_key(self):
+        # No key ⇒ aes is None ⇒ a secure-looking packet is just junk on the plaintext path.
         wire = rs.Wire(TOKEN, None, require_secure=False)
         self.assertIsNone(wire.parse(b"L2" + b"\x00" * 40, CLIENT, CLIENT))
 
@@ -531,11 +532,13 @@ class ActionLabels(unittest.TestCase):
 
     def test_every_control_verb_is_known_to_the_dispatcher(self):
         # Guards against a verb being added to CONTROL_VERBS (so it gets gated by
-        # the local-takeover pause) but never handled, or vice versa.
-        self.assertIn("MOVE", rs.CONTROL_VERBS)
-        self.assertNotIn("PING", rs.CONTROL_VERBS)   # liveness must never be gated
-        self.assertNotIn("BGET", rs.CONTROL_VERBS)
-        self.assertNotIn("VGET", rs.CONTROL_VERBS)
+        # the local-takeover pause) but never handled, or vice versa. The handled
+        # set is read from handle_packet itself, not typed out a second time.
+        import inspect
+        handled = set(re.findall(r'verb == "([A-Z]+)"', inspect.getsource(rs.handle_packet)))
+        self.assertEqual(handled, set(rs.CONTROL_VERBS))
+        for liveness in ("PING", "VGET", "BGET", "HELLO", "AUTH", "BYE"):
+            self.assertNotIn(liveness, rs.CONTROL_VERBS)   # must never be gated
 
 
 class Dispatch(unittest.TestCase):
@@ -917,6 +920,10 @@ class ServeLoopResilience(unittest.TestCase):
         rs._stop.clear()
         self.cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.cli.settimeout(2.0)
+        # A packet sent before serve_loop has bound (or while it rebinds) draws an
+        # ICMP port-unreachable, which Windows reports as a reset on the NEXT recv:
+        # a flake in whichever test got there first. The server turns it off too.
+        rs.udp_resets_off(self.cli)
         self.addCleanup(self._teardown)
 
     def _teardown(self):
@@ -937,6 +944,9 @@ class ServeLoopResilience(unittest.TestCase):
                   net, "testhost"),
             daemon=True)
         self.thread.start()
+        # Bound before the first send: a packet that beats the bind is dropped, and
+        # the test then sits out a whole receive timeout.
+        self._await_event(lambda e: e[0] == "serving", "the loop to bind")
         return self.wire
 
     def _recv_secure(self):
@@ -952,7 +962,7 @@ class ServeLoopResilience(unittest.TestCase):
             self.cli.sendto(pkt, self.srv)
             try:
                 reply = self._recv_secure()
-            except (socket.timeout, Exception):
+            except Exception:
                 continue
             if reply.startswith("CHAL "):
                 pkt, _ = fc.seal("AUTH " + reply.split(" ", 1)[1])
@@ -973,6 +983,19 @@ class ServeLoopResilience(unittest.TestCase):
         self._start()
         self._pair_secure()
         self._await_event(lambda e: e[0] == "connected", "a connected event")
+
+    def test_woke_is_only_reported_after_a_sleep_gap(self):
+        # The GUI answers "woke" by re-running the whole firewall check (netsh and
+        # registry reads) and re-fitting the window. Sent every tick, that was a
+        # netsh process per packet while the phone drove the cursor.
+        self._start()
+        fc = self._pair_secure()
+        for _ in range(20):
+            pkt, _ = fc.seal("PING")
+            self.cli.sendto(pkt, self.srv)
+            self.assertEqual(self._recv_secure(), "PONG")
+        time.sleep(1.5)    # and a couple of idle recv timeouts
+        self.assertEqual([e for e in self.events if e[0] == "woke"], [])
 
     def test_loop_survives_a_raising_handler_and_keeps_serving(self):
         self._start()
@@ -1060,6 +1083,51 @@ class ServeLoopResilience(unittest.TestCase):
             pkt, _ = fc.seal("PING")
             self.cli.sendto(pkt, self.srv)
             self.assertEqual(self._recv_secure(), "PONG")
+
+    def test_vget_reports_mute_when_the_backend_knows_it(self):
+        self._start()
+        fc = self._pair_secure()
+        for muted, want in ((True, "VOL 37 1"), (False, "VOL 37 0"), (None, "VOL 37")):
+            with self.subTest(muted=muted):
+                def get():
+                    return 37
+                get.muted = lambda: muted
+                with mock.patch.object(rs, "get_volume", get):
+                    pkt, _ = fc.seal("VGET")
+                    self.cli.sendto(pkt, self.srv)
+                    self.assertEqual(self._recv_secure(), want)
+        # A getter with no mute attribute at all (macOS, Linux) sends the old reply.
+        with mock.patch.object(rs, "get_volume", lambda: 37):
+            pkt, _ = fc.seal("VGET")
+            self.cli.sendto(pkt, self.srv)
+            self.assertEqual(self._recv_secure(), "VOL 37")
+        # A mute read that fails costs only the mute field, not the volume.
+        def get():
+            return 37
+        def broken():
+            raise OSError("endpoint gone")
+        get.muted = broken
+        with mock.patch.object(rs, "get_volume", get):
+            pkt, _ = fc.seal("VGET")
+            self.cli.sendto(pkt, self.srv)
+            self.assertEqual(self._recv_secure(), "VOL 37")
+
+    def test_no_output_device_skips_the_mute_read(self):
+        # Each read blocks the UDP loop on a COM round trip; with no volume there
+        # is nothing to send, so the mute read would be wasted.
+        self._start()
+        fc = self._pair_secure()
+        calls = []
+        def get():
+            return None
+        get.muted = lambda: calls.append(1)
+        with mock.patch.object(rs, "get_volume", get):
+            pkt, _ = fc.seal("VGET")
+            self.cli.sendto(pkt, self.srv)
+            pkt, _ = fc.seal("PING")
+            self.cli.sendto(pkt, self.srv)
+            self.assertEqual(self._recv_secure(), "PONG")
+        self.assertEqual(calls, [])
 
     def test_a_phone_that_rebuilt_its_session_can_re_pair_from_a_new_port(self):
         # What actually happens across a laptop sleep: the phone's watchdog gives up
@@ -1198,6 +1266,156 @@ class ServeLoopResilience(unittest.TestCase):
         self._await_event(lambda e: e[0] == "blocked", "a blocked-takeover event")
         # ...and the intruder's click must not have been executed.
         self.assertNotIn(("click", "<Key.left>", 1), rs.mouse.calls)
+
+    def _pair_plaintext(self):
+        for _ in range(25):
+            self.cli.sendto(f"{TOKEN} HELLO".encode(), self.srv)
+            try:
+                if self.cli.recvfrom(2048)[0] == b"OK":
+                    return
+            except socket.timeout:
+                continue
+        self.fail("plaintext handshake never completed")
+
+    def _recv_raw(self, tries=25, send=None):
+        for _ in range(tries):
+            if send is not None:
+                self.cli.sendto(send, self.srv)
+            try:
+                return self.cli.recvfrom(2048)[0]
+            except socket.timeout:
+                continue
+            except ConnectionResetError:
+                # Windows reports an ICMP port-unreachable from a send that beat
+                # the loop's bind as a reset on the next recv. Just resend.
+                continue
+        return None
+
+    def test_a_non_ascii_first_word_does_not_kill_the_plaintext_loop(self):
+        self._start(require_secure=False)
+        self._pair_plaintext()
+        for _ in range(3):
+            self.cli.sendto(b"\xc3\xa9 X", self.srv)
+        self.cli.sendto(f"{TOKEN} PING".encode(), self.srv)
+        self.assertEqual(self.cli.recvfrom(2048)[0], b"PONG")
+        self.assertTrue(self.thread.is_alive(), "a stranger's datagram killed the loop")
+
+    def test_a_phone_with_an_old_key_is_told_so(self):
+        self._start()
+        pkt, _ = FakeClient(bytes(32)).seal("HELLO")
+        self.assertEqual(self._recv_raw(send=pkt), b"ERR bad-key")
+        self._await_event(lambda e: e[0] == "warn" and "old pairing" in str(e[1]),
+                          "a warning about the stale pairing")
+
+    def test_a_typed_code_is_told_encryption_is_required(self):
+        self._start(require_secure=True)
+        self.assertEqual(self._recv_raw(send=f"{TOKEN} HELLO".encode()),
+                         b"ERR secure-required")
+
+    def test_a_wrong_token_still_gets_silence(self):
+        # Answering a wrong token would be a guessing oracle for the typed code.
+        self._start(require_secure=False)
+        self._pair_plaintext()               # proves the loop is up and answering
+        self.cli.settimeout(0.5)
+        self.cli.sendto(b"WRONG1 HELLO", self.srv)
+        with self.assertRaises(socket.timeout):
+            self.cli.recvfrom(2048)
+
+    def test_a_bound_handshake_over_a_real_socket(self):
+        self._start()
+        fc = FakeClient(KEY)
+        for _ in range(25):
+            pkt, _ = fc.seal(f"HELLO {CNONCE}")
+            self.cli.sendto(pkt, self.srv)
+            try:
+                chal = self._recv_secure().split(" ")
+                break
+            except socket.timeout:
+                continue
+        self.assertEqual(chal[2], CNONCE)
+        pkt, _ = fc.seal("AUTH " + chal[1])
+        self.cli.sendto(pkt, self.srv)
+        self.assertEqual(self._recv_secure(), f"OK {CNONCE}")
+
+    def test_a_replayed_hello_mid_handshake_still_lets_the_phone_in(self):
+        self._start()
+        fc = FakeClient(KEY)
+        for _ in range(25):
+            pkt, _ = fc.seal(f"HELLO {CNONCE}")
+            self.cli.sendto(pkt, self.srv)
+            try:
+                chal = self._recv_secure().split(" ")
+                break
+            except socket.timeout:
+                continue
+        # Earlier sessions' HELLOs, replayed from the phone's own address: more of
+        # them than a challenge keeps nonces for.
+        olds = [f"T2xkSGVsbG9Ob25jZS0w{i:04d}" for i in range(rs.CNONCE_KEEP + 2)]
+        for n in olds:
+            old, _ = FakeClient(KEY).seal(f"HELLO {n}")
+            self.cli.sendto(old, self.srv)
+            self.assertEqual(self._recv_secure().split(" ")[1], chal[1])
+        pkt, _ = fc.seal("AUTH " + chal[1])
+        self.cli.sendto(pkt, self.srv)
+        oks = {self._recv_secure() for _ in range(rs.CNONCE_KEEP)}
+        self.assertEqual(oks, {f"OK {CNONCE}"} |
+                         {f"OK {n}" for n in olds[-(rs.CNONCE_KEEP - 1):]})
+
+    def test_a_departing_phone_lets_go_of_a_held_drag(self):
+        self._start()
+        fc = self._pair_secure()
+        pkt, _ = fc.seal("MDOWN")
+        self.cli.sendto(pkt, self.srv)
+        pkt, _ = fc.seal("PING")               # PING answers after MDOWN ran
+        self.cli.sendto(pkt, self.srv)
+        self.assertEqual(self._recv_secure(), "PONG")
+        self.assertIn(rs.Button.left, rs._held_buttons)
+        pkt, _ = fc.seal("BYE")
+        self.cli.sendto(pkt, self.srv)
+        self._await_event(lambda e: e[0] == "disconnected", "a disconnect")
+        self.assertIn(("release", rs.Button.left), rs.mouse.calls)
+        self.assertEqual(rs._held_buttons, set())
+
+    def test_a_crash_reports_the_disconnect_and_releases_the_socket(self):
+        wire = self._start()
+        fc = self._pair_secure()
+        pkt, _ = fc.seal("MDOWN")
+        self.cli.sendto(pkt, self.srv)
+        pkt, _ = fc.seal("PING")
+        self.cli.sendto(pkt, self.srv)
+        self.assertEqual(self._recv_secure(), "PONG")
+
+        def boom(*a, **kw):
+            raise RuntimeError("injected loop failure")
+        wire.parse = boom                      # above the handler guard: kills the loop
+        pkt, _ = fc.seal("PING")
+        with mock.patch("threading.excepthook"):
+            self.cli.sendto(pkt, self.srv)
+            self.thread.join(timeout=5)
+        self.assertFalse(self.thread.is_alive())
+        self.thread = None
+        self.assertIn(("disconnected",), self.events)
+        self.assertIn(("release", rs.Button.left), rs.mouse.calls)
+        # The socket was closed, not left for the garbage collector.
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.bind(self.srv)
+        finally:
+            s.close()
+
+    @unittest.skipUnless(sys.platform.startswith("win"),
+                         "only Windows reports an oversized datagram as an error")
+    def test_oversized_datagrams_do_not_stall_the_loop(self):
+        self._start()
+        fc = self._pair_secure()
+        for _ in range(30):
+            self.cli.sendto(b"x" * 4000, self.srv)
+        t0 = time.monotonic()
+        pkt, _ = fc.seal("PING")
+        self.cli.sendto(pkt, self.srv)
+        self.assertEqual(self._recv_secure(), "PONG")
+        # Each one used to cost a 100ms sleep: 30 of them, 3s.
+        self.assertLess(time.monotonic() - t0, 1.0)
 
 
 class _FakeEndpoint:
@@ -1344,6 +1562,16 @@ class PanicChord(unittest.TestCase):
                          "generic modifier codes cannot match a low-level hook's "
                          "side-specific report — read the OS state instead")
 
+    def test_the_chord_needs_all_three_modifiers_down(self):
+        def state(down):
+            return lambda vk: 0x8000 if vk in down else 0
+        self.assertTrue(rs.panic_chord_held(state({0x10, 0x11, 0x12})))
+        for missing in (0x10, 0x11, 0x12):
+            with self.subTest(missing=hex(missing)):
+                self.assertFalse(rs.panic_chord_held(state({0x10, 0x11, 0x12} - {missing})))
+        # Low bit only ("pressed since last call") is not "held".
+        self.assertFalse(rs.panic_chord_held(lambda vk: 1))
+
     def test_the_guard_keeps_no_held_key_state(self):
         # There is nothing left to go stale across a lock screen: the modifiers are
         # read back from the OS at the moment L is pressed.
@@ -1363,6 +1591,32 @@ class InputGuardRearm(unittest.TestCase):
         guard = rs.LocalInputGuard(on_physical=lambda: None, on_panic=lambda: None)
         self.assertIsNone(guard._tid)
         guard.rearm()
+
+    def _swap(self, new_pair):
+        log = []
+
+        def install():
+            log.append(("install",))
+            return new_pair
+
+        def unhook(h):
+            log.append(("unhook", h))
+        return rs.swap_hooks(install, unhook, ("oldkb", "oldms")), log
+
+    def test_rearm_installs_the_new_pair_before_dropping_the_old(self):
+        pair, log = self._swap(("newkb", "newms"))
+        self.assertEqual(pair, ("newkb", "newms"))
+        self.assertEqual(log, [("install",), ("unhook", "oldkb"), ("unhook", "oldms")])
+
+    def test_a_failed_install_keeps_the_hooks_that_work(self):
+        pair, log = self._swap((None, None))
+        self.assertEqual(pair, ("oldkb", "oldms"))
+        self.assertEqual(log, [("install",)])
+
+    def test_a_half_install_is_undone_and_the_old_pair_kept(self):
+        pair, log = self._swap(("newkb", None))
+        self.assertEqual(pair, ("oldkb", "oldms"))
+        self.assertEqual(log, [("install",), ("unhook", "newkb")])
 
 
 class PointerVisibility(unittest.TestCase):
@@ -1448,10 +1702,17 @@ class IdleSuppression(unittest.TestCase):
         # time.monotonic() counts from boot, so a 0.0 sentinel reads as "90s ago"
         # for the first 90s of uptime — with the server on autostart and a phone
         # auto-reconnecting at launch, that asserted the hold at boot for nothing.
-        rs._last_remote_ts[0] = None
-        last = rs._last_remote_ts[0]
-        self.assertIsNone(last, "the sentinel must be distinguishable from a real "
-                                "timestamp near boot")
+        client = ("192.168.1.50", 1)
+        # Ten seconds after boot, no control verb yet: no hold.
+        self.assertFalse(rs.want_wake_hold(client, None, 10.0))
+        # ...where a 0.0 sentinel would have read as "10s ago" and held it.
+        self.assertTrue(rs.want_wake_hold(client, 0.0, 10.0))
+
+    def test_the_hold_follows_recent_activity_while_paired(self):
+        client = ("192.168.1.50", 1)
+        self.assertTrue(rs.want_wake_hold(client, 1000.0, 1000.0 + rs.REMOTE_AWAKE_S - 1))
+        self.assertFalse(rs.want_wake_hold(client, 1000.0, 1000.0 + rs.REMOTE_AWAKE_S))
+        self.assertFalse(rs.want_wake_hold(None, 1000.0, 1001.0))
 
     def test_control_verbs_mark_the_user_present(self):
         rs._last_remote_ts[0] = 0.0
@@ -1541,6 +1802,29 @@ class LoopSupervision(unittest.TestCase):
         with mock.patch.object(rs, "serve_loop", clean):
             rs.serve_forever(None, lambda *a: None, None, "testhost")
         self.assertEqual(len(calls), 1, "a normal shutdown was treated as a crash")
+
+    def _backoffs(self, healthy_s, crashes=6):
+        waits, calls = [], []
+
+        def flaky(wire, emit, net, hostname):
+            calls.append(1)
+            if len(calls) > crashes:
+                rs._stop.set()
+                return
+            raise RuntimeError("injected")
+
+        with mock.patch.object(rs, "serve_loop", flaky), \
+             mock.patch.object(rs, "LOOP_HEALTHY_S", healthy_s), \
+             mock.patch.object(rs._stop, "wait", lambda t: waits.append(t)):
+            rs.serve_forever(None, lambda *a: None, None, "testhost")
+        return waits
+
+    def test_back_to_back_crashes_back_off(self):
+        self.assertEqual(self._backoffs(healthy_s=1e9), [1.0, 2.0, 3.0, 4.0, 5.0, 5.0])
+
+    def test_a_crash_after_a_healthy_run_starts_the_backoff_over(self):
+        # Every run counts as healthy here, so no crash inherits the last one's cost.
+        self.assertEqual(self._backoffs(healthy_s=-1.0), [1.0] * 6)
 
 
 class SingletonGuardSurvivesSocketLoss(unittest.TestCase):
@@ -1892,9 +2176,34 @@ class UpdateCheck(unittest.TestCase):
     def test_read_is_capped_so_a_hostile_body_cannot_exhaust_memory(self):
         # We only need one short field from a host we don't control.
         huge = b'{"tag_name": "v2.1.0", "body": "' + b"A" * 500_000 + b'"}'
+        self.assertGreater(len(huge), rs.RELEASE_READ_CAP)
+        reads = []
+        import urllib.request
+        real = urllib.request.urlopen
         self._stub_urlopen(body=huge)
-        # Truncated at 64k mid-string ⇒ invalid JSON ⇒ None, rather than a 500kB read.
+        stub = urllib.request.urlopen
+
+        def spy(req, timeout=None):
+            resp = stub(req, timeout=timeout)
+            orig = resp.read
+            resp.read = lambda n=None: reads.append(n) or orig(n)
+            return resp
+        urllib.request.urlopen = spy
+        self.addCleanup(setattr, urllib.request, "urlopen", real)
+        # The read stops at the cap, which cuts the JSON mid-string — yet the tag is
+        # still found. A release with long notes used to read as "couldn't check".
+        self.assertEqual(rs.fetch_latest_release(), "v2.1.0")
+        self.assertEqual(reads, [rs.RELEASE_READ_CAP])
+
+    def test_a_truncated_body_without_a_tag_is_still_none(self):
+        self._stub_urlopen(body=b'{"name": "x", "body": "' + b"A" * 500_000)
         self.assertIsNone(rs.fetch_latest_release())
+
+    def test_non_ascii_digits_are_rejected_not_raised(self):
+        for text in ("v2.².0", "٢.1.0", "2.1.①"):
+            with self.subTest(text=text):
+                self.assertIsNone(rs.parse_version(text))
+                self.assertFalse(rs.is_newer_version(text, "1.0.0"))
 
     def test_check_for_update_pairs_the_tag_with_the_verdict(self):
         self._stub_urlopen(body=b'{"tag_name": "v99.0.0"}')
@@ -2060,7 +2369,7 @@ class VpnDetectionLooksAtDescriptions(unittest.TestCase):
             self.assertIsNone(rs.detect_vpn())
 class PlaintextSuspension(unittest.TestCase):
     """A reject-rate flood pauses plaintext ACCEPTANCE for a window, instead of
-    merely warning forever. Token brute force only exists on the v1 wire — the
+    merely warning forever. Token brute force only exists on the plaintext wire — the
     secure wire authenticates by GCM tag and never sees a token — so pausing
     exactly that path makes guessing futile. Deliberately GLOBAL, not per-source:
     UDP source addresses are spoofable, so per-IP blocking would let a flooder
@@ -2102,6 +2411,508 @@ class PlaintextSuspension(unittest.TestCase):
                  mock.patch.object(rs, "KEY_FILE", os.path.join(tmp, ".lazer_key")):
                 rs.rotate_secrets(wire)
         self.assertEqual(wire.pt_suspended_until, 0.0)
+
+
+class HostilePlaintext(unittest.TestCase):
+    """Wire.parse runs on the UDP thread, above the handler guard, for every
+    datagram from anyone. secrets.compare_digest raises TypeError on non-ASCII
+    str, so a first word like 'é' used to escape parse and kill the loop."""
+
+    HOSTILE = [b"\xc3\xa9 X", "é HELLO".encode(), b"\xff\xfe HELLO", b"\x80 \x80",
+               "🙂 CLICK".encode(), f"{TOKEN}é HELLO".encode(), b"\x00 HELLO",
+               b" ", b"  ", b"\r\n", b"L3" + b"\xc3\xa9" * 20]
+
+    def test_no_datagram_raises_with_plaintext_allowed(self):
+        wire = rs.Wire(TOKEN, KEY, require_secure=False)
+        for data in self.HOSTILE:
+            with self.subTest(data=data[:16]):
+                self.assertIsNone(wire.parse(data, STRANGER, None))
+
+    def test_no_datagram_raises_with_encryption_required(self):
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        for data in self.HOSTILE:
+            with self.subTest(data=data[:16]):
+                self.assertIsNone(wire.parse(data, STRANGER, None))
+                self.assertFalse(wire.plaintext_refused)
+
+    def test_a_valid_token_still_parses_after_the_bytes_compare(self):
+        wire = rs.Wire(TOKEN, KEY, require_secure=False)
+        self.assertEqual(wire.parse(f"{TOKEN} KEY héllo wörld\r\n".encode(), CLIENT, CLIENT),
+                         ("KEY", "héllo wörld", False))
+
+
+CNONCE = "Q2xpZW50Tm9uY2UtMTIzNDU2"      # a client nonce as the phone sends it
+
+
+class ReplyBinding(unittest.TestCase):
+    """The key outlives every session, so a sealed CHAL or OK captured earlier
+    is still tag-valid. The phone's nonce is echoed so it can tell our reply to
+    THIS handshake from a replay."""
+
+    def setUp(self):
+        self.wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        self.sock = FakeSock()
+
+    def _hello(self, cnonce):
+        fc = FakeClient(KEY)
+        pkt, _ = fc.seal(f"HELLO {cnonce}" if cnonce else "HELLO")
+        verb, rest, _ = self.wire.parse(pkt, CLIENT, None)
+        self.wire.issue_challenge(self.sock, CLIENT, 100.0, cnonce=rest)
+        return fc, unseal(KEY, self.sock.last()).split(" ")
+
+    def test_challenge_echoes_the_client_nonce(self):
+        _, chal = self._hello(CNONCE)
+        self.assertEqual(chal[0], "CHAL")
+        self.assertEqual(chal[2], CNONCE)
+
+    def test_ok_echoes_the_client_nonce(self):
+        _, chal = self._hello(CNONCE)
+        self.assertTrue(self.wire.verify_challenge(CLIENT, chal[1], 100.0))
+        self.assertEqual(self.wire.ok_texts(), [f"OK {CNONCE}"])
+
+    def test_an_old_phone_still_gets_the_old_replies(self):
+        # A phone that sends no nonce compares the reply to exactly "OK", and
+        # reads everything after "CHAL " as the nonce. Both must be unchanged.
+        _, chal = self._hello("")
+        self.assertEqual(len(chal), 2)
+        self.assertTrue(self.wire.verify_challenge(CLIENT, chal[1], 100.0))
+        self.assertEqual(self.wire.ok_texts(), ["OK"])
+
+    def test_a_resent_hello_echoes_the_latest_nonce_with_the_same_challenge(self):
+        _, first = self._hello(CNONCE)
+        _, second = self._hello("Q2xpZW50Tm9uY2UtNjU0MzIx")
+        self.assertEqual(first[1], second[1])
+        self.assertEqual(second[2], "Q2xpZW50Tm9uY2UtNjU0MzIx")
+
+    def test_a_replayed_hello_does_not_take_the_phones_ok(self):
+        # A HELLO captured earlier, replayed between the phone's HELLO and its AUTH.
+        old = "T2xkSGVsbG9Ob25jZS0wMDAw"
+        _, chal = self._hello(CNONCE)
+        self._hello(old)
+        self._hello(old)
+        self.assertTrue(self.wire.verify_challenge(CLIENT, chal[1], 100.0))
+        self.assertEqual(self.wire.ok_texts(), [f"OK {old}", f"OK {CNONCE}"])
+
+    def test_a_challenge_keeps_its_first_nonce_and_the_latest_others(self):
+        nonces = [f"Q2xpZW50Tm9uY2UtMDAw{i:04d}" for i in range(rs.CNONCE_KEEP + 2)]
+        for n in nonces:
+            _, chal = self._hello(n)
+        self.assertTrue(self.wire.verify_challenge(CLIENT, chal[1], 100.0))
+        kept = [nonces[0]] + nonces[-(rs.CNONCE_KEEP - 1):]
+        self.assertEqual(self.wire.ok_texts(), [f"OK {n}" for n in reversed(kept)])
+
+    def test_a_flood_of_replayed_hellos_cannot_push_out_the_phones_nonce(self):
+        # The phone's HELLO opens the challenge (a replayer can't know its port
+        # sooner); any number of replays from that address afterwards must not
+        # evict it, or the handshake never completes.
+        _, chal = self._hello(CNONCE)
+        for i in range(rs.CNONCE_KEEP * 3):
+            self._hello(f"T2xkSGVsbG9Ob25jZS0w{i:04d}")
+        self._hello(CNONCE)                          # the phone re-sends its HELLO
+        self.assertTrue(self.wire.verify_challenge(CLIENT, chal[1], 100.0))
+        oks = self.wire.ok_texts()
+        self.assertIn(f"OK {CNONCE}", oks)
+        self.assertEqual(len(oks), rs.CNONCE_KEEP)
+
+    def test_junk_in_place_of_a_nonce_is_not_echoed(self):
+        for junk in ["short", "has space in it but long enough", "é" * 20, "x" * 65,
+                     "bad/chars+here=ok?"]:
+            with self.subTest(junk=junk[:12]):
+                self.wire = rs.Wire(TOKEN, KEY, require_secure=True)
+                self.wire.issue_challenge(self.sock, CLIENT, 100.0, cnonce=junk)
+                self.assertEqual(len(unseal(KEY, self.sock.last()).split(" ")), 2)
+
+
+class ChallengeConsumption(unittest.TestCase):
+
+    def setUp(self):
+        self.wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        self.sock = FakeSock()
+        self.wire.issue_challenge(self.sock, CLIENT, 100.0)
+        self.nonce = unseal(KEY, self.sock.last()).split(" ", 1)[1]
+
+    def test_a_wrong_auth_does_not_burn_the_real_one(self):
+        # A tag-valid AUTH replayed from an older session carries an old nonce.
+        # It must not consume the challenge the real phone is about to answer.
+        stale = base64.urlsafe_b64encode(b"\x01" * 16).rstrip(b"=").decode()
+        self.assertFalse(self.wire.verify_challenge(CLIENT, stale, 100.0))
+        self.assertTrue(self.wire.verify_challenge(CLIENT, self.nonce, 100.0))
+
+    def test_a_malformed_auth_does_not_burn_it_either(self):
+        self.assertFalse(self.wire.verify_challenge(CLIENT, "!!!", 100.0))
+        self.assertTrue(self.wire.verify_challenge(CLIENT, self.nonce, 100.0))
+
+    def test_an_expired_challenge_is_dropped(self):
+        self.assertFalse(
+            self.wire.verify_challenge(CLIENT, self.nonce, 100.0 + rs.CHAL_TTL_S + 1))
+        self.assertNotIn(CLIENT, self.wire._chal)
+
+
+class RefusalHints(unittest.TestCase):
+
+    def test_parse_flags_a_packet_sealed_with_another_key(self):
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        pkt, _ = FakeClient(bytes(32)).seal("HELLO")
+        self.assertIsNone(wire.parse(pkt, CLIENT, None))
+        self.assertTrue(wire.key_refused)
+
+    def test_parse_does_not_flag_a_packet_that_is_not_secure_framed(self):
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        for junk in [b"garbage", b"L3short", b"XX" + b"\x00" * 40]:
+            wire.key_refused = False
+            wire.parse(junk, CLIENT, None)
+            self.assertFalse(wire.key_refused, junk)
+
+    def test_limiter_spaces_hints_per_address(self):
+        lim = rs.RefusalLimiter()
+        self.assertTrue(lim.allow(CLIENT, 10.0))
+        self.assertFalse(lim.allow(CLIENT, 10.0 + rs.REFUSAL_MIN_GAP_S - 0.1))
+        self.assertTrue(lim.allow(STRANGER, 10.1))
+        self.assertTrue(lim.allow(CLIENT, 10.0 + rs.REFUSAL_MIN_GAP_S))
+
+    def test_limiter_caps_the_total(self):
+        lim = rs.RefusalLimiter()
+        allowed = sum(lim.allow(("10.0.0.1", 1000 + i), 1.0) for i in range(200))
+        self.assertEqual(allowed, rs.REFUSAL_MAX_PER_WINDOW)
+        lim.reset()
+        self.assertTrue(lim.allow(("10.0.0.1", 1000), 1.0))
+
+
+class SecretFiles(unittest.TestCase):
+    """The token and key are everything needed to drive the laptop."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.tok = os.path.join(self.tmp.name, ".lazer_token")
+        self.key = os.path.join(self.tmp.name, ".lazer_key")
+        for name, val in (("TOKEN_FILE", self.tok), ("KEY_FILE", self.key)):
+            p = mock.patch.object(rs, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _acl(self, path):
+        import subprocess
+        return subprocess.run([rs.win_exe("icacls.exe"), path], capture_output=True,
+                              text=True).stdout
+
+    def test_write_secret_round_trips_and_leaves_no_temp_file(self):
+        rs.write_secret(self.tok, "ABC123")
+        rs.write_secret(self.tok, "XYZ789")          # replaces in place
+        with open(self.tok) as f:
+            self.assertEqual(f.read(), "XYZ789")
+        self.assertEqual(os.listdir(self.tmp.name), [".lazer_token"])
+
+    @unittest.skipUnless(sys.platform.startswith("win"), "Windows access lists")
+    def test_a_secret_is_owner_only_on_windows(self):
+        rs.write_secret(self.key, "k")
+        acl = self._acl(self.key)
+        self.assertNotIn("(I)", acl, f"inherited entries survived:\n{acl}")
+        for group in ("Authenticated Users", "BUILTIN\\Users", "Everyone"):
+            self.assertNotIn(group, acl)
+        self.assertTrue(rs._secret_is_private(self.key))
+
+    @unittest.skipIf(sys.platform.startswith("win"), "POSIX modes")
+    def test_a_secret_is_0600_elsewhere(self):              # pragma: no cover
+        rs.write_secret(self.key, "k")
+        self.assertEqual(os.stat(self.key).st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(sys.platform.startswith("win"), "Windows access lists")
+    def test_an_old_inherited_secret_is_hardened_on_load(self):
+        with open(self.key, "w") as f:                     # the pre-fix way
+            f.write(rs.key_b64(KEY))
+        self.assertFalse(rs._secret_is_private(self.key))
+        self.assertEqual(rs.load_or_create_key(), KEY)     # same key comes back...
+        self.assertTrue(rs._secret_is_private(self.key))   # ...now owner-only
+
+    def test_a_failed_rotation_changes_nothing(self):
+        rs.write_secret(self.tok, TOKEN)
+        rs.write_secret(self.key, rs.key_b64(KEY))
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        real = rs._write_secret_tmp
+        calls = []
+
+        def second_write_fails(path, text):
+            calls.append(path)
+            if len(calls) == 2:
+                raise PermissionError(13, "Access is denied")
+            return real(path, text)
+
+        with mock.patch.object(rs, "_write_secret_tmp", second_write_fails):
+            with self.assertRaises(OSError):
+                rs.rotate_secrets(wire)
+        self.assertEqual((wire.token, wire.key), (TOKEN, KEY))
+        self.assertFalse(wire.rotated)
+        with open(self.tok) as f:
+            self.assertEqual(f.read(), TOKEN)
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), [".lazer_key", ".lazer_token"])
+
+    def test_a_rotation_that_fails_halfway_puts_the_token_back(self):
+        # The key file is the one held open (OneDrive, AV): its replace fails after
+        # the token's succeeded. The pair on disk must still be the old pair.
+        rs.write_secret(self.tok, TOKEN)
+        rs.write_secret(self.key, rs.key_b64(KEY))
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        real = os.replace
+
+        def key_is_locked(src, dst):
+            if os.path.abspath(dst) == os.path.abspath(self.key):
+                raise PermissionError(13, "Access is denied")
+            return real(src, dst)
+
+        with mock.patch.object(rs.os, "replace", key_is_locked):
+            with self.assertRaises(OSError):
+                rs.rotate_secrets(wire)
+        self.assertEqual((wire.token, wire.key), (TOKEN, KEY))
+        with open(self.tok) as f:
+            self.assertEqual(f.read(), TOKEN)
+        self.assertEqual(rs.load_or_create_key(), KEY)
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), [".lazer_key", ".lazer_token"])
+
+    def test_a_rotation_persists_both_and_flags_the_loop(self):
+        wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        token, key = rs.rotate_secrets(wire)
+        self.assertTrue(wire.rotated)
+        with open(self.tok) as f:
+            self.assertEqual(f.read(), token)
+        self.assertEqual(rs.load_or_create_key(), key)
+
+    def test_an_unwritable_folder_is_reported_at_startup(self):
+        with mock.patch.object(rs, "write_secret",
+                               side_effect=PermissionError(13, "Access is denied")), \
+             mock.patch.object(rs, "SECRET_WRITE_ERRORS", []):
+            rs.load_or_create_token()
+            self.assertEqual(len(rs.SECRET_WRITE_ERRORS), 1)
+
+
+class SingleInstance(unittest.TestCase):
+
+    def setUp(self):
+        rs._stop.clear()
+        self.addCleanup(rs._stop.clear)
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        p = mock.patch.object(rs, "SINGLETON_PORT", port)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _serve(self, headless=False, token="ABC123"):
+        kind, lsock = rs.singleton_acquire(poke=False)
+        self.assertEqual(kind, "owner")
+        self.eq = queue_mod.Queue()
+        t = threading.Thread(target=rs.singleton_serve,
+                             args=(lsock, self.eq, lambda: token, headless), daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        self.addCleanup(rs._stop.set)
+
+    def _send(self, data):
+        c = socket.create_connection(("127.0.0.1", rs.SINGLETON_PORT), timeout=2)
+        c.sendall(data)
+        self.reply = c.recv(16)
+        c.close()
+        return self.eq.get(timeout=3)
+
+    def test_a_second_launch_learns_the_owner_has_no_window(self):
+        self._serve(headless=True)
+        self.assertEqual(rs.singleton_acquire(poke=True), ("existing", rs.SHOW_HEADLESS))
+
+    def test_a_gui_owner_says_it_came_forward(self):
+        self._serve(headless=False)
+        self.assertEqual(rs.singleton_acquire(poke=True), ("existing", rs.SHOW_OK))
+
+    def test_resume_needs_the_pairing_code(self):
+        self._serve()
+        with mock.patch.object(rs, "resume_remote") as resume:
+            # A bare RESUME is what an older --resume sends: say so.
+            kind, text = self._send(b"RESUME")
+            self.assertEqual(kind, "warn")
+            self.assertIn("older LazeR", text)
+            self.assertEqual(self.reply, rs.RESUME_DENIED)
+            kind, text = self._send(b"RESUME WRONG1")
+            self.assertEqual(kind, "warn")
+            self.assertNotIn("older LazeR", text)
+            self.assertEqual(self.reply, rs.RESUME_DENIED)
+            resume.assert_not_called()
+            self.assertEqual(self._send(b"RESUME ABC123"), ("resumed",))
+            self.assertEqual(self.reply, rs.RESUME_OK)
+            resume.assert_called_once()
+
+    def test_resume_reports_what_the_running_copy_said(self):
+        self.assertIn("resumed", rs._resume_outcome(rs.RESUME_OK))
+        self.assertIn("refused", rs._resume_outcome(rs.RESUME_DENIED))
+        self.assertIn("didn't confirm", rs._resume_outcome(b""))
+        # And says it in the exit status, for a hotkey or script.
+        self.assertEqual(rs._resume_exit_code(rs.RESUME_OK), 0)
+        self.assertEqual(rs._resume_exit_code(rs.RESUME_DENIED), 1)
+        self.assertEqual(rs._resume_exit_code(b""), 2)
+
+
+@unittest.skipUnless(sys.platform.startswith("win"), "a Windows-only socket behaviour")
+class UdpResets(unittest.TestCase):
+    """A send to a port nobody holds makes Windows fail the NEXT recv with
+    WSAECONNRESET unless SIO_UDP_CONNRESET is off. The socket module can't set it
+    (its ioctl() rejects the code), so this checks the setting really takes."""
+
+    def _dead_port(self):
+        d = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        d.bind(("127.0.0.1", 0))
+        port = d.getsockname()[1]
+        d.close()
+        return port
+
+    def _recv_after_dead_send(self, s):
+        s.settimeout(0.3)
+        s.sendto(b"x", ("127.0.0.1", self._dead_port()))
+        with self.assertRaises(socket.timeout):     # not ConnectionResetError
+            s.recvfrom(16)
+
+    def test_the_setting_takes(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.addCleanup(s.close)
+        self.assertTrue(rs.udp_resets_off(s))
+        self._recv_after_dead_send(s)
+
+    def test_the_server_socket_has_it(self):
+        saved = (rs.PORT, rs.HOST)
+        self.addCleanup(lambda: setattr(rs, "PORT", saved[0]) or setattr(rs, "HOST", saved[1]))
+        rs.PORT, rs.HOST = self._dead_port(), "127.0.0.1"
+        s = rs.open_socket()
+        self.addCleanup(s.close)
+        self._recv_after_dead_send(s)
+
+
+class ExclusivePort(unittest.TestCase):
+
+    @unittest.skipUnless(sys.platform.startswith("win"),
+                         "SO_EXCLUSIVEADDRUSE is Windows' answer to SO_REUSEADDR")
+    def test_a_second_server_cannot_bind_the_port(self):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        with mock.patch.object(rs, "PORT", port), mock.patch.object(rs, "HOST", "127.0.0.1"):
+            first = rs.open_socket()
+            try:
+                self.assertIsNotNone(rs._probe_udp_port())
+                # A plain SO_REUSEADDR socket — what an older LazeR opened — is
+                # refused too. What this catches is SO_REUSEADDR creeping back
+                # into open_socket; Windows already refuses this pair when only the
+                # second socket asks for reuse, so SO_EXCLUSIVEADDRUSE is extra
+                # cover (other users' sockets) that no same-user test can observe.
+                old = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                old.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                with self.assertRaises(OSError):
+                    old.bind(("127.0.0.1", port))
+                old.close()
+            finally:
+                first.close()
+            # ...and once closed, it rebinds at once (the wake-up path relies on it).
+            rs.open_socket().close()
+
+
+class HeldInput(unittest.TestCase):
+    """A drag-lock press must never outlive the phone's control of the laptop."""
+
+    def setUp(self):
+        self._saved = rs.mouse
+        rs.mouse = _Recorder()
+        rs._held_buttons.clear()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        rs.mouse = self._saved
+        rs._held_buttons.clear()
+        rs._remote_paused.clear()
+        rs._panic_latched.clear()
+        _client_connected_clear()
+
+    def _released(self):
+        return [c for c in rs.mouse.calls if c[0] == "release"]
+
+    def test_mdown_is_tracked_and_mup_clears_it(self):
+        rs.handle_packet("MDOWN", "")
+        self.assertIn(rs.Button.left, rs._held_buttons)
+        rs.handle_packet("MUP", "")
+        self.assertNotIn(rs.Button.left, rs._held_buttons)
+
+    def test_release_lets_go_of_a_held_button(self):
+        rs.handle_packet("MDOWN", "")
+        rs.release_held_input()
+        self.assertEqual(self._released(), [("release", rs.Button.left)])
+        self.assertEqual(rs._held_buttons, set())
+
+    def test_release_with_nothing_held_touches_nothing(self):
+        rs.release_held_input()
+        self.assertEqual(self._released(), [])
+
+    def test_local_takeover_releases_a_held_button(self):
+        rs._client_connected.set()
+        rs.handle_packet("MDOWN", "")
+        rs._physical_event(lambda *a: None)
+        self.assertEqual(self._released(), [("release", rs.Button.left)])
+
+    def test_panic_releases_a_held_button(self):
+        rs.handle_packet("MDOWN", "")
+        rs._panic_event(lambda *a: None)
+        self.assertEqual(self._released(), [("release", rs.Button.left)])
+
+
+class PaddedKeys(unittest.TestCase):
+    """A bound phone pads KEY/KEYSP bodies with trailing NULs (padKeyBody in
+    net/Protocol.kt); the server strips them before anything reads the text."""
+
+    def setUp(self):
+        self.wire = rs.Wire(TOKEN, KEY, require_secure=True)
+        self.fc = handshake(self.wire, FakeSock())
+
+    def test_padding_is_stripped_before_dispatch(self):
+        for body, want in (("KEY hi" + "\x00" * 26, ("KEY", "hi", True)),
+                           ("KEYSP enter" + "\x00" * 21, ("KEYSP", "enter", True))):
+            with self.subTest(body=body.rstrip("\x00")):
+                pkt, _ = self.fc.seal(body)
+                self.assertEqual(self.wire.parse(pkt, CLIENT, CLIENT), want)
+
+    def test_padded_text_types_only_the_text(self):
+        pkt, _ = self.fc.seal("KEY hi" + "\x00" * 26)
+        verb, rest, _ = self.wire.parse(pkt, CLIENT, CLIENT)
+        rs.keyboard.calls.clear()
+        rs.handle_packet(verb, rest)
+        self.assertEqual(rs.keyboard.calls, [("type", "hi")])
+
+
+class SharedContract(unittest.TestCase):
+    """Values the phone must agree on. ProtocolContractTest.kt pins the same
+    literals, so changing one side without the other turns one suite red."""
+
+    GOLDEN_URI = ("lazer://192.168.1.20:50505/?token=A1B2C3&name=Dearth"
+                  "&k=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")
+
+    def test_port(self):
+        self.assertEqual(rs.PORT, 50505)
+
+    def test_mdns_service_type(self):
+        # The phone browses "_lazer._udp." (NSD drops the ".local." suffix).
+        self.assertEqual(rs.SERVICE_TYPE, "_lazer._udp.local.")
+
+    def test_idle_drop_outlasts_the_phones_idle_poll(self):
+        # The phone polls every 4 s when idle (IDLE_POLL_MS) and must get at
+        # least two polls in before the server gives up on it.
+        self.assertEqual(rs.CLIENT_IDLE_S, 12)
+
+    def test_qr_format(self):
+        self.assertEqual(rs.build_uri("192.168.1.20", "A1B2C3", "Dearth", KEY),
+                         self.GOLDEN_URI)
+
+    def test_refusal_words(self):
+        self.assertEqual((rs.REFUSE_SECURE_REQUIRED, rs.REFUSE_BAD_KEY),
+                         ("secure-required", "bad-key"))
+
+    def test_volume_reply(self):
+        self.assertEqual([rs.volume_reply(42, m) for m in (True, False, None)],
+                         ["VOL 42 1", "VOL 42 0", "VOL 42"])
 
 
 if __name__ == "__main__":

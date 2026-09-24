@@ -7,7 +7,7 @@
   Run from anywhere (paths resolve relative to this script):
     powershell -ExecutionPolicy Bypass -File tools\build_exe.ps1
 
-  Then ship dist\LazeR.exe with LazeR.apk and START_HERE.md. Double-click to run.
+  A release ships dist\LazeR.exe with LazeR.apk (release.yml). Double-click to run.
 #>
 # NOT 'Stop': the build shells out to uv/pip/PyInstaller, which all log progress to
 # stderr. Under 'Stop', PowerShell 5.1 turns that normal stderr into a terminating
@@ -37,11 +37,14 @@ if (-not $py) {
 }
 Write-Host "Building with $(& $py --version)" -ForegroundColor Cyan
 
-# Build-time deps: the app's runtime deps + PyInstaller. uv-created venvs ship
-# without pip, so fall back to `uv pip` (targeting this interpreter) when pip is
-# absent. The install is idempotent - already-present packages are skipped.
-$pkgs = @("pyinstaller", "pynput", "cryptography", "pycaw", "comtypes",
-          "zeroconf", "qrcode", "pillow", "pystray", "psutil")
+# Build-time deps: the app's runtime deps + PyInstaller, from a lock file with a
+# SHA-256 for every wheel, so the exe can only bundle exactly what was reviewed.
+# Bare names here let a compromised or yanked PyPI release ride straight into an
+# exe that injects keyboard and mouse input. Regenerate after changing
+# server\requirements.txt - the command is at the top of the .in file.
+# The install is idempotent - already-present packages are skipped.
+$lock = Join-Path $PSScriptRoot "build-requirements.lock"
+$pkgs = @("--require-hashes", "-r", $lock)
 # uv-created venvs ship without pip, so fall back to `uv pip` (targeting this
 # interpreter) when pip is absent. find_spec is silent + exits 0/1, so it's a clean
 # probe; every install is gated on $LASTEXITCODE (stderr flows to the console).
@@ -127,7 +130,7 @@ $exe = Join-Path $root "dist\LazeR.exe"
 if (Test-Path $exe) {
     Write-Host ""
     Write-Host "Built: $exe" -ForegroundColor Green
-    Write-Host "Ship dist\LazeR.exe + LazeR.apk + START_HERE.md. No Python needed to run it." -ForegroundColor Cyan
+    Write-Host "Ship dist\LazeR.exe + LazeR.apk. No Python needed to run it." -ForegroundColor Cyan
 } else {
     Write-Host "Build finished but LazeR.exe not found - check the output above." -ForegroundColor Yellow
 }

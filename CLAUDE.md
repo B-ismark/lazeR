@@ -1,11 +1,16 @@
 # LazeR — agent guide
 
 Phone-as-trackpad. Android (Kotlin/Compose) client + Python server. LAN-only UDP on
-`50505`, gated by a per-session token; secure wire is AES-256-GCM (QR pairing) with a
-challenge-response handshake (`HELLO`→`CHAL`→`AUTH`, replay-proof). Encryption is
+`50505`, gated by a persistent pairing token + key; secure wire is AES-256-GCM (QR
+pairing) with a challenge-response handshake (`HELLO`→`CHAL`→`AUTH`, replay-proof;
+the phone's HELLO nonce is echoed in CHAL/OK so replies are bound too). Encryption is
 required by default — `--allow-plaintext` opts into the legacy manual-code wire.
 The wire dialect is `L3` (`sid(8)|counter(4)`); the legacy `L2` dialect was removed
 after its one-release grace window.
+
+Values both halves must agree on (port, mDNS type, idle timeout, QR format, refusal
+words) are pinned by `SharedContract` (server/tests) and `ProtocolContractTest`
+(android) against the same literals — change them together.
 See [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md) for the full picture.
 
 ## Update checks — the only internet access
@@ -13,18 +18,30 @@ See [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md) for the full picture.
 Both halves check GitHub's public releases API for a newer tag and show a
 notice (server: a "Version" pill in Details; phone: a card on the connect
 screen, a dot on the Settings button, and a status line under **Settings →
-Updates**). **Notify-only** — never downloads or installs. Anonymous GET, no token.
-A failure never interrupts; on the phone its only trace is that Settings status
-line ("Couldn't check for updates"). Off via `--no-update-check` (server) /
-**Settings → Updates** (phone).
+Updates**). Anonymous GET, no token. A failure never interrupts; on the phone its
+only trace is that Settings status line ("Couldn't check for updates"). Off via
+`--no-update-check` (server) / **Settings → Updates** (phone, reachable from the
+connect screen too).
+
+**The check never downloads.** The server is notify-only. The phone can download
+and install the new APK, but only when the user taps **Download & install**
+(`data/ApkUpdater.kt`, after Twitwa's updater): only URLs under
+`https://github.com/B-ismark/lazeR/releases/download/`, https after redirects, a
+100 MB cap and 10-minute deadline, SHA-256 checked while writing against the
+release's `LazeR.apk.sha256` and again just before handing it to Android's
+installer (FileProvider + `REQUEST_INSTALL_PACKAGES`). Android itself refuses an
+APK not signed with the release key. **Every release must publish
+`LazeR.apk.sha256`** (`release.yml` and `publish_release.ps1` both do); a release
+without it can only be installed from the release page.
 
 `APP_VERSION` in `remote_server.py` **must match** `versionName` in
 `android/app/build.gradle.kts` — a test asserts it, since a stale value would
 either nag forever or never nag. Bump both when you bump either.
 
-This is the ONLY outbound internet request in the product; everything else is
-LAN-only. Keep it that way — if a feature needs the internet, that's a design
-discussion, not an implementation detail.
+These (the check, and the phone's user-started download of a release asset) are
+the ONLY outbound internet requests in the product; everything else is LAN-only.
+Keep it that way — if a feature needs the internet, that's a design discussion,
+not an implementation detail.
 
 ## Releases — IMPORTANT POLICY
 
@@ -100,7 +117,13 @@ on the old commit and the notes as they were. So:
 
 - **Windows server exe:** `tools/build_exe.ps1` → `dist/LazeR.exe` (PyInstaller
   onefile, bundles Python + deps). The script prefers `server/.venv` (incl. uv
-  venvs, which have no pip — it falls back to `uv pip`).
+  venvs, which have no pip — it falls back to `uv pip`). Deps come from
+  `tools/build-requirements.lock` with `--require-hashes`; after changing
+  `server/requirements.txt`, regenerate it with the command at the top of
+  `tools/build-requirements.in`.
+- **Supply chain:** workflow actions are pinned to commit SHAs (Dependabot bumps
+  them), and the Gradle wrapper has `distributionSha256Sum` — update it with the
+  distribution URL.
 - **Android APK:** from `android/`, `./gradlew assembleRelease` (hardened, R8,
   signed with the local `~/.android/debug.keystore` "sideload" config) →
   `app/build/outputs/apk/release/`. `assembleDebug` for a quick debuggable build.

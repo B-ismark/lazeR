@@ -96,6 +96,11 @@ CHAL_MAX = 256              # bound the pending-challenge table (anti-flood)
 # per-IP cap makes a flood evict only its own entries. One genuine phone needs a
 # handful at most (handshake retries from one or two source ports).
 CHAL_PER_IP = 8
+# Client nonces remembered per challenge: the one that opened it, plus the latest
+# others. A HELLO is replayable, so keeping only the latest let a replay slipped in
+# between the phone's HELLO and its AUTH swap in an old nonce, and the OK then
+# echoed that one, which the phone refuses.
+CNONCE_KEEP = 4
 
 # Verbs that move or press the pointer. Listed separately because Windows needs a
 # nudge to make the pointer visible before one lands (see make_pointer_waker), and
@@ -130,12 +135,26 @@ RATE_WINDOW_S = 10                   # rejected-packet rate window
 RATE_MAX_BAD = 80                    # >this many rejected packets/window ⇒ warn (brute/flood)
 # When that warning fires, plaintext (manual-code) ACCEPTANCE is paused for this
 # many seconds: Wire.parse drops v1 packets before any parsing or comparison.
-# Token brute force only exists on the v1 wire — the secure wire authenticates by
+# Token brute force only exists on the plaintext wire — the secure wire authenticates by
 # GCM tag and never sees a token — so pausing exactly that path makes guessing
 # futile while QR-paired phones are untouched. Deliberately GLOBAL, not per-source
 # blocking: UDP source addresses are spoofable, so per-IP blocking would let a
 # flooder frame the real phone's address and lock the genuine user out.
 PLAINTEXT_SUSPEND_S = 60
+
+
+def win_exe(*parts):
+    """Absolute path to a Windows system program.
+
+    Bare names ("netsh", "cmd.exe") are resolved by CreateProcess, which looks in
+    the application's own folder and the current directory BEFORE System32 — so a
+    netsh.exe or cmd.exe dropped next to LazeR.exe (Downloads, a shared folder)
+    would be run instead, and for the firewall fix, run elevated."""
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    return os.path.join(root, "System32", *parts)
+
+
+POWERSHELL = ("WindowsPowerShell", "v1.0", "powershell.exe")
 
 
 def resume_remote():
@@ -146,7 +165,9 @@ def resume_remote():
 
 # ── volume ────────────────────────────────────────────────────────────────────
 def make_volume():
-    """Return (get_volume, set_volume, label); fns may be None if unavailable."""
+    """Return (get_volume, set_volume, label); fns may be None if unavailable.
+    A getter that can also tell whether output is muted carries that as its
+    `muted` attribute (returns True/False, or None when it can't tell)."""
     plat = sys.platform
 
     if plat.startswith("win"):
@@ -218,6 +239,12 @@ def make_volume():
 
         def set_win(pct):
             _on_endpoint(lambda e: e.SetMasterVolumeLevelScalar(pct / 100.0, None))
+
+        def muted_win():
+            m = _on_endpoint(lambda e: e.GetMute())
+            return None if m is None else bool(m)
+
+        get_win.muted = muted_win
 
         try:
             _endpoint()          # fail fast at startup, exactly as before
@@ -303,7 +330,7 @@ def make_brightness():
             # windowed process has no valid stdin handle, and without redirecting it
             # PowerShell fails to start — which silently made the brightness probe
             # (and reads) fail in the packaged build while working from source.
-            return subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+            return subprocess.run([win_exe(*POWERSHELL), "-NoProfile", "-Command", cmd],
                                   stdin=subprocess.DEVNULL, capture_output=True,
                                   text=True, timeout=4, creationflags=_flags)
 
@@ -331,7 +358,7 @@ def make_brightness():
         def _ensure_setproc():
             p = _setproc["p"]
             if p is None or p.poll() is not None:
-                p = subprocess.Popen(["powershell", "-NoProfile", "-Command", "-"],
+                p = subprocess.Popen([win_exe(*POWERSHELL), "-NoProfile", "-Command", "-"],
                                      stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL, text=True,
                                      creationflags=_flags)
@@ -656,6 +683,31 @@ def appswitch_reset():
         _alt_held = False
 
 
+# Mouse buttons the phone is holding down ("Hold drag"). MUP rides lossy UDP and is
+# dropped while the remote is paused, so every path that ends the phone's control
+# lets go of these too, or the laptop's own mouse keeps dragging.
+_held_buttons = set()
+
+
+def release_held_input():
+    """Let go of everything the phone is holding: a drag-lock button and the Alt
+    of an app-switch session. Called wherever the phone stops driving — it left,
+    the loop restarted, or the user took over locally. Never raises."""
+    for b in list(_held_buttons):
+        try:
+            mouse.release(b)
+        except Exception:
+            pass
+    _held_buttons.clear()
+    appswitch_reset()
+
+
+def volume_reply(vol, muted):
+    """The answer to VGET: "VOL n", plus " 1" / " 0" when mute is known. An older
+    phone reads only the number, so the extra word costs it nothing."""
+    return f"VOL {vol}" if muted is None else f"VOL {vol} {1 if muted else 0}"
+
+
 def do_system(action):
     """lock | sleep | mute — best effort per OS."""
     plat = sys.platform
@@ -682,7 +734,9 @@ def do_system(action):
         return
     if action == "sleep":
         if plat.startswith("win"):
-            os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
+            import subprocess
+            subprocess.Popen([win_exe("rundll32.exe"), "powrprof.dll,SetSuspendState",
+                              "0,1,0"], creationflags=_no_window_flags())
         elif plat == "darwin":
             os.system("pmset sleepnow")
         else:
@@ -690,7 +744,7 @@ def do_system(action):
         return
 
 
-# ── crypto: secure wire (v2/v3) ───────────────────────────────────────────────
+# ── crypto: secure wire (L3) ──────────────────────────────────────────────────
 #   v1 (legacy, PLAINTEXT):  "<TOKEN> <VERB> [args]"   — trusted LAN only.
 #   SECURE:  b"L3" || sid(8) || counter(4 BE) || AES-256-GCM(ct+tag)
 #     nonce = sid||counter (12 B) · AAD = b"L3"||sid||counter · plaintext = "VERB [args]"
@@ -705,8 +759,8 @@ def do_system(action):
 # ~39% by 65k — reachable, since every reconnect mints a session and the watchdog
 # reconnects on any drop). L3 moved four bytes to the sid for 2^64 at zero cost: a
 # 4-byte counter still allows 4.29e9 packets per session, and exhausting it re-keys
-# the sid rather than wrapping. L2 was accepted through v2.x so un-updated phones
-# kept working, and is REMOVED as of this release — an L2 packet is now just unknown
+# the sid rather than wrapping. L2 was accepted until 2.2.0 so un-updated phones
+# kept working, and is REMOVED — an L2 packet is now just unknown
 # magic and falls through like any other junk. Do not add a new dialect without also
 # updating the golden vectors in server/tests/test_wire.py AND
 # android/.../SecureChannelTest.kt — they are what stop the two implementations
@@ -723,51 +777,259 @@ except Exception:
     _HAVE_CRYPTO = False
 
 
+# ── secret files ──────────────────────────────────────────────────────────────
+# .lazer_token and .lazer_key are everything needed to drive this laptop. A plain
+# open() inherits the folder's access list (next to an exe on D:\ that is
+# "Authenticated Users: Modify") or the umask, so one writer makes them owner-only
+# from the moment the file exists: a fresh temp file renamed over the target (a
+# rename keeps the temp file's own access list), raising on failure rather than
+# pretending.
+
+# Filled when a secret could not be persisted at startup, for the UI to show: the
+# pairing then lasts only until the app is closed.
+SECRET_WRITE_ERRORS = []
+
+
+def _win_owner_only_sddl():
+    """SDDL granting full control to this user and SYSTEM only, protected from
+    inheritance (the "P"), so nothing the folder grants reaches the file."""
+    import ctypes
+    from ctypes import wintypes
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                          ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                             ctypes.c_void_p, wintypes.DWORD,
+                                             ctypes.POINTER(wintypes.DWORD)]
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p,
+                                                ctypes.POINTER(wintypes.LPWSTR)]
+    TOKEN_QUERY, TOKEN_USER = 0x0008, 1
+    tok = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), TOKEN_QUERY,
+                                     ctypes.byref(tok)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        size = wintypes.DWORD()
+        advapi32.GetTokenInformation(tok, TOKEN_USER, None, 0, ctypes.byref(size))
+        buf = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(tok, TOKEN_USER, buf, size,
+                                            ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        psid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]  # TOKEN_USER.User.Sid
+        s = wintypes.LPWSTR()
+        if not advapi32.ConvertSidToStringSidW(psid, ctypes.byref(s)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            sid = s.value
+        finally:
+            kernel32.LocalFree(s)
+    finally:
+        kernel32.CloseHandle(tok)
+    return f"D:P(A;;FA;;;SY)(A;;FA;;;{sid})"
+
+
+def _win_create_private(path):
+    """Create [path] (which must not exist) with the owner-only access list set
+    by CreateFileW itself, so there is no moment it is readable by anyone else.
+    Returns a writable text file object."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class SECURITY_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", ctypes.c_void_p),
+                    ("bInheritHandle", wintypes.BOOL)]
+
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.ULONG)]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                     ctypes.POINTER(SECURITY_ATTRIBUTES), wintypes.DWORD,
+                                     wintypes.DWORD, wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    psd = ctypes.c_void_p()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            _win_owner_only_sddl(), 1, ctypes.byref(psd), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        sa = SECURITY_ATTRIBUTES(ctypes.sizeof(SECURITY_ATTRIBUTES), psd, False)
+        GENERIC_WRITE, CREATE_NEW, FILE_ATTRIBUTE_NORMAL = 0x40000000, 1, 0x80
+        h = kernel32.CreateFileW(path, GENERIC_WRITE, 0, ctypes.byref(sa), CREATE_NEW,
+                                 FILE_ATTRIBUTE_NORMAL, None)
+        if h is None or h == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.LocalFree(psd)
+    fd = msvcrt.open_osfhandle(h, os.O_WRONLY)
+    return os.fdopen(fd, "w", encoding="ascii")
+
+
+def _secret_tmp_path(path):
+    return f"{path}.tmp-{secrets.token_hex(4)}"
+
+
+def _write_secret_tmp(path, text):
+    """Write [text] to a fresh owner-only temp file beside [path]; return its path.
+    Raises OSError on any failure (and leaves no temp file behind)."""
+    tmp = _secret_tmp_path(path)
+    try:
+        if sys.platform.startswith("win"):
+            f = _win_create_private(tmp)
+        else:
+            f = os.fdopen(os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600),
+                          "w", encoding="ascii")
+        with f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        return tmp
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_secret(path, text):
+    """Persist one secret owner-only and atomically. Raises OSError on failure."""
+    tmp = _write_secret_tmp(path, text)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _secret_is_private(path):
+    """False when a secret file is readable by more than its owner — an install
+    from before write_secret existed. Unknown counts as private (no rewrite)."""
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+            from ctypes import wintypes
+            advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            advapi32.GetNamedSecurityInfoW.argtypes = [
+                wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p)]
+            advapi32.GetSecurityDescriptorControl.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(wintypes.WORD), ctypes.POINTER(wintypes.DWORD)]
+            kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+            SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED = 1, 4, 0x1000
+            psd = ctypes.c_void_p()
+            if advapi32.GetNamedSecurityInfoW(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                              None, None, None, None, ctypes.byref(psd)):
+                return True
+            try:
+                ctl, rev = wintypes.WORD(), wintypes.DWORD()
+                if not advapi32.GetSecurityDescriptorControl(psd, ctypes.byref(ctl),
+                                                             ctypes.byref(rev)):
+                    return True
+                return bool(ctl.value & SE_DACL_PROTECTED)
+            finally:
+                kernel32.LocalFree(psd)
+        return (os.stat(path).st_mode & 0o077) == 0
+    except Exception:
+        return True
+
+
+def _harden_existing_secret(path, text):
+    """Re-write an old, loosely-permissioned secret in place with the same
+    contents. Best effort: a folder we can't write to keeps what it has."""
+    if not _secret_is_private(path):
+        try:
+            write_secret(path, text)
+        except OSError:
+            pass
+
+
+def _new_token():
+    return "".join(secrets.choice(string.ascii_uppercase + string.digits)
+                   for _ in range(TOKEN_LEN))
+
+
 def load_or_create_key():
     """Persistent 32-byte key (base64url in KEY_FILE), reused across launches."""
-    import base64
     try:
         with open(KEY_FILE, "r") as f:
-            raw = base64.urlsafe_b64decode(f.read().strip() + "===")
-            if len(raw) == 32:
-                return raw
+            text = f.read().strip()
+        raw = base64.urlsafe_b64decode(text + "===")
+        if len(raw) == 32:
+            _harden_existing_secret(KEY_FILE, text)
+            return raw
     except Exception:
         pass
     key = secrets.token_bytes(32)
     try:
-        with open(KEY_FILE, "w") as f:
-            f.write(base64.urlsafe_b64encode(key).rstrip(b"=").decode())
-        if not sys.platform.startswith("win"):
-            os.chmod(KEY_FILE, 0o600)
-    except OSError:
-        pass
+        write_secret(KEY_FILE, key_b64(key))
+    except OSError as e:
+        SECRET_WRITE_ERRORS.append(f"{KEY_FILE}: {e}")
     return key
 
 
 def key_b64(key):
-    import base64
     return base64.urlsafe_b64encode(key).rstrip(b"=").decode()
 
 
 def rotate_secrets(wire):
     """Generate a fresh token + key, persist them, and update the live Wire.
-    Any currently-paired phone is invalidated (must rescan) — a one-click 'kick'."""
-    import base64
-    token = "".join(secrets.choice(string.ascii_uppercase + string.digits)
-                    for _ in range(TOKEN_LEN))
+    Any currently-paired phone is invalidated (must rescan) — a one-click 'kick'.
+
+    Raises OSError, leaving the live Wire and both files untouched, if the new
+    secrets can't be saved: swapping them in anyway would kick the phone only until
+    the next launch reloaded the old pair."""
+    token = _new_token()
     key = secrets.token_bytes(32)
+    # Both temp files first: if either can't be written (the usual failure — a
+    # folder like Program Files that isn't ours), neither target has changed.
+    tmp_tok = _write_secret_tmp(TOKEN_FILE, token)
     try:
-        with open(TOKEN_FILE, "w") as f:
-            f.write(token)
+        tmp_key = _write_secret_tmp(KEY_FILE, key_b64(key))
     except OSError:
-        pass
+        os.remove(tmp_tok)
+        raise
+    def _drop(*paths):
+        for t in paths:
+            try:
+                os.remove(t)
+            except OSError:
+                pass
+
     try:
-        with open(KEY_FILE, "w") as f:
-            f.write(base64.urlsafe_b64encode(key).rstrip(b"=").decode())
-        if not sys.platform.startswith("win"):
-            os.chmod(KEY_FILE, 0o600)
+        os.replace(tmp_tok, TOKEN_FILE)
     except OSError:
-        pass
+        _drop(tmp_tok, tmp_key)
+        raise
+    try:
+        os.replace(tmp_key, KEY_FILE)
+    except OSError:
+        # The token on disk is already the new one. Put the old one back, or the
+        # next launch pairs the new token with the old key and every phone fails
+        # with nothing to say why — while the GUI said nothing had changed.
+        try:
+            write_secret(TOKEN_FILE, wire.token)
+        except OSError:
+            pass
+        _drop(tmp_key)
+        raise
+    with wire.lock:
+        _swap_secrets(wire, token, key)
+    return token, key
+
+
+def _swap_secrets(wire, token, key):
     wire.token = token
     wire.key = key
     wire.aes = AESGCM(key) if (key and _HAVE_CRYPTO) else None
@@ -778,7 +1040,66 @@ def rotate_secrets(wire):
     # repeated nonce under a DIFFERENT key is harmless), but it keeps the invariant
     # "one (key, dialect, sid) never reuses a counter" true without a caveat.
     wire._srv.clear()
-    return token, key
+    # serve_loop still holds the kicked phone's address as its client; this tells
+    # it to drop that pin on its next tick, so the window stops saying "connected"
+    # right away instead of after the 12s idle timeout.
+    wire.rotated = True
+
+
+# ── refusal hints ─────────────────────────────────────────────────────────────
+# Silence is what a firewall, a sleeping laptop and a wrong IP produce too, so for
+# the two refusals the phone can act on, the server answers one plaintext line,
+# "ERR <reason>":
+#   secure-required  a plaintext HELLO carrying the RIGHT token, while encryption is
+#                    required: pair by QR, or turn Require encryption off.
+#   bad-key          a secure-framed packet that failed authentication: this phone's
+#                    key is not ours, almost always a pairing from before Regenerate.
+# What it reveals: that a LazeR server is listening (mDNS already announces that),
+# and for secure-required, that the sender's token is right — worth nothing while
+# encryption is required, since the token alone opens nothing then. A wrong token
+# on the plaintext wire still gets silence, so there is no token-guessing oracle.
+# It is unauthenticated, so the phone treats it as a hint for its error message,
+# never as a reason to stop trying. Older phones ignore it: they discard anything
+# that isn't a sealed reply or a bare "OK".
+REFUSE_SECURE_REQUIRED = "secure-required"
+REFUSE_BAD_KEY = "bad-key"
+REFUSAL_MIN_GAP_S = 2.0          # per address: one hint per handshake attempt is plenty
+REFUSAL_MAX_PER_WINDOW = 32      # overall, per RATE_WINDOW_S — no use as a reflector
+WSAEMSGSIZE = 10040              # Windows: datagram larger than the receive buffer
+# A receive loop that ran this long before crashing was healthy; the next crash
+# starts the restart backoff over instead of paying for crashes hours ago.
+LOOP_HEALTHY_S = 60.0
+
+
+class RefusalLimiter:
+    """Rate limit for refusal hints: at most one per address per
+    REFUSAL_MIN_GAP_S, and REFUSAL_MAX_PER_WINDOW in total until reset()."""
+
+    def __init__(self):
+        self._last = {}
+        self._count = 0
+
+    def allow(self, addr, now):
+        if self._count >= REFUSAL_MAX_PER_WINDOW:
+            return False
+        last = self._last.get(addr)
+        if last is not None and now - last < REFUSAL_MIN_GAP_S:
+            return False
+        self._last[addr] = now
+        self._count += 1
+        return True
+
+    def reset(self):
+        self._last.clear()
+        self._count = 0
+
+
+def send_refusal(sock, addr, reason):
+    """Send one "ERR <reason>" hint. Fail-soft: it runs above the handler guard."""
+    try:
+        sock.sendto(f"ERR {reason}".encode("ascii"), addr)
+    except OSError:
+        pass
 
 
 class Wire:
@@ -788,6 +1109,11 @@ class Wire:
         self.token = token
         self.key = key
         self.require_secure = require_secure
+        # Taken by rotate_secrets (Tk thread) around the swap, and by serve_loop
+        # around each parse and handshake step, so a packet is never judged half
+        # against the old secrets and half against the new.
+        self.lock = threading.RLock()
+        self.rotated = False
         self.aes = AESGCM(key) if (key and _HAVE_CRYPTO) else None
         # Default reply dialect, used only until a client is pinned. It is NOT
         # mutated by incoming packets — see _seal_reply for why that mattered.
@@ -808,6 +1134,12 @@ class Wire:
         # Set when a correctly-tokened plaintext packet was refused because
         # encryption is required; serve_loop turns it into a one-time explanation.
         self.plaintext_refused = False
+        # Set when a secure-framed packet failed authentication — almost always a
+        # phone paired to this laptop's PREVIOUS key. Same one-shot contract.
+        self.key_refused = False
+        # The client nonces to echo in the OKs that answer a verified AUTH, newest
+        # first ("" for a phone too old to send one). See issue_challenge.
+        self.auth_echoes = ()
         # Monotonic deadline while plaintext v1 acceptance is paused (see
         # PLAINTEXT_SUSPEND_S). 0.0 ⇒ accepting.
         self.pt_suspended_until = 0.0
@@ -832,8 +1164,15 @@ class Wire:
             try:
                 pt = self.aes.decrypt(data[2:14], data[14:], data[0:14])
             except Exception:
-                return None                     # bad tag ⇒ forged/corrupt ⇒ drop
-            text = pt.decode("utf-8", "ignore")
+                # Bad tag: forged, corrupt, or (usually) a key from before a re-pair.
+                # Flag it for the bad-key hint.
+                self.key_refused = True
+                return None
+            # Trailing NULs are padding: a phone that saw this server bind its
+            # handshake (so knows it strips them) pads KEY/KEYSP to fixed buckets,
+            # so the ciphertext length stops giving away how much was typed or
+            # which special key it was. Nothing legitimate ends in a NUL.
+            text = pt.decode("utf-8", "ignore").rstrip("\x00")
             verb, rest = _split_verb(text)
             if verb in ("HELLO", "AUTH"):
                 # Record the dialect so the CHAL goes back in the one this client
@@ -856,31 +1195,44 @@ class Wire:
         # the only path a token brute-force exists against.
         if time.monotonic() < self.pt_suspended_until:
             return None
+        # Split and compare as BYTES: secrets.compare_digest raises TypeError on
+        # non-ASCII str, and this runs above the handler guard.
+        parts = data.rstrip(b"\r\n").split(b" ", 2)
+        if len(parts) < 2 or not secrets.compare_digest(parts[0], self._token_b):
+            return None
         if self.require_secure:
             # Nothing is accepted here — but tell apart "a real phone tried to pair
             # with the manual code" from random junk, so the UI can explain the
             # refusal. Otherwise flipping the default to secure-only turns manual
             # pairing into an unexplained timeout, which is a worse experience than
             # the insecure wire it replaced.
-            try:
-                head = data.decode("utf-8", "ignore").split(" ", 2)
-                if len(head) >= 2 and secrets.compare_digest(head[0], self.token):
-                    self.plaintext_refused = True
-            except Exception:
-                pass
+            self.plaintext_refused = True
             return None
-        try:
-            text = data.decode("utf-8", "ignore").rstrip("\r\n")
-        except Exception:
-            return None
-        parts = text.split(" ", 2)
-        if len(parts) < 2:
-            return None
-        if not secrets.compare_digest(parts[0], self.token):
-            return None
-        return parts[1], (parts[2] if len(parts) > 2 else ""), False
+        verb = parts[1].decode("utf-8", "ignore")
+        rest = parts[2].decode("utf-8", "ignore") if len(parts) > 2 else ""
+        return verb, rest, False
 
-    def issue_challenge(self, sock, addr, now, magic=None):
+    @property
+    def token(self):
+        return self._token
+
+    @token.setter
+    def token(self, value):
+        # Kept alongside its bytes form so parse never encodes per packet, and so
+        # rotate_secrets (which assigns .token) can't leave the two out of step.
+        self._token = value
+        self._token_b = (value or "").encode("utf-8")
+
+    def _clean_cnonce(self, rest):
+        """The client nonce a HELLO carries (see issue_challenge), or "" if it has
+        none — an older phone — or sends something that isn't one."""
+        c = rest.strip()
+        if 16 <= len(c) <= 64 and all(ch.isascii() and (ch.isalnum() or ch in "-_")
+                                      for ch in c):
+            return c
+        return ""
+
+    def issue_challenge(self, sock, addr, now, magic=None, cnonce=""):
         """Answer a secure HELLO with a one-time challenge (encrypted). The client
         must echo the nonce in an AUTH to be pinned. Does NOT pin — a replayed HELLO
         just draws a challenge the replayer can't answer.
@@ -895,17 +1247,33 @@ class Wire:
         the SAME outstanding nonce until it's answered or expires. Without
         this, each HELLO would mint a new nonce and overwrite the last, so the client's
         AUTH — echoing whichever CHAL it happened to receive first — would never match
-        the server's latest, and the relay handshake could never complete."""
+        the server's latest, and the handshake could never complete on a slow link.
+
+        [cnonce] is the client's own nonce from its HELLO. It is echoed in the CHAL
+        and again in the final OK (one OK per nonce the challenge collected, see
+        CNONCE_KEEP), which is what binds our replies to THIS handshake:
+        the key outlives every session, so any sealed CHAL or OK captured earlier is
+        still tag-valid, and a phone that took the first one it received could be
+        handed a replay from a stranger and pin a session that isn't ours. A phone
+        too old to send one gets the old unbound replies; it never parses the rest."""
         if self.aes is None:
             return
         if magic is None:
             magic = self._pending[0] if self._pending else self.wire_magic
+        cnonce = self._clean_cnonce(cnonce)
         ent = self._chal.get(addr)
         if ent is not None and now <= ent[1]:
             nonce = ent[0]                      # reuse the live challenge for this addr
-            # Keep the nonce (that idempotency is the point) but track the dialect of
-            # the LATEST HELLO, in case the client retried on the legacy fallback.
-            self._chal[addr] = (nonce, ent[1], magic)
+            # Keep the nonce (that idempotency is the point) but track the dialect
+            # of the LATEST HELLO, and add its client nonce to the ones the OK echoes.
+            # The first one is never evicted: it came with the HELLO that opened the
+            # challenge, which is the phone's own (nobody knew its port before), and
+            # without the pin a few replayed HELLOs would push it out.
+            first, rest = ent[3][0], tuple(c for c in ent[3][1:] if c != cnonce)
+            if cnonce != first:
+                rest += (cnonce,)
+            seen = (first,) + rest[-(CNONCE_KEEP - 1):]
+            self._chal[addr] = (nonce, ent[1], magic, seen)
         else:
             # Make room without ever letting one source cost another its challenge.
             # This used to clear the WHOLE table at the cap, so a replayed-HELLO
@@ -928,25 +1296,43 @@ class Wire:
                 victims = [a for a in self._chal if a[0] == worst]
                 self._chal.pop(min(victims, key=lambda a: self._chal[a][1]), None)
             nonce = secrets.token_bytes(16)
-            self._chal[addr] = (nonce, now + CHAL_TTL_S, magic)
-        self._seal_reply(sock, addr,
-                         "CHAL " + base64.urlsafe_b64encode(nonce).rstrip(b"=").decode(),
-                         magic=magic)
+            self._chal[addr] = (nonce, now + CHAL_TTL_S, magic, (cnonce,))
+        text = "CHAL " + base64.urlsafe_b64encode(nonce).rstrip(b"=").decode()
+        if cnonce:
+            text += " " + cnonce
+        self._seal_reply(sock, addr, text, magic=magic)
 
     def verify_challenge(self, addr, rest, now):
         """True iff [rest] echoes the fresh, unexpired challenge issued to [addr].
-        Single-use: the challenge is consumed whether or not it matches."""
-        ent = self._chal.pop(addr, None)
+
+        Single-use: a MATCH consumes it, so a replay of the genuine AUTH fails. A
+        mismatch does not, so a tag-valid AUTH replayed from an older session can't
+        burn the phone's challenge mid-handshake. On success the
+        client nonces to echo are left in [auth_echoes]."""
+        self.auth_echoes = ()
+        ent = self._chal.get(addr)
         if ent is None:
             return False
         nonce, exp = ent[0], ent[1]
         if now > exp:
+            self._chal.pop(addr, None)
             return False
         try:
-            got = base64.urlsafe_b64decode(rest.strip() + "=" * (-len(rest.strip()) % 4))
+            r = rest.strip()
+            got = base64.urlsafe_b64decode(r + "=" * (-len(r) % 4))
         except Exception:
             return False
-        return secrets.compare_digest(got, nonce)
+        if not secrets.compare_digest(got, nonce):
+            return False
+        self._chal.pop(addr, None)
+        self.auth_echoes = tuple(reversed(ent[3]))
+        return True
+
+    def ok_texts(self):
+        """The OKs answering a just-verified AUTH, newest HELLO first: each echoes
+        one client nonce the challenge collected, or is a bare "OK" for a phone too
+        old to send one (see issue_challenge). The phone takes the one it sent."""
+        return ["OK " + c if c else "OK" for c in self.auth_echoes]
 
     def sweep_challenges(self, now):
         """Drop expired challenges so a flood of unanswered HELLOs can't accumulate."""
@@ -1040,6 +1426,43 @@ def _split_verb(text):
 
 
 # ── local-input takeover guard (Windows) ─────────────────────────────────────
+def panic_chord_held(get_async_key_state):
+    """True iff the panic modifiers are physically down at this instant.
+
+    Asked of the OS, not tracked from the hook: the hook reports side-specific codes
+    (see LocalInputGuard.PANIC_KEY), and misses key-UPs across a lock screen / UAC
+    prompt / session switch. Three register reads, cheap enough for a hook callback."""
+    return all(get_async_key_state(vk) & 0x8000
+               for vk in LocalInputGuard.PANIC_MODIFIERS)
+
+
+def want_wake_hold(client, last_remote, mono):
+    """Should the machine be held awake? Only while a phone is paired AND it drove
+    the machine within REMOTE_AWAKE_S. [last_remote] is None until the first
+    control verb: time.monotonic() counts from boot, so a 0.0 sentinel read as
+    "just now" for the first REMOTE_AWAKE_S of uptime and held a freshly booted
+    laptop awake for nothing."""
+    return (client is not None and last_remote is not None
+            and (mono - last_remote) < REMOTE_AWAKE_S)
+
+
+def swap_hooks(install, unhook, current):
+    """Replace the hook pair [current] with a freshly installed one; return the
+    pair now in force. Install FIRST and drop the old pair only once the new one
+    is real: SetWindowsHookExW can fail mid session/desktop transition — exactly
+    when a rearm runs — and unhooking first would throw away two working hooks
+    for nothing. A partial install is undone and [current] kept."""
+    new_kb, new_ms = install()
+    if new_kb and new_ms:
+        for h in current:
+            unhook(h)
+        return new_kb, new_ms
+    for h in (new_kb, new_ms):
+        if h:
+            unhook(h)
+    return current
+
+
 class LocalInputGuard:
     """Low-level Windows hooks that fire ONLY on physical (non-injected) input.
     Our own pynput injections carry the INJECTED flag and are ignored, so the
@@ -1133,17 +1556,7 @@ class LocalInputGuard:
                         ("dwExtraInfo", ctypes.c_void_p)]
 
         def chord_held():
-            """True iff the panic modifiers are physically down at this instant.
-
-            Asked of the OS rather than read from `self._down`, for two reasons.
-            The set holds side-specific codes the generic constants never match
-            (see PANIC_KEY), and it is not trustworthy anyway: hooks miss key-UP
-            events across a lock screen / UAC prompt / session switch, so a
-            modifier can linger in it long after the user let go. GetAsyncKeyState
-            answers for the real keyboard, and for either Shift. Three register
-            reads, cheap enough for a hook callback."""
-            return all(user32.GetAsyncKeyState(vk) & 0x8000
-                       for vk in self.PANIC_MODIFIERS)
+            return panic_chord_held(user32.GetAsyncKeyState)
 
         def kb_proc(nCode, wParam, lParam):
             if nCode == 0:
@@ -1194,16 +1607,8 @@ class LocalInputGuard:
                 # pausing the remote, and the panic key would stop working, for the
                 # rest of the session. A duplicate LL hook from one thread is legal,
                 # so the brief overlap costs nothing.
-                new_kb, new_ms = install()
-                if new_kb and new_ms:
-                    user32.UnhookWindowsHookEx(kb_hook)
-                    user32.UnhookWindowsHookEx(ms_hook)
-                    kb_hook, ms_hook = new_kb, new_ms
-                else:                       # keep what still works
-                    if new_kb:
-                        user32.UnhookWindowsHookEx(new_kb)
-                    if new_ms:
-                        user32.UnhookWindowsHookEx(new_ms)
+                kb_hook, ms_hook = swap_hooks(install, user32.UnhookWindowsHookEx,
+                                              (kb_hook, ms_hook))
                 continue
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
@@ -1420,8 +1825,12 @@ def handle_packet(verb, rest):
 
     elif verb == "MDOWN":        # drag-lock: hold the left button down
         mouse.press(Button.left)
+        _held_buttons.add(Button.left)
 
     elif verb == "MUP":          # drag-lock: release
+        # Unconditional, not "only if tracked": a loop restart forgets the set, and
+        # the phone resends MUP, so the OS may still hold a button we don't know of.
+        _held_buttons.discard(Button.left)
         mouse.release(Button.left)
 
     elif verb == "COMBO":
@@ -1584,7 +1993,10 @@ def parse_version(text):
         return None
     out = []
     for p in parts:
-        if not p.isdigit():
+        # ASCII digits only. str.isdigit() also accepts "²" and other Unicode
+        # digits that int() then rejects — raising on the update thread instead of
+        # returning None for a tag we can't read.
+        if not (p.isascii() and p.isdigit()):
             return None
         out.append(int(p))
     while len(out) < 3:
@@ -1599,6 +2011,9 @@ def is_newer_version(latest, current):
     if a is None or b is None:
         return False
     return a > b
+
+
+RELEASE_READ_CAP = 256_000   # bytes of the releases API response we will read
 
 
 def fetch_latest_release(url=RELEASES_API, timeout=UPDATE_TIMEOUT_S):
@@ -1623,10 +2038,20 @@ def fetch_latest_release(url=RELEASES_API, timeout=UPDATE_TIMEOUT_S):
                 return None
             # Cap the read: we only need one short field, and an unbounded read from
             # a host we don't control is how a hung transfer becomes a memory bug.
-            data = json.loads(r.read(64_000).decode("utf-8", "ignore"))
+            raw = r.read(RELEASE_READ_CAP).decode("utf-8", "ignore")
     except Exception:
         return None
-    tag = data.get("tag_name") if isinstance(data, dict) else None
+    try:
+        data = json.loads(raw)
+        tag = data.get("tag_name") if isinstance(data, dict) else None
+    except ValueError:
+        # A release with long notes or many assets can outgrow the cap, and the
+        # cut leaves invalid JSON — which would read as "couldn't check" forever
+        # for that release. tag_name sits near the top of GitHub's response, so
+        # take it from the prefix we did read.
+        import re
+        m = re.search(r'"tag_name"\s*:\s*"([^"\\]{1,64})"', raw)
+        tag = m.group(1) if m else None
     return tag if isinstance(tag, str) and tag.strip() else None
 
 
@@ -1638,32 +2063,77 @@ def check_for_update(url=RELEASES_API, timeout=UPDATE_TIMEOUT_S):
     return tag, is_newer_version(tag, APP_VERSION)
 
 
+# Not in the socket module, whose ioctl() takes only three codes: asking it for this
+# one raised AttributeError, which was caught, so the setting never took effect.
+SIO_UDP_CONNRESET = 0x9800000C
+
+
+def udp_resets_off(sock):
+    """Windows raises WSAECONNRESET (ConnectionResetError) on a UDP socket's *next*
+    recv after a send to an endpoint with no listener, which happens routinely when
+    we reply to a phone that has just vanished (app killed, Wi-Fi dropped). Turn that
+    off for [sock]. True if it took effect; never raises. serve_loop still catches
+    the error, in case this couldn't be applied."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        ioctl = ctypes.WinDLL("ws2_32").WSAIoctl
+        ioctl.argtypes = [ctypes.c_size_t, wintypes.DWORD, ctypes.c_void_p,
+                          wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                          ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+                          ctypes.c_void_p]
+        ioctl.restype = ctypes.c_int
+        off, got = wintypes.BOOL(False), wintypes.DWORD(0)
+        return ioctl(sock.fileno(), SIO_UDP_CONNRESET, ctypes.byref(off),
+                     ctypes.sizeof(off), None, 0, ctypes.byref(got), None, None) == 0
+    except Exception:
+        return False
+
+
 def open_socket():
     """Fresh bound UDP socket. Recreated after resume — a socket bound before the
     laptop slept can stop receiving once the NIC cycles, so we rebind to recover."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # Windows raises WSAECONNRESET (ConnectionResetError) on a UDP socket's *next*
-    # recv after we send to an endpoint with no listener — which happens routinely
-    # when we reply to a phone that has just vanished (app killed, Wi-Fi dropped).
-    # SIO_UDP_CONNRESET off stops that spurious error tearing down the recv loop.
+    # Exclusive, so a second LazeR can't bind the same port. Not SO_REUSEADDR: on
+    # Windows that lets ANY later socket bind 50505 too: two servers then split
+    # the phone's packets between them, which looks exactly like a flaky network
+    # (constant drops and reconnects on a perfect link). UDP has no TIME_WAIT, so
+    # the wake-up rebind — which closes the old socket first — never needed reuse.
     if sys.platform.startswith("win"):
-        try:
-            sock.ioctl(socket.SIO_UDP_CONNRESET, False)
-        except (AttributeError, OSError):
-            pass
+        excl = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if excl is not None:
+            sock.setsockopt(socket.SOL_SOCKET, excl, 1)
+    udp_resets_off(sock)
     sock.settimeout(1.0)   # idle wake-ups: 1/s is plenty for the resume/idle/rate checks
-    sock.bind((HOST, PORT))
+    try:
+        sock.bind((HOST, PORT))
+    except OSError:
+        sock.close()
+        raise
     return sock
+
+
+# What an owner answers a SHOW with, so a second launch knows whether a window
+# actually came forward. A headless (terminal) owner has none to show, and the
+# second launch — often a double-clicked windowed exe with no console to print to —
+# used to exit silently, looking like the click did nothing.
+SHOW_OK = b"SHOWN"
+SHOW_HEADLESS = b"HEADLESS"
+# Answers to RESUME, so `--resume` can say whether it worked.
+RESUME_OK = b"RESUMED"
+RESUME_DENIED = b"DENIED"
 
 
 def singleton_acquire(poke=True):
     """Single-instance guard over a loopback control port.
 
-    Returns ("existing", None) if another instance is already running (and, when
-    [poke], was signaled to surface its window), ("owner", lsock) if we are the
-    first instance (lsock is the control listener to serve), or ("solo", None) if
-    the guard couldn't be set up (proceed unguarded).
+    Returns ("existing", reply) if another instance is already running (when
+    [poke], it was asked to surface its window and [reply] is its answer: SHOW_OK,
+    SHOW_HEADLESS, or b"" from an older version that doesn't answer),
+    ("owner", lsock) if we are the first instance (lsock is the control listener
+    to serve), or ("solo", None) if the guard couldn't be set up.
 
     [poke]=False (terminal mode) still detects an existing owner but does NOT
     send SHOW — a second headless launch must not pop anyone's window; it only
@@ -1676,9 +2146,12 @@ def singleton_acquire(poke=True):
     except OSError:
         probe = None
     if probe is not None:
+        reply = b"" if poke else None
         try:
             if poke:
                 probe.sendall(b"SHOW")
+                probe.settimeout(1.0)
+                reply = probe.recv(16)
         except OSError:
             pass
         finally:
@@ -1686,7 +2159,7 @@ def singleton_acquire(poke=True):
                 probe.close()
             except OSError:
                 pass
-        return "existing", None
+        return "existing", reply
     # No one answered — claim the port. No SO_REUSEADDR: on Windows it would let
     # a second instance steal the port and defeat the guard; we want bind to fail.
     try:
@@ -1721,9 +2194,16 @@ def _reclaim_singleton_port(dead):
     return None
 
 
-def singleton_serve(lsock, eq):
+def singleton_serve(lsock, eq, token_fn=None, headless=False):
     """Accept loopback pokes from later launches: SHOW surfaces the window;
-    RESUME clears a panic latch (the terminal has no Resume button — --resume)."""
+    RESUME clears a panic latch (the terminal has no Resume button — --resume).
+
+    RESUME must carry the pairing token ([token_fn] returns the live one). The
+    port is loopback, but loopback is shared by every session on the machine —
+    fast user switching, RDP — so a bare RESUME let any local account undo the
+    panic latch of the user sitting at the laptop. The token file is readable by
+    this user only, which is what `--resume` reads it from. The answer
+    (RESUME_OK / RESUME_DENIED) goes back before the connection closes."""
     while not _stop.is_set():
         try:
             conn, _ = lsock.accept()
@@ -1747,8 +2227,22 @@ def singleton_serve(lsock, eq):
             _stop.wait(0.5)
             continue
         cmd = b""
+        resumed = None
+        bare = False
         try:
-            cmd = conn.recv(16)
+            conn.settimeout(1.0)
+            cmd = conn.recv(64)
+            if cmd.startswith(b"SHOW"):
+                conn.sendall(SHOW_HEADLESS if headless else SHOW_OK)
+            elif cmd.startswith(b"RESUME"):
+                given = cmd[len(b"RESUME"):].strip()
+                bare = not given
+                want = (token_fn() if token_fn else "").encode("utf-8")
+                resumed = bool(want) and secrets.compare_digest(given, want)
+                if resumed:
+                    # Safe from this thread: resume_remote only clears threading.Events.
+                    resume_remote()
+                conn.sendall(RESUME_OK if resumed else RESUME_DENIED)
         except OSError:
             pass
         finally:
@@ -1756,11 +2250,17 @@ def singleton_serve(lsock, eq):
                 conn.close()
             except OSError:
                 pass
-        if cmd.startswith(b"RESUME"):
-            # Safe from this thread: resume_remote only clears threading.Events.
-            resume_remote()
+        if resumed is True:
             eq.put(("resumed",))
-        else:
+        elif resumed is False and bare:
+            # What an older LazeR's --resume sends, and it reports success anyway.
+            eq.put(("warn", "Ignored a resume request with no pairing code, as an "
+                            "older LazeR's --resume sends. Use this version's "
+                            "--resume, or click Resume."))
+        elif resumed is False:
+            eq.put(("warn", "Ignored a resume request that didn't carry this "
+                            "laptop's pairing code."))
+        elif cmd.startswith(b"SHOW"):
             eq.put(("show",))
     try:
         lsock.close()
@@ -1781,17 +2281,16 @@ def load_or_create_token():
     try:
         with open(TOKEN_FILE, "r") as f:
             tok = f.read().strip()
-            if tok:
-                return tok
+        if tok:
+            _harden_existing_secret(TOKEN_FILE, tok)
+            return tok
     except OSError:
         pass
-    tok = "".join(secrets.choice(string.ascii_uppercase + string.digits)
-                  for _ in range(TOKEN_LEN))
+    tok = _new_token()
     try:
-        with open(TOKEN_FILE, "w") as f:
-            f.write(tok)
-    except OSError:
-        pass
+        write_secret(TOKEN_FILE, tok)
+    except OSError as e:
+        SECRET_WRITE_ERRORS.append(f"{TOKEN_FILE}: {e}")
     return tok
 
 
@@ -1915,17 +2414,38 @@ def _self_invocation():
     return f"python {os.path.basename(SCRIPT_PATH)}"
 
 
-def _startup_command():
-    """Command string to register under Run — handles frozen .exe and .py."""
+def _startup_command(minimized=True):
+    """Command string to register under Run — handles frozen .exe and .py.
+
+    --minimized starts in the tray: at login nobody is looking yet, and the full
+    window put the QR (token AND key) on a possibly unattended screen for up to
+    QR_HIDE_AFTER_MS."""
+    flag = " --minimized" if minimized else ""
     if getattr(sys, "frozen", False):              # PyInstaller bundle
-        return f'"{sys.executable}"'
+        return f'"{sys.executable}"{flag}'
     # Source run: prefer pythonw so no console window pops at login.
     pyw = sys.executable
     if pyw.lower().endswith("python.exe"):
         cand = pyw[:-len("python.exe")] + "pythonw.exe"
         if os.path.exists(cand):
             pyw = cand
-    return f'"{pyw}" "{SCRIPT_PATH}"'
+    return f'"{pyw}" "{SCRIPT_PATH}"{flag}'
+
+
+def migrate_startup_command():
+    """Add --minimized to a Run entry an older release registered for THIS
+    binary. An entry pointing anywhere else is the user's choice — left alone."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as k:
+            cur, _ = winreg.QueryValueEx(k, _RUN_VALUE)
+            if cur == _startup_command(minimized=False):
+                winreg.SetValueEx(k, _RUN_VALUE, 0, winreg.REG_SZ, _startup_command())
+    except OSError:
+        pass
 
 
 def startup_enabled():
@@ -1990,7 +2510,7 @@ set_startup.last_error = ""
 # rule is inert there: the port stays shut, every check still reports the rule
 # as present, and phones time out with nothing to go on. Opening it is not the
 # exposure it looks like, because the port is not the security boundary — every
-# datagram is gated by the per-session token, over AES-256-GCM with a
+# datagram is gated by the pairing token or key, over AES-256-GCM with a
 # replay-proof challenge-response handshake, so a reachable port without the QR
 # is useless.
 #
@@ -2039,7 +2559,8 @@ def firewall_rule_exists():
     import subprocess
     try:
         r = subprocess.run(
-            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={FW_RULE_NAME}"],
+            [win_exe("netsh.exe"), "advfirewall", "firewall", "show", "rule",
+             f"name={FW_RULE_NAME}"],
             capture_output=True, text=True, timeout=6,
             creationflags=_no_window_flags())
         return r.returncode == 0 and "No rules match" not in r.stdout
@@ -2180,7 +2701,7 @@ def _firewall_purge_legacy_direct():
     for name in _FW_LEGACY_RULE_NAMES:
         try:
             subprocess.run(
-                ["netsh", "advfirewall", "firewall", "delete", "rule",
+                [win_exe("netsh.exe"), "advfirewall", "firewall", "delete", "rule",
                  f"name={name}"],
                 capture_output=True, text=True, timeout=8,
                 creationflags=_no_window_flags())
@@ -2195,7 +2716,7 @@ def _firewall_add_direct():
     _firewall_purge_legacy_direct()
     try:
         subprocess.run(
-            ["netsh"] + _FW_ADD_ARGS,
+            [win_exe("netsh.exe")] + _FW_ADD_ARGS,
             capture_output=True, text=True, timeout=8,
             creationflags=_no_window_flags())
     except Exception:
@@ -2254,14 +2775,17 @@ def ensure_firewall_rule(allow_elevate=False):
         # Purge + add has to run in one elevated shell, or the user eats a UAC
         # prompt per netsh call. cmd.exe chains them; the rule names are quoted
         # and hold no cmd metacharacters, so `&` only ever splits our commands.
+        netsh = f'"{win_exe("netsh.exe")}"'
         parts = [
-            f'netsh advfirewall firewall delete rule name="{name}" >nul 2>nul'
+            f'{netsh} advfirewall firewall delete rule name="{name}" >nul 2>nul'
             for name in _FW_LEGACY_RULE_NAMES
         ]
-        parts.append("netsh " + " ".join(
+        parts.append(netsh + " " + " ".join(
             f'name="{FW_RULE_NAME}"' if a.startswith("name=") else a
             for a in _FW_ADD_ARGS))
-        _run_elevated_and_wait("cmd.exe", "/c " + " & ".join(parts))
+        # cmd.exe /c strips one pair of outer quotes when the line starts with one,
+        # so wrap the whole chain in an extra pair to keep netsh's path quoted.
+        _run_elevated_and_wait(win_exe("cmd.exe"), '/c "' + " & ".join(parts) + '"')
         return firewall_rule_exists()
     return False
 
@@ -2393,15 +2917,6 @@ _ACTION_LABELS = {
 }
 
 
-def _emit_action(event_q, verb, rest):
-    fn = _ACTION_LABELS.get(verb)
-    if fn is None:
-        return
-    res = fn(rest)
-    if res:
-        event_q.put(("action", res[0], res[1]))
-
-
 def serve_loop(wire, emit, net, hostname):
     """The one UDP loop, used by both GUI and terminal modes.
 
@@ -2409,6 +2924,7 @@ def serve_loop(wire, emit, net, hostname):
     (GUI → queue, terminal → print). [net] is a shared {"ip","zc","info"} dict
     for mDNS re-announce after resume."""
     sock = open_socket()
+    emit("serving")
     client = None
     last_tick = time.time()
     last_pkt = last_tick     # wall-clock of the last accepted packet from the pinned phone
@@ -2420,6 +2936,8 @@ def serve_loop(wire, emit, net, hostname):
     handler_errors = set()   # verbs whose handler raised
     blocked_seen = set()     # addresses turned away while a phone is already paired
     plaintext_hinted = False  # explained a secure-only refusal this window
+    key_hinted = False        # explained a wrong-key refusal this window
+    refusals = RefusalLimiter()
     _client_connected.clear()
     # Normalize the wake hold. This is per-thread state and serve_forever restarts
     # us on the SAME thread, so a loop that died mid-session would otherwise leave
@@ -2447,7 +2965,8 @@ def serve_loop(wire, emit, net, hostname):
                 if announce_network(net, hostname, wire, emit, ip):
                     emit("log", f"Reachable at {ip}")
             except Exception as e:
-                emit("warn", f"Could not re-announce on the network ({e})")
+                emit("warn", f"Couldn't announce this laptop for discovery ({e}). "
+                             "Phones can still connect by QR; LazeR retries by itself.")
             finally:
                 announce_busy.clear()
 
@@ -2460,7 +2979,7 @@ def serve_loop(wire, emit, net, hostname):
     def drop_client():
         nonlocal client
         if client is not None:
-            appswitch_reset()
+            release_held_input()
             client = None
             _client_connected.clear()
             emit("disconnected")
@@ -2470,312 +2989,341 @@ def serve_loop(wire, emit, net, hostname):
         # the leftovers instead of starting clean.
         wire.unpin_client()
 
-    while not _stop.is_set():
-        now = time.time()
-        mono = time.monotonic()
+    try:
+        while not _stop.is_set():
+            now = time.time()
+            mono = time.monotonic()
 
-        # Resume detection: a tick gap far longer than the 1s recv timeout means
-        # the process was frozen (laptop slept). Rebind + re-announce so a phone
-        # can reach us again without a restart.
-        if now - last_tick > RESUME_GAP_S:
+            # Regenerate ran (see _swap_secrets): drop the pinned phone now.
+            if wire.rotated:
+                wire.rotated = False
+                drop_client()
+
+            # Resume detection: a tick gap far longer than the 1s recv timeout means
+            # the process was frozen (laptop slept). Rebind + re-announce so a phone
+            # can reach us again without a restart.
+            if now - last_tick > RESUME_GAP_S:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                # Retry the rebind until it succeeds: on wake the old port may not be released
+                # yet, or the NIC may still be coming up. Giving up here would leave `sock`
+                # closed and the loop permanently deaf.
+                sock = None
+                rebind_fail = 0
+                while not _stop.is_set():
+                    try:
+                        sock = open_socket()
+                        break
+                    except OSError:
+                        rebind_fail += 1
+                        if rebind_fail == 1:
+                            emit("log", "Waiting to rebind the socket after sleep…")
+                        time.sleep(1.0)
+                if sock is None:      # _stop was set while we were retrying — shutting down
+                    break
+                # The retry may have taken several seconds; refresh `now` so the stale
+                # value doesn't spuriously re-trigger the resume path or idle-drop below.
+                now = time.time()
+                # Keep the phone pinned: HELLO/AUTH are accepted from any source, so a phone
+                # that rebuilt its session re-pairs anyway, and one whose socket survived (both
+                # devices slept) resumes seamlessly. But give it only a short grace, not a full
+                # CLIENT_IDLE_S, so a phone that left is reported gone promptly.
+                release_held_input()
+                last_pkt = time.time() - max(0, CLIENT_IDLE_S - POST_WAKE_GRACE_S)
+                # Hooks are commonly revoked across a wake or a lock, and key-ups during
+                # one are never delivered — so re-install and forget any held keys.
+                if _input_guard[0] is not None:
+                    _input_guard[0].rearm()
+                # A wake often lands with the panic/pause latch set from whatever the user
+                # touched on the way in (or before sleeping). Clearing the SOFT pause is
+                # safe — it re-arms on the next physical event 2s later. The panic latch is
+                # deliberate, so it stays.
+                _remote_paused.clear()
+                # Re-announce, but not with lan_ip() now: a wake usually beats the Wi-Fi
+                # association (see usable_lan_ip). Mark the address stale; the watch below
+                # publishes it once there's a real one.
+                net_pending, net_pending_since, net_checked = True, now, 0.0
+                emit("log", "Woke from sleep — restoring the network…")
+                emit("woke")
+            last_tick = now
+
+            # Own-address watch. Runs on every tick, not only after a sleep gap: roaming
+            # to another SSID or a DHCP change moves us with no gap at all, and the mDNS
+            # record and QR would otherwise keep pointing at the old address for the rest
+            # of the process. [net_pending] also drives the post-wake retry — we may need
+            # several passes before the NIC hands us a usable address.
+            if (net is not None and not announce_busy.is_set()
+                    and (net_pending or now - net_checked > NET_WATCH_S)):
+                net_checked = now
+                ip_now = usable_lan_ip()
+                if ip_now is None:
+                    # No LAN address yet (still associating, or offline): publish nothing,
+                    # look again next tick.
+                    if net_pending and now - net_pending_since > NET_SETTLE_S:
+                        # Stop the every-tick retry and say so once. The periodic watch
+                        # keeps running at its normal cadence, so plugging the network
+                        # back in later still re-announces without an app restart.
+                        net_pending = False
+                        emit("warn", "Still no network address after waking — "
+                                     "reconnect Wi-Fi and LazeR will re-announce itself.")
+                elif (ip_now != net.get("ip") or net_pending
+                        or (net.get("zc") is None and not _MDNS_UNAVAILABLE[0])):
+                    # Re-register on a changed address, after a wake (the zeroconf
+                    # sockets are bound to interfaces that just cycled), or when a
+                    # previous attempt failed. A machine
+                    # with no zeroconf installed is a different thing entirely and must
+                    # NOT be retried: it would reprint the notice every few seconds.
+                    # Stop the fast retry and fall back to the normal NET_WATCH_S
+                    # cadence — the clause above re-tries a failed registration on the
+                    # next pass without spinning on this one.
+                    net_pending = False
+                    announce_async(ip_now)
+
+            # The phone pings ~every 1.5s; prolonged silence means it left without a
+            # BYE (app killed, Wi-Fi dropped). Reflect that instead of showing it
+            # "connected" forever — so the status is always truthful.
+            if client is not None and now - last_pkt > CLIENT_IDLE_S:
+                drop_client()
+
+            if now - bad_win > RATE_WINDOW_S:
+                bad, bad_win, warned = 0, now, False
+                handler_errors.clear()
+                blocked_seen.clear()
+                plaintext_hinted = False
+                key_hinted = False
+                refusals.reset()
+                wire.sweep_challenges(mono)
+
+            # Local takeover auto-resume: once physical input has been quiet for the
+            # grace period (and no panic latch), let the remote drive again.
+            if (_remote_paused.is_set() and not _panic_latched.is_set()
+                    and (mono - _last_physical_ts[0]) > PHYSICAL_RESUME_GRACE_S):
+                _remote_paused.clear()
+                emit("resumed")
+
+            # Hold the machine awake while the phone is actively driving it (see
+            # make_idle_suppressor). Only transitions are pushed, and releasing on quiet
+            # lets an idle laptop sleep normally.
+            if hold_awake is not None:
+                want_awake = want_wake_hold(client, _last_remote_ts[0], mono)
+                if want_awake != awake_held:
+                    hold_awake(want_awake)
+                    awake_held = want_awake
+
+            sock.settimeout(1.0)   # 1/s idle wake-ups drive the resume/idle/rate checks
+
+            try:
+                data, addr = sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except ConnectionResetError:
+                # Windows: a prior send hit an endpoint with no listener (a phone that
+                # left). Not fatal — the socket is fine; keep serving.
+                continue
+            except OSError as e:
+                if getattr(e, "winerror", None) == WSAEMSGSIZE:
+                    # Windows reports an oversized datagram as an error (the excess is
+                    # discarded). It is one bad packet, not a sick socket, so it must not
+                    # take the 100ms pause below: that made ~10 junk packets a second
+                    # enough to keep the loop mostly asleep.
+                    bad += 1
+                    continue
+                # A transient network error (e.g. host/net-unreachable surfacing on the
+                # next recv after a send to a departed phone) must NOT tear the loop down
+                # for good. Pause briefly and keep serving; a real dead socket is handled
+                # by the sleep/resume rebind above.
+                time.sleep(0.1)
+                continue
+            if not data:
+                continue
+
+            with wire.lock:
+                res = wire.parse(data, addr, client)
+            if res is None:
+                bad += 1
+                reason = None
+                if wire.plaintext_refused:
+                    wire.plaintext_refused = False
+                    reason = REFUSE_SECURE_REQUIRED
+                    if not plaintext_hinted:
+                        plaintext_hinted = True
+                        emit("warn", "A phone tried to pair with the typed code, but "
+                                     "Require encryption is on. Scan the QR instead, or "
+                                     "turn off Require encryption under Show details.")
+                elif wire.key_refused:
+                    wire.key_refused = False
+                    reason = REFUSE_BAD_KEY
+                    if not key_hinted:
+                        key_hinted = True
+                        emit("warn", f"{addr[0]} is using an old pairing (or sent a "
+                                     "corrupt packet). If it's your phone, scan the QR "
+                                     "again.")
+                if reason is not None and refusals.allow(addr, mono):
+                    # Tell the phone WHY, so it can say "scan the new QR" instead of
+                    # blaming the firewall. See send_refusal for what it reveals.
+                    send_refusal(sock, addr, reason)
+                if bad > RATE_MAX_BAD and not warned:
+                    warned = True
+                    if wire.aes is not None:
+                        # Suspend plaintext ACCEPTANCE for a window (PLAINTEXT_SUSPEND_S):
+                        # brute force only exists on the plaintext wire, so pausing exactly that
+                        # path makes guessing futile while QR-paired phones are untouched.
+                        # Global, not per-source: UDP source addresses are spoofable, and
+                        # per-IP blocking would let a flooder frame the real phone.
+                        wire.pt_suspended_until = mono + PLAINTEXT_SUSPEND_S
+                        emit("warn",
+                             "High rate of rejected packets — possible brute-force / flood; "
+                             f"manual-code pairing paused {int(PLAINTEXT_SUSPEND_S)}s "
+                             "(QR pairing unaffected)")
+                    else:
+                        # No key (or no `cryptography`) ⇒ the plaintext wire is the ONLY
+                        # way in, so pausing it would lock the user out entirely rather
+                        # than push them to the QR. Warn and keep serving: a deliberate
+                        # availability-over-throttling trade, bounded by a 36^6 (~2.2e9)
+                        # token space that is only reachable from the LAN.
+                        emit("warn", "High rate of rejected packets — possible brute-force / flood")
+                continue
+            verb, rest, secure = res
+
+            if verb == "HELLO":
+                if secure:
+                    # Don't pin on HELLO — it's replayable. Answer with a one-time
+                    # challenge; only an AUTH echoing it (which needs the key to seal)
+                    # pins control. Defeats captured-session replay by a keyless attacker.
+                    # [rest] is the phone's own nonce, echoed so it can tell our reply
+                    # from a replayed one.
+                    wire.issue_challenge(sock, addr, mono, cnonce=rest)
+                else:
+                    # v1 plaintext HELLO (legacy, trusted-LAN only; never reachable when
+                    # remote access forces secure-only). Token match already gated it in
+                    # parse; pin directly. A plaintext re-pin is logged as a warning.
+                    repin = client is not None and addr != client
+                    release_held_input()
+                    client = addr
+                    last_pkt = now
+                    wire.commit_hello(False)
+                    _client_connected.set()
+                    emit("connected", f"{addr[0]}:{addr[1]}", False)
+                    if repin:
+                        emit("warn", f"Control moved to {addr[0]}:{addr[1]} over PLAINTEXT "
+                                     "— turn on Require encryption to prevent takeovers")
+                    wire.reply(sock, addr, "OK")
+                continue
+
+            if verb == "AUTH":
+                # Second handshake leg: pins control iff it echoes the fresh challenge
+                # we just issued to this address (proves key possession AND freshness).
+                with wire.lock:
+                    authed = secure and wire.verify_challenge(addr, rest, mono)
+                    if authed:
+                        wire.commit_hello(True)     # baseline = this AUTH's sid/counter
+                if authed:
+                    release_held_input()
+                    client = addr
+                    last_pkt = now
+                    _client_connected.set()
+                    emit("connected", f"{addr[0]}:{addr[1]}", True)
+                    for text in wire.ok_texts():
+                        wire.reply(sock, addr, text)
+                continue
+
+            if verb == "BYE":
+                if addr == client:
+                    drop_client()
+                continue
+
+            if addr != client:
+                # Authenticated but not from the pinned phone. Reachable on the v1
+                # plaintext wire, where a token match is the only gate — so this is a
+                # second phone (or someone who learned the code) trying to take over a
+                # live session. On the secure (L3) wire the same attempt is rejected
+                # inside wire.parse (wrong
+                # source for the pinned sid) and lands in the `bad` counter instead,
+                # which is what raises the brute-force/flood warning.
+                if client is not None and addr not in blocked_seen:
+                    blocked_seen.add(addr)
+                    emit("blocked", f"{addr[0]}:{addr[1]}")
+                continue
+            last_pkt = now   # pinned phone is alive — keep the idle timer fed
+
+            # PING/VGET answer over the same (encrypted) wire the client used.
+            if verb == "PING":
+                wire.reply(sock, addr, "PONG")
+                continue
+            if verb == "VGET":
+                if get_volume is not None:
+                    # Belt and braces around the backend: make_volume's Windows path now
+                    # re-acquires a stale endpoint by itself, but this branch runs ABOVE
+                    # the handler guard below, so anything that still escapes here would
+                    # take the whole receive loop with it. A missing answer costs the
+                    # phone one poll — it re-probes with PING and stays connected.
+                    try:
+                        vol = get_volume()
+                    except Exception:
+                        vol = None
+                    if vol is not None:
+                        # Its own guard: a failed mute read costs the mute field,
+                        # not the volume answer.
+                        try:
+                            muted = getattr(get_volume, "muted", lambda: None)()
+                        except Exception:
+                            muted = None
+                        wire.reply(sock, addr, volume_reply(vol, muted))
+                continue
+            if verb == "BGET":
+                if brightness_svc.available:
+                    wire.reply(sock, addr, f"BRI {brightness_svc.get_cached()}")   # cached: never blocks the loop
+                continue
+
+            # Local input wins: while the user has taken over (or after a panic),
+            # every machine-driving verb is dropped on the floor.
+            if verb in CONTROL_VERBS and (_remote_paused.is_set() or _panic_latched.is_set()):
+                continue
+
+            # A verb handler — or an activity-log label, which the GUI emitter
+            # evaluates inline on THIS thread — must never take the receive loop down
+            # with it. This is the single thread serving every phone: an unhandled
+            # raise here left the server permanently deaf, window still green and
+            # "server running" still lit, every packet ignored until a manual restart.
+            # The GUI's event poll already guards itself for exactly this reason.
+            try:
+                emit("action", verb, rest)
+                handle_packet(verb, rest)
+            except Exception as e:
+                if verb not in handler_errors:
+                    handler_errors.add(verb)
+                    what = _ACTION_LABELS.get(verb)
+                    try:
+                        what = (what(rest) or (verb,))[0] if what else verb
+                    except Exception:
+                        what = verb
+                    emit("warn", f"Couldn't do “{what}” ({verb}) on this laptop and "
+                                 f"skipped it ({type(e).__name__}: {e}).")
+    finally:
+        # Runs on a clean shutdown AND on a crash serve_forever will restart us from:
+        # release a held button, clear the connected state and the wake hold, and close
+        # the socket now — with an exclusive bind, one left for the GC would block the
+        # restart's rebind.
+        release_held_input()
+        if client is not None:
+            _client_connected.clear()
+            try:
+                wire.unpin_client()
+                emit("disconnected")
+            except Exception:
+                pass
+        if hold_awake is not None and awake_held:
+            try:
+                hold_awake(False)
+            except Exception:
+                pass
+        if sock is not None:
             try:
                 sock.close()
             except OSError:
                 pass
-            # Retry the rebind until it succeeds. On wake the OS may not have released
-            # the old port yet, or the NIC may still be coming up, so a single
-            # open_socket() can raise OSError. The old code bailed here with
-            # `last_tick = time.time(); continue`, which DISARMED the resume-gap check
-            # (now - last_tick > RESUME_GAP_S could never fire again) and left `sock`
-            # pointing at the already-closed socket — so the recv loop spun forever on
-            # a dead socket and the server went permanently deaf after sleep until a
-            # manual restart. Loop instead, so we always come out with a live socket.
-            sock = None
-            rebind_fail = 0
-            while not _stop.is_set():
-                try:
-                    sock = open_socket()
-                    break
-                except OSError:
-                    rebind_fail += 1
-                    if rebind_fail == 1:
-                        emit("log", "Waiting to rebind the socket after sleep…")
-                    time.sleep(1.0)
-            if sock is None:      # _stop was set while we were retrying — shutting down
-                break
-            # The retry may have taken several seconds; refresh `now` so the stale
-            # value doesn't spuriously re-trigger the resume path or idle-drop below.
-            now = time.time()
-            # Keep the phone pinned, but stop giving it a FULL idle window to prove
-            # it's still there.
-            #
-            # The pin costs nothing to hold: HELLO/AUTH are accepted from any source,
-            # so a phone that rebuilt its session (new port, new sid — what its
-            # watchdog does after ~2.5s of silence, i.e. always, since the gap that
-            # got us here is longer than that) re-pairs immediately regardless. And on
-            # the rarer path where BOTH devices slept, the phone's socket really did
-            # survive and holding the pin means it resumes with no interruption at all.
-            #
-            # What was wrong was the idle window. `last_pkt = now` handed the departed
-            # phone a fresh CLIENT_IDLE_S, so the window sat there claiming a phone was
-            # connected for 12s after a wake, every time. Give it a short grace instead:
-            # a phone that is genuinely still there speaks well inside it, and one that
-            # isn't is reported gone promptly.
-            appswitch_reset()
-            last_pkt = time.time() - max(0, CLIENT_IDLE_S - POST_WAKE_GRACE_S)
-            # Hooks are commonly revoked across a wake or a lock, and key-ups during
-            # one are never delivered — so re-install and forget any held keys.
-            if _input_guard[0] is not None:
-                _input_guard[0].rearm()
-            # A wake often lands with the panic/pause latch set from whatever the user
-            # touched on the way in (or before sleeping). Clearing the SOFT pause is
-            # safe — it re-arms on the next physical event 2s later. The panic latch is
-            # deliberate, so it stays; the false-trigger it used to suffer is fixed in
-            # LocalInputGuard.rearm/chord_held.
-            _remote_paused.clear()
-            # Re-announce, but NOT with whatever lan_ip() says at this instant. This
-            # ran before the rebind and published the answer unconditionally, so a
-            # wake that beat the Wi-Fi association — the normal case — advertised the
-            # 127.0.0.1 fallback over mDNS and painted it into the QR, and it stayed
-            # that way until the app was restarted. Just mark the address stale; the
-            # watch below publishes it once there's a real one to publish.
-            net_pending, net_pending_since, net_checked = True, now, 0.0
-            emit("log", "Woke from sleep — restoring the network…")
-        last_tick = now
-
-        # Own-address watch. Runs on every tick, not only after a sleep gap: roaming
-        # to another SSID or a DHCP change moves us with no gap at all, and the mDNS
-        # record and QR would otherwise keep pointing at the old address for the rest
-        # of the process. [net_pending] also drives the post-wake retry — we may need
-        # several passes before the NIC hands us a usable address.
-        if (net is not None and not announce_busy.is_set()
-                and (net_pending or now - net_checked > NET_WATCH_S)):
-            net_checked = now
-            ip_now = usable_lan_ip()
-            if ip_now is None:
-                # No LAN address yet (still associating, or genuinely offline).
-                # Publishing the loopback fallback here is what poisoned discovery,
-                # so publish nothing and look again on the next tick.
-                if net_pending and now - net_pending_since > NET_SETTLE_S:
-                    # Stop the every-tick retry and say so once. The periodic watch
-                    # keeps running at its normal cadence, so plugging the network
-                    # back in later still re-announces without an app restart.
-                    net_pending = False
-                    emit("warn", "Still no network address after waking — "
-                                 "reconnect Wi-Fi and LazeR will re-announce itself.")
-            elif (ip_now != net.get("ip") or net_pending
-                    or (net.get("zc") is None and not _MDNS_UNAVAILABLE[0])):
-                # Re-register on a changed address, after a wake (the zeroconf
-                # sockets are bound to interfaces that just cycled), or when a
-                # previous attempt failed — that last case used to store the failure
-                # and never look again, silently losing discovery for good. A machine
-                # with no zeroconf installed is a different thing entirely and must
-                # NOT be retried: it would reprint the notice every few seconds.
-                # Stop the fast retry and fall back to the normal NET_WATCH_S
-                # cadence — the clause above re-tries a failed registration on the
-                # next pass without spinning on this one.
-                net_pending = False
-                announce_async(ip_now)
-
-        # The phone pings ~every 1.5s; prolonged silence means it left without a
-        # BYE (app killed, Wi-Fi dropped). Reflect that instead of showing it
-        # "connected" forever — so the status is always truthful.
-        if client is not None and now - last_pkt > CLIENT_IDLE_S:
-            drop_client()
-
-        if now - bad_win > RATE_WINDOW_S:
-            bad, bad_win, warned = 0, now, False
-            handler_errors.clear()
-            blocked_seen.clear()
-            plaintext_hinted = False
-            wire.sweep_challenges(mono)   # drop expired, unanswered HELLO challenges
-
-        # Local takeover auto-resume: once physical input has been quiet for the
-        # grace period (and no panic latch), let the remote drive again.
-        if (_remote_paused.is_set() and not _panic_latched.is_set()
-                and (mono - _last_physical_ts[0]) > PHYSICAL_RESUME_GRACE_S):
-            _remote_paused.clear()
-            emit("resumed")
-
-        # Hold the machine awake while the phone is actively driving it, and let go
-        # once it goes quiet. Remote control never counted as activity — the moves
-        # go through SetCursorPos, which does not advance the system's idle timer —
-        # so a session run entirely from the phone would blank the display and, with
-        # a lock-on-wake policy, lock the laptop out from under the user. Only the
-        # transitions are pushed, so a steady session costs one call, not one a
-        # second; and releasing on quiet means an idle phone still lets the laptop
-        # sleep normally. See make_idle_suppressor for why this is a wake hold
-        # rather than fabricated mouse input.
-        if hold_awake is not None:
-            last = _last_remote_ts[0]
-            want_awake = (client is not None and last is not None
-                          and (mono - last) < REMOTE_AWAKE_S)
-            if want_awake != awake_held:
-                hold_awake(want_awake)
-                awake_held = want_awake
-
-        sock.settimeout(1.0)   # 1/s idle wake-ups drive the resume/idle/rate checks
-
-        try:
-            data, addr = sock.recvfrom(2048)
-        except socket.timeout:
-            continue
-        except ConnectionResetError:
-            # Windows: a prior send hit an endpoint with no listener (a phone that
-            # left). Not fatal — the socket is fine; keep serving.
-            continue
-        except OSError:
-            # A transient network error (e.g. host/net-unreachable surfacing on the
-            # next recv after a send to a departed phone) must NOT tear the loop down
-            # for good. Pause briefly and keep serving; a real dead socket is handled
-            # by the sleep/resume rebind above.
-            time.sleep(0.1)
-            continue
-        if not data:
-            continue
-
-        res = wire.parse(data, addr, client)
-        if res is None:
-            bad += 1
-            if wire.plaintext_refused:
-                wire.plaintext_refused = False
-                if not plaintext_hinted:
-                    plaintext_hinted = True
-                    emit("warn", "A phone tried to pair with the typed code, but "
-                                 "Require encryption is on — scan the QR instead "
-                                 "(or restart with --allow-plaintext).")
-            if bad > RATE_MAX_BAD and not warned:
-                warned = True
-                if wire.aes is not None:
-                    # Suspend plaintext ACCEPTANCE for a window (PLAINTEXT_SUSPEND_S):
-                    # brute force only exists on the v1 wire, so pausing exactly that
-                    # path makes guessing futile while QR-paired phones are untouched.
-                    # Global, not per-source: UDP source addresses are spoofable, and
-                    # per-IP blocking would let a flooder frame the real phone.
-                    wire.pt_suspended_until = mono + PLAINTEXT_SUSPEND_S
-                    emit("warn",
-                         "High rate of rejected packets — possible brute-force / flood; "
-                         f"manual-code pairing paused {int(PLAINTEXT_SUSPEND_S)}s "
-                         "(QR pairing unaffected)")
-                else:
-                    # No key (or no `cryptography`) ⇒ the plaintext wire is the ONLY
-                    # way in, so pausing it would lock the user out entirely rather
-                    # than push them to the QR. Warn and keep serving: a deliberate
-                    # availability-over-throttling trade, bounded by a 36^6 (~2.2e9)
-                    # token space that is only reachable from the LAN.
-                    emit("warn", "High rate of rejected packets — possible brute-force / flood")
-            continue
-        verb, rest, secure = res
-
-        if verb == "HELLO":
-            if secure:
-                # Don't pin on HELLO — it's replayable. Answer with a one-time
-                # challenge; only an AUTH echoing it (which needs the key to seal)
-                # pins control. Defeats captured-session replay by a keyless attacker.
-                wire.issue_challenge(sock, addr, mono)
-            else:
-                # v1 plaintext HELLO (legacy, trusted-LAN only; never reachable when
-                # remote access forces secure-only). Token match already gated it in
-                # parse; pin directly. A plaintext re-pin is logged as a warning.
-                repin = client is not None and addr != client
-                appswitch_reset()
-                client = addr
-                last_pkt = now
-                wire.commit_hello(False)
-                _client_connected.set()
-                emit("connected", f"{addr[0]}:{addr[1]}", False)
-                if repin:
-                    emit("warn", f"Control moved to {addr[0]}:{addr[1]} over PLAINTEXT "
-                                 "— turn on Require encryption to prevent takeovers")
-                wire.reply(sock, addr, "OK")
-            continue
-
-        if verb == "AUTH":
-            # Second handshake leg: pins control iff it echoes the fresh challenge
-            # we just issued to this address (proves key possession AND freshness).
-            if secure and wire.verify_challenge(addr, rest, mono):
-                appswitch_reset()
-                client = addr
-                last_pkt = now
-                wire.commit_hello(True)         # baseline = this AUTH's sid/counter
-                _client_connected.set()
-                emit("connected", f"{addr[0]}:{addr[1]}", True)
-                wire.reply(sock, addr, "OK")
-            continue
-
-        if verb == "BYE":
-            if addr == client:
-                drop_client()
-            continue
-
-        if addr != client:
-            # Authenticated but not from the pinned phone. Reachable on the v1
-            # plaintext wire, where a token match is the only gate — so this is a
-            # second phone (or someone who learned the code) trying to take over a
-            # live session. The GUI and terminal have always had a handler for this
-            # event, but nothing ever emitted it, so the attempt was invisible.
-            # On the v2 wire the same attempt is rejected inside wire.parse (wrong
-            # source for the pinned sid) and lands in the `bad` counter instead,
-            # which is what raises the brute-force/flood warning.
-            if client is not None and addr not in blocked_seen:
-                blocked_seen.add(addr)
-                emit("blocked", f"{addr[0]}:{addr[1]}")
-            continue
-        last_pkt = now   # pinned phone is alive — keep the idle timer fed
-
-        # PING/VGET answer over the same (encrypted) wire the client used.
-        if verb == "PING":
-            wire.reply(sock, addr, "PONG")
-            continue
-        if verb == "VGET":
-            if get_volume is not None:
-                # Belt and braces around the backend: make_volume's Windows path now
-                # re-acquires a stale endpoint by itself, but this branch runs ABOVE
-                # the handler guard below, so anything that still escapes here would
-                # take the whole receive loop with it. A missing answer costs the
-                # phone one poll — it re-probes with PING and stays connected.
-                try:
-                    vol = get_volume()
-                except Exception:
-                    vol = None
-                if vol is not None:
-                    wire.reply(sock, addr, f"VOL {vol}")
-            continue
-        if verb == "BGET":
-            if brightness_svc.available:
-                wire.reply(sock, addr, f"BRI {brightness_svc.get_cached()}")   # cached: never blocks the loop
-            continue
-
-        # Local input wins: while the user has taken over (or after a panic),
-        # every machine-driving verb is dropped on the floor.
-        if verb in CONTROL_VERBS and (_remote_paused.is_set() or _panic_latched.is_set()):
-            continue
-
-        # A verb handler — or an activity-log label, which the GUI emitter
-        # evaluates inline on THIS thread — must never take the receive loop down
-        # with it. This is the single thread serving every phone: an unhandled
-        # raise here left the server permanently deaf, window still green and
-        # "server running" still lit, every packet ignored until a manual restart.
-        # The GUI's event poll already guards itself for exactly this reason.
-        try:
-            emit("action", verb, rest)
-            handle_packet(verb, rest)
-        except Exception as e:
-            if verb not in handler_errors:
-                handler_errors.add(verb)
-                emit("warn", f"{verb} failed and was ignored "
-                             f"({type(e).__name__}: {e})")
-
-    # Drop the wake hold on the way out — shutdown, or a crash the supervisor is
-    # about to restart us from. It is thread state, so a restarted loop starts on a
-    # fresh thread with none of it; leaking it here would pin the display awake for
-    # the life of the process with nothing left to release it.
-    if hold_awake is not None and awake_held:
-        hold_awake(False)
-    try:
-        sock.close()
-    except OSError:
-        pass
 
 
 def serve_forever(wire, emit, net, hostname):
@@ -2796,13 +3344,20 @@ def serve_forever(wire, emit, net, hostname):
     which is a blink next to needing a human to restart the app."""
     failures = 0
     while not _stop.is_set():
+        started = time.monotonic()
         try:
             serve_loop(wire, emit, net, hostname)
             return                      # clean exit — _stop was set
         except Exception as e:
+            # Count only crashes in a row, or a stranger's packets could keep every later
+            # restart at the full 5s backoff.
+            if time.monotonic() - started > LOOP_HEALTHY_S:
+                failures = 0
             failures += 1
-            emit("warn", f"Receive loop crashed and was restarted "
-                         f"({type(e).__name__}: {e})")
+            emit("loopdown")
+            emit("warn", f"The connection service hit an error and restarted "
+                         f"itself ({type(e).__name__}: {e}). The phone reconnects "
+                         "on its own.")
             # Back off a little so a hard-failing loop (e.g. the port genuinely
             # taken) doesn't spin the CPU, but stay responsive enough that the
             # phone's own retry finds us again within a few seconds.
@@ -2826,27 +3381,50 @@ _C = {
 }
 
 
+# How often the window re-checks the firewall on its own, on top of the checks
+# after a network change and a wake. Moving to a Public or policy-locked network
+# is the most common real-world failure, and it can happen with no address change.
+FW_RECHECK_MS = 5 * 60 * 1000
+
+
+def qr_box_size(screen_h):
+    """Pixels per QR module for a screen [screen_h] pixels tall. At 7 the window
+    is taller than a 768-pixel screen can show, and the window's height cap then
+    cut off "Show details" — the only way to the pairing settings and the log.
+    5 still scans easily from arm's length."""
+    return 7 if screen_h >= 900 else 5
+
+
 class LazeRWindow:
-    def __init__(self, ip, port, wire, event_q, require_secure, update_check=True):
+    def __init__(self, ip, port, wire, event_q, require_secure, update_check=True,
+                 net=None, notices=(), minimized=False):
+        """[ip] is the published address, or None while there is none yet (the
+        QR then waits for the first netchange instead of showing 127.0.0.1)."""
         import tkinter as tk
         from tkinter import font as tkf
 
         self._tk = tk
         self._eq = event_q
         self._wire = wire
+        self._net = net
         self._token = wire.token
         self._require_secure = require_secure
         self._update_check = update_check
         self._update_tag = None      # newest release tag once known
         self._hostname = socket.gethostname()
-        uri = build_uri(ip, wire.token, self._hostname, wire.key)
+        self._warnings = 0           # unread warnings, badged on Show details
+        self._close_noticed = False  # told the user once that close != quit
+        self._fw_dismissed = False
+        self._vpn_logged = None
+        uri = build_uri(ip, wire.token, self._hostname, wire.key) if ip else None
         token = wire.token
 
         root = tk.Tk()
         self._root = root
         root.title("LazeR")
         root.configure(bg=_C["bg"])
-        root.resizable(False, False)
+        # Resizable, so large text scaling can't push controls off a fixed window.
+        root.resizable(True, True)
         try:
             root.tk.call("tk", "scaling", 1.25)
         except Exception:
@@ -2869,11 +3447,26 @@ class LazeRWindow:
 
         self._ip, self._port = ip, port
 
-        outer = tk.Frame(root, bg=_C["bg"], padx=22, pady=18)
-        outer.pack(fill="both", expand=True)
+        # The whole body scrolls. On a 768-pixel screen the window is taller than
+        # the screen as soon as a banner shows or details open, and the height cap
+        # in _center then cut the bottom off — the details panel and the typed
+        # code included — with no way to reach it.
+        self._canvas = tk.Canvas(root, bg=_C["bg"], highlightthickness=0, bd=0)
+        self._vbar = tk.Scrollbar(root, orient="vertical", command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=self._vbar.set)
+        self._canvas.pack(side="left", fill="both", expand=True)
+        outer = tk.Frame(self._canvas, bg=_C["bg"], padx=22, pady=18)
+        self._outer = outer
+        self._outer_win = self._canvas.create_window(0, 0, window=outer, anchor="nw")
+        outer.bind("<Configure>", lambda e: self._canvas.configure(
+            scrollregion=self._canvas.bbox("all")))
+        self._canvas.bind("<Configure>", lambda e: self._canvas.itemconfigure(
+            self._outer_win, width=e.width))
+        root.bind_all("<MouseWheel>", self._on_wheel)
 
         self._build_header(outer)
         self._build_hero(outer)
+        self._build_notice_banner(outer)
         self._build_pause_banner(outer)
         self._build_firewall_banner(outer)
 
@@ -2895,10 +3488,21 @@ class LazeRWindow:
         self._tray_thread = None
         self._setup_tray()
         self._log("Server started", "ok")
+        for tag, text in notices:
+            self._warn(text) if tag == "warn" else self._log(text, "info")
+        if uri is None:
+            self._hide_qr(waiting=True)
         self._poll()
         self._check_firewall()   # surface the Allow banner if inbound is blocked
+        self._root.after(FW_RECHECK_MS, self._periodic_firewall)
         self._check_update()     # no-op unless enabled; never blocks the UI thread
-        self._center()
+        self._poll_discovery_pill()
+        self._fit()
+        if minimized and self._tray is not None:
+            # Start with Windows: nobody is looking at login, so don't put the QR
+            # (token AND key) up on the screen. The tray icon is the way in.
+            self._close_noticed = True
+            root.withdraw()
 
     # ── system tray ───────────────────────────────────────────────────────────
     def _setup_tray(self):
@@ -2964,6 +3568,67 @@ class LazeRWindow:
         except Exception:
             pass
 
+    # ── clickable labels, made keyboard-usable ─────────────────────────────────
+    def _clickable(self, widget, command):
+        """Every button here is a styled tk.Label. Bind the mouse AND make it a
+        Tab stop that Enter/Space activate, with a visible focus ring — without
+        this, nothing in the window could be reached from the keyboard."""
+        try:
+            bg = widget.master.cget("bg")
+        except Exception:
+            bg = _C["card"]
+        widget.config(takefocus=1, highlightthickness=1, highlightbackground=bg,
+                      highlightcolor=_C["accent"])
+        widget.bind("<Button-1>", lambda e: command())
+        widget.bind("<Return>", lambda e: command())
+        widget.bind("<space>", lambda e: command())
+        widget.bind("<FocusIn>", lambda e: self._scroll_into_view(widget))
+        return widget
+
+    # ── scrolling body ──────────────────────────────────────────────────────
+    def _fit(self):
+        """Size the window to its content, capped to the screen; past the cap
+        the body scrolls (scrollbar shown only then)."""
+        root = self._root
+        root.update_idletasks()
+        w, h = self._outer.winfo_reqwidth(), self._outer.winfo_reqheight()
+        avail = root.winfo_screenheight() - 80
+        if h > avail:
+            self._vbar.pack(side="right", fill="y", before=self._canvas)
+        else:
+            self._vbar.pack_forget()
+            self._canvas.yview_moveto(0)
+        self._canvas.configure(width=w, height=min(h, avail))
+        root.geometry("")
+        root.after(10, self._center)
+
+    def _scrolls(self):
+        return self._outer.winfo_reqheight() > self._canvas.winfo_height() + 1
+
+    def _on_wheel(self, e):
+        # The activity log scrolls itself; don't scroll the page under it too.
+        if isinstance(e.widget, self._tk.Text) or not self._scrolls():
+            return
+        self._canvas.yview_scroll(int(-e.delta / 120) or (-1 if e.delta > 0 else 1),
+                                  "units")
+
+    def _scroll_into_view(self, widget):
+        """Tabbing to a control below the fold scrolls it up into sight."""
+        if not self._scrolls():
+            return
+        try:
+            top = widget.winfo_rooty() - self._outer.winfo_rooty()
+            bottom = top + widget.winfo_height()
+            total = max(1, self._outer.winfo_reqheight())
+            view_top = self._canvas.canvasy(0)
+            view_h = self._canvas.winfo_height()
+            if top < view_top:
+                self._canvas.yview_moveto(max(0, top - 8) / total)
+            elif bottom > view_top + view_h:
+                self._canvas.yview_moveto(max(0, bottom + 8 - view_h) / total)
+        except Exception:
+            pass
+
     # ── card primitive ──────────────────────────────────────────────────────
     def _card(self, parent, **pack):
         """A bordered surface that reads as a rounded card."""
@@ -2999,12 +3664,24 @@ class LazeRWindow:
         tk.Label(bar, text="LAN Remote", bg=_C["bg"], fg=_C["faint"],
                  font=self.f_sm).pack(side="left", padx=(8, 0), pady=(4, 0))
 
+        quit_btn = tk.Label(bar, text="Quit", bg=_C["bg"], fg=_C["faint"],
+                            font=self.f_sm, cursor="hand2", padx=6)
+        quit_btn.pack(side="right", pady=(4, 0), padx=(10, 0))
+        self._clickable(quit_btn, self._real_quit)
+
         run = tk.Frame(bar, bg=_C["bg"])
         run.pack(side="right", pady=(4, 0))
-        tk.Label(run, text="●", bg=_C["bg"], fg=_C["ok"],
-                 font=self.f_sm).pack(side="left")
-        tk.Label(run, text="server running", bg=_C["bg"], fg=_C["dim"],
-                 font=self.f_sm).pack(side="left", padx=(5, 0))
+        # Driven by the receive loop's own events, so it goes dark with a dead loop.
+        self._run_dot = tk.Label(run, text="●", bg=_C["bg"], fg=_C["faint"],
+                                 font=self.f_sm)
+        self._run_dot.pack(side="left")
+        self._run_txt = tk.Label(run, text="starting…", bg=_C["bg"], fg=_C["dim"],
+                                 font=self.f_sm)
+        self._run_txt.pack(side="left", padx=(5, 0))
+
+    def _set_serving(self, ok):
+        self._run_dot.config(fg=_C["ok"] if ok else _C["warn"])
+        self._run_txt.config(text="ready for phones" if ok else "restarting…")
 
     # ── hero status card ────────────────────────────────────────────────────
     def _build_hero(self, parent):
@@ -3031,6 +3708,42 @@ class LazeRWindow:
                                 bg=_C["card"], fg=_C["dim"], font=self.f_sm)
         self._status.pack(anchor="w", pady=(2, 0))
 
+    # ── notice banner: the latest warning, on the main screen ────────────────
+    def _build_notice_banner(self, parent):
+        """The newest warning, shown until dismissed (in the log, per-click lines scroll
+        it away); Show details is badged with the count."""
+        tk = self._tk
+        self._notice_wrap = tk.Frame(parent, bg=_C["bg"])   # packed on demand
+        border = tk.Frame(self._notice_wrap, bg=_C["warn"])
+        border.pack(fill="x", pady=(12, 0))
+        inner = tk.Frame(border, bg=_C["card"], padx=14, pady=10)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        self._notice_txt = tk.Label(inner, text="", bg=_C["card"], fg=_C["warn"],
+                                    font=self.f_sm, justify="left", wraplength=420)
+        self._notice_txt.pack(side="left", anchor="w", fill="x", expand=True)
+        dismiss = tk.Label(inner, text="Dismiss", bg=_C["card2"], fg=_C["fg"],
+                           font=self.f_sm, cursor="hand2", padx=10, pady=4)
+        dismiss.pack(side="right", padx=(10, 0))
+        self._clickable(dismiss, self._clear_notice)
+
+    def _warn(self, msg):
+        """Log a warning AND surface it: banner + details badge."""
+        self._log(msg, "warn")
+        self._notice_txt.config(text=msg)
+        if not self._notice_wrap.winfo_ismapped():
+            self._notice_wrap.pack(fill="x", before=self._swap)
+        if not self._details_open:
+            self._warnings += 1
+            self._refresh_details_toggle()
+        self._resize()
+
+    def _clear_notice(self):
+        try:
+            self._notice_wrap.pack_forget()
+        except Exception:
+            pass
+        self._resize()
+
     # ── local-takeover banner: shown when physical input has paused the remote ──
     def _build_pause_banner(self, parent):
         tk = self._tk
@@ -3053,11 +3766,11 @@ class LazeRWindow:
         resume = tk.Label(btns, text="Resume remote", bg=_C["accent"], fg=_C["bg"],
                           font=self.f_sm, cursor="hand2", padx=14, pady=6)
         resume.pack(side="left")
-        resume.bind("<Button-1>", lambda e: self._do_resume())
+        self._clickable(resume, self._do_resume)
         quitb = tk.Label(btns, text="Quit LazeR", bg=_C["card2"], fg=_C["fg"],
                          font=self.f_sm, cursor="hand2", padx=14, pady=6)
         quitb.pack(side="left", padx=(8, 0))
-        quitb.bind("<Button-1>", lambda e: self._real_quit())
+        self._clickable(quitb, self._real_quit)
 
     def _set_paused(self, latched):
         title = ("Remote stopped — you took over"
@@ -3106,14 +3819,22 @@ class LazeRWindow:
                                 fg=_C["bg"], font=self.f_sm, cursor="hand2",
                                 padx=14, pady=6)
         self._fw_btn.pack(side="left")
-        self._fw_btn.bind("<Button-1>", lambda e: self._fix_firewall())
+        self._clickable(self._fw_btn, self._fix_firewall)
         self._fw_dismiss = tk.Label(btns, text="Dismiss", bg=_C["card2"], fg=_C["fg"],
                                     font=self.f_sm, cursor="hand2", padx=14, pady=6)
         self._fw_dismiss.pack(side="left", padx=(8, 0))
-        self._fw_dismiss.bind("<Button-1>", lambda e: self._clear_firewall_banner())
+        self._clickable(self._fw_dismiss, self._dismiss_firewall_banner)
+        self._fw_inert = False
+
+    def _periodic_firewall(self):
+        self._check_firewall()
+        self._root.after(FW_RECHECK_MS, self._periodic_firewall)
 
     def _check_firewall(self):
-        """Probe the rule off the UI thread, then show the banner if it's missing."""
+        """Probe the rule off the UI thread, then show the banner if it's missing.
+        Runs at launch, after every network change and wake, and every
+        FW_RECHECK_MS, so joining a Public or policy-locked network mid-session
+        still warns."""
         if not sys.platform.startswith("win"):
             return
 
@@ -3130,13 +3851,25 @@ class LazeRWindow:
         # Enabled/Allow/Profile=Any and Windows drops the packets anyway — so a
         # green pill here is a lie that costs hours. Count it as blocked.
         blocked_now = bool(inert and inert[1])
+        was_ok = self._fw_ok
         self._fw_ok = ok and not blocked_now
+        self._fw_inert = blocked_now
+        if self._fw_ok is False and was_ok is not False:
+            self._fw_dismissed = False       # a NEW problem deserves the banner again
         self._update_fw_pill()
         advice = firewall_advice_for(inert)   # no re-probe on the Tk thread
+        if vpn and vpn != self._vpn_logged:
+            # Say it whenever one is present — README promises this — not only when
+            # the rule is already known to be bad.
+            self._vpn_logged = vpn
+            self._log(f"VPN “{vpn}” is active. If phones can't connect, turn on "
+                      "“allow local network” (LAN access) in the VPN.", "warn")
         if self._fw_ok:
             self._clear_firewall_banner()
-            if advice:
+            if advice and was_ok is None:
                 self._log(advice, "warn")
+            return
+        if self._fw_dismissed:
             return
         if blocked_now:
             # Adding the rule again cannot help, so don't offer a button that
@@ -3163,6 +3896,16 @@ class LazeRWindow:
             pass
         self._resize()
 
+    def _dismiss_firewall_banner(self):
+        self._fw_dismissed = True
+        self._clear_firewall_banner()
+        self._update_fw_pill()
+
+    def _reopen_firewall_banner(self):
+        if self._fw_ok is False:
+            self._fw_dismissed = False
+            self._check_firewall()
+
     def _fix_firewall(self):
         self._fw_btn.config(text="Requesting admin…")
 
@@ -3178,8 +3921,10 @@ class LazeRWindow:
         if ok:
             self._clear_firewall_banner()
             self._log(f"Firewall allowed — inbound UDP {PORT} open for phones", "ok")
+            self._check_firewall()      # the rule can exist and still be inert
         else:
-            self._log("Firewall rule not added — admin prompt declined?", "warn")
+            self._warn("The firewall rule wasn't added: the admin prompt was declined "
+                       "or failed. Click Allow through firewall again and choose Yes.")
 
     # ── update check ──────────────────────────────────────────────────────────
     def _check_update(self):
@@ -3222,7 +3967,7 @@ class LazeRWindow:
             # Only clickable once there IS something to open, so a dead pointer
             # cursor never invites a click that does nothing.
             val.config(fg=_C["accent"], cursor="hand2")
-            val.bind("<Button-1>", lambda e: self._open_releases())
+            self._clickable(val, self._open_releases)
         else:
             val.config(fg=_C["faint"], cursor="")
             val.unbind("<Button-1>")
@@ -3239,12 +3984,23 @@ class LazeRWindow:
         if pill is None:
             return
         dot, txt = pill
+        txt.unbind("<Button-1>")
+        txt.config(cursor="")
         if self._fw_ok is None:
             dot.config(fg=_C["faint"]); txt.config(text="checking…")
         elif self._fw_ok:
             dot.config(fg=_C["ok"]); txt.config(text="inbound allowed")
         else:
-            dot.config(fg=_C["warn"]); txt.config(text="blocked — click Allow above")
+            dot.config(fg=_C["warn"])
+            # Say what is actually wrong, and never point at a button that isn't
+            # there: policy lock hides Allow, and Dismiss hides the whole banner.
+            what = ("blocked by this network's policy" if self._fw_inert
+                    else "blocked — inbound UDP rule missing")
+            if self._fw_dismissed or self._fw_inert:
+                txt.config(text=what + " · click for details", cursor="hand2")
+                txt.bind("<Button-1>", lambda e: self._reopen_firewall_banner())
+            else:
+                txt.config(text=what + " · see the banner above")
 
     # ── friendly connect card: just the QR + pairing code ────────────────────
     def _build_connect_card(self, parent, uri, token):
@@ -3263,12 +4019,15 @@ class LazeRWindow:
         self._make_qr_photo = None
         self._photo = None
         self._qr_hidden = False
+        self._qr_waiting = False
         self._qr_after = None
         try:
             import qrcode
             from PIL import ImageTk
             self._make_qr_photo = self._build_qr_maker(qrcode, ImageTk)
-            self._photo = self._make_qr_photo(uri)
+            # No address yet: render a throwaway so the slot has its size; it is
+            # hidden behind the "waiting" placeholder until netchange repaints it.
+            self._photo = self._make_qr_photo(uri or "lazer://")
             # The QR and its placeholder swap inside a slot packed ONCE, rather
             # than being packed into `pad` directly: Tk appends a re-packed widget
             # at the END of its parent's pack order, so a direct swap dropped the
@@ -3287,20 +4046,24 @@ class LazeRWindow:
             # token+key to every passer-by indefinitely.
             self._qr_placeholder = tk.Frame(slot, bg=_C["card"])
             ph = tk.Label(self._qr_placeholder,
-                          text="Pairing code hidden — click to show",
+                          text="QR code hidden — click to show",
                           bg=_C["card"], fg=_C["dim"], font=self.f_md,
                           width=24, height=6, justify="center", cursor="hand2")
             ph.pack()
-            ph.bind("<Button-1>", lambda e: self._show_qr())
+            self._qr_ph_label = ph
+            self._clickable(ph, self._show_qr)
         except ImportError:
             tk.Label(pad, text="Install Pillow for the QR image:\npip install pillow",
                      bg=_C["card"], fg=_C["dim"], font=self.f_sm,
                      width=24, height=10, justify="center").pack(pady=16)
 
-        # pairing code chip — friendly framing of the token, for manual entry
-        tk.Label(pad, text="No scanner? Enter this code in the app",
+        # Typed-code pairing. Encryption is required by default, and the typed code
+        # is the plaintext wire, so it is shown only while it can work.
+        self._code_box = tk.Frame(pad, bg=_C["card"])
+        self._code_box.pack()
+        tk.Label(self._code_box, text="No scanner? Type this pairing code in the app",
                  bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack()
-        chip = tk.Frame(pad, bg=_C["card2"])
+        chip = tk.Frame(self._code_box, bg=_C["card2"])
         chip.pack(pady=(8, 0))
         self._token_chip = tk.Label(chip, text=token, bg=_C["card2"], fg=_C["accent"],
                                     font=self.f_tok, padx=16, pady=6)
@@ -3308,14 +4071,29 @@ class LazeRWindow:
         self._copy_btn = tk.Label(chip, text="Copy", bg=_C["accent2"], fg=_C["fg"],
                                   font=self.f_sm, cursor="hand2", padx=14, pady=6)
         self._copy_btn.pack(side="left")
-        self._copy_btn.bind("<Button-1>", lambda e: self._copy(self._wire.token))
-        tk.Label(pad, text="(Manual entry is plaintext — scan the QR for encryption)",
-                 bg=_C["card"], fg=_C["faint"], font=self.f_lbl).pack(pady=(6, 0))
+        self._clickable(self._copy_btn, lambda: self._copy(self._wire.token))
+        tk.Label(self._code_box, text="(Typed-code pairing is NOT encrypted — "
+                 "scan the QR when you can)",
+                 bg=_C["card"], fg=_C["warn"], font=self.f_lbl).pack(pady=(6, 0))
         self._copy_btn.bind("<Enter>",
                             lambda e: self._copy_btn.config(bg=_C["accent"]))
         self._copy_btn.bind("<Leave>",
                             lambda e: self._copy_btn.config(bg=_C["accent2"]))
+        self._code_off = tk.Label(
+            pad, text="Only QR pairing is on (encrypted). Typed-code pairing can be "
+                      "allowed under Show details → Require encryption.",
+            bg=_C["card"], fg=_C["faint"], font=self.f_sm, wraplength=360,
+            justify="center")
+        self._refresh_code_box()
         self._arm_qr_hide()
+
+    def _refresh_code_box(self):
+        if self._require_secure and _HAVE_CRYPTO:
+            self._code_box.pack_forget()
+            self._code_off.pack()
+        else:
+            self._code_off.pack_forget()
+            self._code_box.pack()
 
     # ── connected panel: shown instead of the QR once a phone is paired ───────
     def _build_connected_panel(self, parent):
@@ -3341,20 +4119,29 @@ class LazeRWindow:
             bg=_C["card"], fg=_C["dim"], font=self.f_md)
         self._connected_sub.pack(pady=(3, 0))
 
-        show_qr = tk.Label(pad, text="Show QR code", bg=_C["card2"],
+        btns = tk.Frame(pad, bg=_C["card"])
+        btns.pack(pady=(16, 0))
+        show_qr = tk.Label(btns, text="Show QR code", bg=_C["card2"],
                            fg=_C["dim"], font=self.f_sm, cursor="hand2",
                            padx=16, pady=7)
-        show_qr.pack(pady=(16, 0))
-        show_qr.bind("<Button-1>", lambda e: self._show_qr_view())
+        show_qr.pack(side="left")
+        self._clickable(show_qr, self._show_qr_view)
         show_qr.bind("<Enter>", lambda e: show_qr.config(fg=_C["accent"]))
         show_qr.bind("<Leave>", lambda e: show_qr.config(fg=_C["dim"]))
-        tk.Label(pad, text="Disconnected? Scan again to reconnect",
+        kick = tk.Label(btns, text="New code (disconnects phone)…", bg=_C["card2"],
+                        fg=_C["dim"], font=self.f_sm, cursor="hand2",
+                        padx=16, pady=7)
+        kick.pack(side="left", padx=(8, 0))
+        self._clickable(kick, self._confirm_regenerate)
+        tk.Label(pad, text="After a drop or a sleep the phone reconnects by itself.",
                  bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(pady=(8, 0))
 
     def _build_qr_maker(self, qrcode, ImageTk):
         """Return a fn uri -> PhotoImage, so the QR can be rebuilt after an IP change."""
+        box = qr_box_size(self._root.winfo_screenheight())
+
         def make(uri):
-            qr = qrcode.QRCode(border=2, box_size=7,
+            qr = qrcode.QRCode(border=2, box_size=box,
                                error_correction=qrcode.constants.ERROR_CORRECT_M)
             qr.add_data(uri)
             qr.make(fit=True)
@@ -3370,7 +4157,9 @@ class LazeRWindow:
             self._ip_value.config(text=new_ip)
         except Exception:
             pass
+        self._qr_waiting = False
         self._repaint_qr(new_uri)
+        self._refresh_discovery_pill()
 
     def _repaint_qr(self, uri):
         if self._make_qr_photo and self._qr_img_label is not None:
@@ -3396,12 +4185,20 @@ class LazeRWindow:
             self._qr_after = None
         self._qr_after = self._root.after(QR_HIDE_AFTER_MS, self._hide_qr)
 
-    def _hide_qr(self):
+    def _hide_qr(self, waiting=False):
+        """Swap the QR for its placeholder: after the idle timeout, or — [waiting]
+        — while there is no network address to put in it yet."""
         self._qr_after = None
-        if self._photo is None or self._qr_img_label is None:
+        if waiting:
+            self._qr_waiting = True
+        if self._qr_img_label is None:
             return                      # no Pillow, or nothing rendered
         self._qr_hidden = True
         try:
+            self._qr_ph_label.config(
+                text=("Waiting for a network connection…" if self._qr_waiting
+                      else "QR code hidden — click to show"),
+                cursor="" if self._qr_waiting else "hand2")
             self._qr_holder.pack_forget()
             self._qr_placeholder.pack()
         except Exception:
@@ -3409,6 +4206,8 @@ class LazeRWindow:
         self._resize()      # let the card shrink to the placeholder
 
     def _show_qr(self):
+        if getattr(self, "_qr_waiting", False):
+            return                      # nothing valid to show until netchange
         if self._qr_hidden:
             self._qr_hidden = False
             try:
@@ -3420,18 +4219,27 @@ class LazeRWindow:
         self._arm_qr_hide()
 
     def _regenerate(self):
-        rotate_secrets(self._wire)
+        try:
+            rotate_secrets(self._wire)
+        except OSError as e:
+            # Nothing was swapped: the current pairing still works (see rotate_secrets).
+            self._warn(f"Couldn't save a new pairing code ({e}). Nothing changed — the "
+                       "current code still works. Move LazeR to a folder you can "
+                       "write to (e.g. Documents) and try again.")
+            return
         self._token = self._wire.token
-        uri = build_uri(self._ip, self._wire.token, self._hostname,
-                        self._wire.key)
-        self._repaint_qr(uri)
+        if self._ip:
+            uri = build_uri(self._ip, self._wire.token, self._hostname,
+                            self._wire.key)
+            self._repaint_qr(uri)
         try:
             self._token_chip.config(text=self._wire.token)
-            self._fullcode_value.config(text=self._wire.token)
         except Exception:
             pass
-        self._show_qr_view()
-        self._log("New pairing code generated — old phones must rescan", "ok")
+        # serve_loop drops the pinned phone on its next tick (wire.rotated); show
+        # it now rather than waiting for that round trip.
+        self._set_status(False)
+        self._log("New pairing code generated — every phone must scan the new QR", "ok")
 
     def _confirm_regenerate(self):
         """Rotation kicks every paired phone and invalidates saved pairings —
@@ -3440,8 +4248,8 @@ class LazeRWindow:
             import tkinter.messagebox as mb
             ok = mb.askyesno(
                 "Regenerate pairing code",
-                "Generate a new pairing code? Every paired phone is kicked "
-                "and must scan the new QR.")
+                "Generate a new pairing code? The connected phone is disconnected "
+                "now, and every paired phone must scan the new QR.")
         except Exception:
             ok = True       # no dialog available — behave as before
         if ok:
@@ -3451,8 +4259,14 @@ class LazeRWindow:
         self._require_secure = not self._require_secure
         self._wire.require_secure = self._require_secure
         self._refresh_secure_btn()
-        self._log("Require encryption: " + ("on" if self._require_secure else "off"),
+        self._refresh_code_box()
+        self._refresh_encryption_pill()
+        # Not remembered: every launch starts with encryption required again, so a
+        # toggle left off by mistake can't quietly outlive the session.
+        self._log("Require encryption: " + ("on" if self._require_secure else
+                  "off until LazeR restarts — typed-code (plaintext) pairing allowed"),
                   "ok" if self._require_secure else "warn")
+        self._resize()
 
     def _refresh_secure_btn(self):
         on = self._require_secure
@@ -3469,7 +4283,8 @@ class LazeRWindow:
             pass
         self._connect_border.pack(fill="x")
         self._resize()
-        self._show_qr()     # unhide if it had timed out, and restart the clock
+        if not self._qr_waiting:
+            self._show_qr()     # unhide if it had timed out, and restart the clock
 
     def _show_connected_view(self):
         try:
@@ -3486,7 +4301,7 @@ class LazeRWindow:
             except Exception:
                 pass
             self._qr_after = None
-        if self._qr_hidden:
+        if self._qr_hidden and not self._qr_waiting:
             self._qr_hidden = False
             try:
                 self._qr_placeholder.pack_forget()
@@ -3495,8 +4310,7 @@ class LazeRWindow:
                 pass
 
     def _resize(self):
-        self._root.geometry("")
-        self._root.after(10, self._center)
+        self._fit()
 
     # ── details toggle (hides all the technical stuff) ────────────────────────
     def _build_details_toggle(self, parent):
@@ -3506,9 +4320,9 @@ class LazeRWindow:
         self._toggle = tk.Label(bar, text="Show details  ▾", bg=_C["bg"],
                                 fg=_C["faint"], font=self.f_sm, cursor="hand2")
         self._toggle.pack()
-        self._toggle.bind("<Button-1>", lambda e: self._toggle_details())
+        self._clickable(self._toggle, self._toggle_details)
         self._toggle.bind("<Enter>", lambda e: self._toggle.config(fg=_C["dim"]))
-        self._toggle.bind("<Leave>", lambda e: self._toggle.config(fg=_C["faint"]))
+        self._toggle.bind("<Leave>", lambda e: self._refresh_details_toggle())
 
     # ── details panel: network info, services, activity ───────────────────────
     def _build_details(self, parent, ip, port, token):
@@ -3528,9 +4342,8 @@ class LazeRWindow:
             val.pack(side="left")
             return val
 
-        self._ip_value = row("IP address", ip)
+        self._ip_value = row("IP address", ip or "no network yet")
         row("Port", str(port))
-        self._fullcode_value = row("Full code", token)
 
         # More than one LAN address (Wi-Fi + Ethernet, or a virtual adapter) means
         # we had to CHOOSE which to advertise, and choosing wrong is the classic
@@ -3545,15 +4358,11 @@ class LazeRWindow:
         vol_ok = VOLUME_BACKEND is not None
         self._pill(pad, "Volume control",
                    VOLUME_BACKEND if vol_ok else "unavailable", vol_ok)
-        try:
-            import zeroconf  # noqa: F401
-            disc_ok, disc_txt = True, "broadcasting on Wi-Fi"
-        except ImportError:
-            disc_ok, disc_txt = False, "zeroconf not installed"
-        self._pill(pad, "Auto-discovery", disc_txt, disc_ok)
-        self._pill(pad, "Encryption",
-                   "AES-256-GCM (QR scan)" if _HAVE_CRYPTO
-                   else "unavailable — pip install cryptography", _HAVE_CRYPTO)
+        # Both driven by live state: a registered mDNS record (not zeroconf importing),
+        # and the Require-encryption toggle.
+        self._disc_pill = self._mutable_pill(pad, "Auto-discovery", "checking…")
+        self._enc_pill = self._mutable_pill(pad, "Encryption", "")
+        self._refresh_encryption_pill()
         if sys.platform.startswith("win"):
             self._fw_pill = self._mutable_pill(pad, "Firewall", "checking…")
         self._upd_pill = self._mutable_pill(
@@ -3565,6 +4374,40 @@ class LazeRWindow:
             self._build_startup_toggle(pad)
 
         self._build_activity(parent)
+
+    def _refresh_discovery_pill(self):
+        pill = getattr(self, "_disc_pill", None)
+        if pill is None:
+            return
+        dot, val = pill
+        net = self._net or {}
+        if _MDNS_UNAVAILABLE[0]:
+            dot.config(fg=_C["faint"]); val.config(text="off — zeroconf not installed")
+        elif net.get("zc") is not None:
+            dot.config(fg=_C["ok"]); val.config(text=f"announcing {net.get('ip')}")
+        elif not net.get("ip"):
+            dot.config(fg=_C["faint"]); val.config(text="waiting for a network")
+        else:
+            dot.config(fg=_C["warn"])
+            val.config(text="not announcing (network blocks multicast?) — scan the QR")
+
+    def _poll_discovery_pill(self):
+        self._refresh_discovery_pill()
+        self._root.after(5000, self._poll_discovery_pill)
+
+    def _refresh_encryption_pill(self):
+        pill = getattr(self, "_enc_pill", None)
+        if pill is None:
+            return
+        dot, val = pill
+        if not _HAVE_CRYPTO:
+            dot.config(fg=_C["warn"])
+            val.config(text="unavailable — pip install cryptography")
+        elif self._require_secure:
+            dot.config(fg=_C["ok"]); val.config(text="required · AES-256-GCM (QR pairing)")
+        else:
+            dot.config(fg=_C["warn"])
+            val.config(text="optional · typed-code phones are NOT encrypted")
 
     def _build_security_controls(self, parent):
         """Require-encryption toggle + regenerate-code button + panic-key hint."""
@@ -3582,7 +4425,7 @@ class LazeRWindow:
         self._secure_btn = tk.Label(f, bg=_C["card2"], fg=_C["dim"],
                                     font=self.f_sm, cursor="hand2", padx=14, pady=5)
         self._secure_btn.pack(side="right")
-        self._secure_btn.bind("<Button-1>", lambda e: self._toggle_secure())
+        self._clickable(self._secure_btn, self._toggle_secure)
         if not _HAVE_CRYPTO:
             self._secure_btn.config(text="n/a")
         else:
@@ -3594,15 +4437,26 @@ class LazeRWindow:
         col2.pack(side="left", anchor="w")
         tk.Label(col2, text="Pairing code", bg=_C["card"], fg=_C["fg"],
                  font=self.f_sm).pack(anchor="w")
-        tk.Label(col2, text="Generate a new code and kick every paired phone",
+        tk.Label(col2, text="Make a new code and QR; every paired phone must rescan",
                  bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(anchor="w")
         regen = tk.Label(r, text="Regenerate", bg=_C["accent2"], fg=_C["fg"],
                          font=self.f_sm, cursor="hand2", padx=14, pady=5)
         regen.pack(side="right")
-        regen.bind("<Button-1>", lambda e: self._confirm_regenerate())
+        self._clickable(regen, self._confirm_regenerate)
 
-        tk.Label(parent, text="Panic: press  Ctrl+Alt+Shift+L  to instantly stop the remote",
-                 bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(anchor="w", pady=(10, 0))
+        if sys.platform.startswith("win"):
+            hint = ("Your own mouse and keyboard always win: touching them pauses the "
+                    "phone.\nPanic: press  Ctrl+Alt+Shift+L  to stop the remote until "
+                    "you click Resume.")
+        else:
+            # LocalInputGuard is Windows-only: here the laptop's own input does NOT
+            # pause the phone, and there is no panic key. Say so rather than show a
+            # promise this platform doesn't keep.
+            hint = ("On this system the laptop's own mouse doesn't pause the phone and "
+                    "there is no panic key.\nTo stop the remote, quit LazeR or tap back "
+                    "on the phone.")
+        tk.Label(parent, text=hint, bg=_C["card"], fg=_C["faint"], font=self.f_sm,
+                 justify="left").pack(anchor="w", pady=(10, 0))
 
     def _build_startup_toggle(self, parent):
         """Clickable row: launch LazeR automatically when Windows starts."""
@@ -3614,12 +4468,12 @@ class LazeRWindow:
         col.pack(side="left", anchor="w")
         tk.Label(col, text="Start with Windows", bg=_C["card"], fg=_C["fg"],
                  font=self.f_sm).pack(anchor="w")
-        tk.Label(col, text="Launch LazeR automatically at login",
+        tk.Label(col, text="Launch LazeR in the tray at login",
                  bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(anchor="w")
         self._startup_btn = tk.Label(f, bg=_C["accent2"], fg=_C["fg"],
                                      font=self.f_sm, cursor="hand2", padx=14, pady=5)
         self._startup_btn.pack(side="right")
-        self._startup_btn.bind("<Button-1>", lambda e: self._toggle_startup())
+        self._clickable(self._startup_btn, self._toggle_startup)
         self._refresh_startup_btn()
 
     def _refresh_startup_btn(self):
@@ -3636,7 +4490,8 @@ class LazeRWindow:
                       + ("on" if startup_enabled() else "off"), "info")
         else:
             reason = getattr(set_startup, "last_error", "") or "unknown error"
-            self._log(f"Couldn't change startup setting: {reason}", "info")
+            self._warn(f"Couldn't change Start with Windows ({reason}). Try again, or "
+                       f"run  {_self_invocation()} --enable-startup  in a terminal.")
 
     def _pill(self, parent, name, detail, ok):
         tk = self._tk
@@ -3692,14 +4547,32 @@ class LazeRWindow:
     def _toggle_details(self):
         if self._details_open:
             self._details.pack_forget()
-            self._toggle.config(text="Show details  ▾")
             self._details_open = False
         else:
             self._details.pack(fill="both", expand=True)
-            self._toggle.config(text="Hide details  ▴")
             self._details_open = True
-        self._root.geometry("")   # let the window resize to fit
-        self._root.after(10, self._center)
+            self._warnings = 0          # opening the log counts as reading them
+        self._refresh_details_toggle()
+        self._fit()
+        if self._details_open:
+            # On a short screen the panel opens below the fold: bring its top up.
+            self._root.after(30, self._scroll_details_up)
+
+    def _scroll_details_up(self):
+        if not self._scrolls():
+            return
+        top = self._toggle.winfo_rooty() - self._outer.winfo_rooty()
+        self._canvas.yview_moveto(max(0, top - 8) / max(1, self._outer.winfo_reqheight()))
+
+    def _refresh_details_toggle(self):
+        if self._details_open:
+            self._toggle.config(text="Hide details  ▴", fg=_C["faint"])
+        elif self._warnings:
+            n = self._warnings
+            self._toggle.config(text=f"Show details  ▾   ● {n} warning{'s' * (n != 1)}",
+                                fg=_C["warn"])
+        else:
+            self._toggle.config(text="Show details  ▾", fg=_C["faint"])
 
     def _center(self):
         self._root.update_idletasks()
@@ -3743,7 +4616,9 @@ class LazeRWindow:
     def _set_status(self, connected, who="", secure=True):
         if connected:
             self._avatar.itemconfig(self._dotid, fill=_C["ok"])
-            txt = "Connected · encrypted" if secure else "Connected · PLAINTEXT"
+            txt = "Connected · encrypted" if secure else "Connected · NOT encrypted"
+            if who:
+                txt += f" · {who.split(':')[0]}"
             self._status.config(fg=_C["ok"] if secure else _C["warn"], text=txt)
             self._show_connected_view()
         else:
@@ -3780,12 +4655,23 @@ class LazeRWindow:
             self._log(ev[1], ev[2] if len(ev) > 2 else "act")
         elif kind == "netchange":
             self.refresh_network(ev[1], ev[2])
-            self._log(f"New IP {ev[1]} — rescan the QR", "ok")
+            # The phone re-finds a moved laptop over mDNS and saves the new
+            # address; a rescan is only needed where discovery is blocked.
+            self._log(f"Now at {ev[1]} — paired phones find it automatically "
+                      "(rescan the QR only if yours doesn't reconnect)", "ok")
+            self._check_firewall()      # a new network can mean a new profile
         elif kind == "blocked":
-            self._log(f"Blocked control attempt from {ev[1]} "
-                      "(a phone is already paired)", "warn")
+            self._warn(f"Blocked a control attempt from {ev[1]} — another phone is "
+                       "already connected. Turn Require encryption on to stop "
+                       "typed-code takeovers.")
         elif kind == "warn":
-            self._log(ev[1], "warn")
+            self._warn(ev[1])
+        elif kind == "serving":
+            self._set_serving(True)
+        elif kind == "loopdown":
+            self._set_serving(False)
+        elif kind == "woke":
+            self._check_firewall()
         elif kind == "paused":
             self._set_paused(latched=False)
             self._log("Local input detected — remote paused", "warn")
@@ -3805,6 +4691,15 @@ class LazeRWindow:
         # Hide to the tray if available; otherwise quit.
         if self._tray is not None:
             self._root.withdraw()
+            if not self._close_noticed:
+                # Closing a window normally ends the program; here it doesn't, and
+                # the server keeps accepting the phone. Say so the first time.
+                self._close_noticed = True
+                try:
+                    self._tray.notify("LazeR is still running in the tray. Right-click "
+                                      "its icon and choose Quit to stop it.", "LazeR")
+                except Exception:
+                    pass
         else:
             self._real_quit()
 
@@ -3819,26 +4714,42 @@ class LazeRWindow:
 
 # ── terminal mode ─────────────────────────────────────────────────────────────
 def run_terminal(token, key, ip, require_secure, update_check=True):
+    """[ip] is the address to publish, or None when there is none yet — then the
+    address watch in serve_loop announces it and prints the QR when it appears."""
     hostname = socket.gethostname()
-    uri = build_uri(ip, token, hostname, key)
-    zc, mdns_info = start_mdns(ip, hostname)
+    # Refuse to be the second server before printing anything that suggests we
+    # are serving.
+    kind_i, lsock_i = singleton_acquire(poke=False)
+    if kind_i == "existing":
+        print("[error] another LazeR is already running on this laptop. Close it "
+              "first — two servers split the phone's packets between them.")
+        _exit_process(1)
+    busy = _probe_udp_port()
+    if busy is not None:
+        print(f"[error] {PORT_BUSY_TEXT} ({busy})")
+        _exit_process(1)
+    uri = build_uri(ip, token, hostname, key) if ip else None
+    zc, mdns_info = start_mdns(ip, hostname) if ip else (None, None)
     net = {"ip": ip, "zc": zc, "info": mdns_info}
 
     print("=" * 44)
     print("  LazeR - server running")
     print("=" * 44)
     print(f"  Laptop    : {hostname}")
-    print(f"  Laptop IP : {ip}")
+    print(f"  Laptop IP : {ip or 'no network yet'}")
     print(f"  Port      : {PORT}")
     print(f"  Token     : {token}")
     sec = "ON (QR scan)" if _HAVE_CRYPTO else "unavailable (pip install cryptography)"
     print(f"  Encryption: {sec}" + ("  · plaintext blocked" if require_secure else ""))
     print("=" * 44)
-    print("  Scan this QR in the LazeR app:")
-    print()
-    show_qr(uri)
-    print()
-    print("  ...or auto-discover, or enter IP + token manually. Ctrl+C to quit.\n")
+    if uri:
+        print("  Scan this QR in the LazeR app:")
+        print()
+        show_qr(uri)
+        print()
+    else:
+        print("  No network address yet — the QR prints once this laptop joins one.")
+    print("  Ctrl+C to quit.\n")
 
     # Update check: notify-only, and the one outbound internet request LazeR makes.
     #
@@ -3887,7 +4798,7 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
         elif kind == "blocked":
             print(f"[security] blocked control attempt from {a[0]} (a phone is already paired)")
         elif kind == "warn":
-            print(f"[security] {a[0]}")
+            print(f"[warn] {a[0]}")
         elif kind == "paused":
             print("[takeover] local input detected — remote paused")
         elif kind == "resumed":
@@ -3902,20 +4813,13 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
         elif kind == "log":
             print(f"[info] {a[0]}")
 
-    # Claim the loopback control port so a later `--resume` can clear a panic
-    # latch here too — the terminal has no Resume button. poke=False: a second
-    # headless launch must not nudge an existing instance's window.
-    kind_i, lsock_i = singleton_acquire(poke=False)
-    if kind_i == "existing":
-        # We still bind UDP 50505 below — SO_REUSEADDR lets a second server share
-        # the port, and the two then split the phone's packets between them, which
-        # presents as constant drops/reconnects on a perfectly healthy link. Say so
-        # rather than leaving the user to diagnose it.
-        print("[warn] another LazeR is already running — two servers will fight "
-              "over UDP 50505 (drops/reconnects). Close the other one.")
+    wire = Wire(token, key, require_secure)
+    # Serve the loopback control port (claimed above) so a later `--resume` can
+    # clear a panic latch here too — the terminal has no Resume button.
     if kind_i == "owner" and lsock_i is not None:
         ctrl_q = queue.Queue()
-        threading.Thread(target=singleton_serve, args=(lsock_i, ctrl_q),
+        threading.Thread(target=singleton_serve,
+                         args=(lsock_i, ctrl_q, lambda: wire.token, True),
                          daemon=True).start()
 
         def _drain_ctrl():
@@ -3926,10 +4830,12 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
                     continue
                 if ev[0] == "resumed":
                     emit("resumed")
-                # "show" has nothing to surface in a terminal — ignored.
+                elif ev[0] == "warn":
+                    emit("warn", ev[1])
+                # "show" has nothing to surface in a terminal; the caller was told
+                # so (SHOW_HEADLESS).
         threading.Thread(target=_drain_ctrl, daemon=True).start()
 
-    wire = Wire(token, key, require_secure)
     guard = LocalInputGuard(
         on_physical=lambda: _physical_event(emit),
         on_panic=lambda: _panic_event(emit),
@@ -4003,7 +4909,9 @@ def _physical_event(emit):
     _last_physical_ts[0] = time.monotonic()
     if not _remote_paused.is_set():
         _remote_paused.set()
-        appswitch_reset()
+        # The phone's own MUP is dropped while paused, so let go of a held drag
+        # button here or the user's mouse keeps dragging.
+        release_held_input()
         emit("paused")
 
 
@@ -4013,22 +4921,114 @@ def _panic_event(emit):
     if not _panic_latched.is_set():
         _panic_latched.set()
         _remote_paused.set()
-        appswitch_reset()
+        release_held_input()
         emit("panic")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
+def _attach_parent_console():
+    """Give a windowed exe somewhere to print when it was run from a terminal.
+
+    The release exe is built --windowed, so it has no console of its own:
+    `LazeR.exe --resume`, `--setup-firewall`, `--help` and every startup notice
+    printed to nowhere, and the user saw nothing happen. Attaching to the parent's
+    console (if there is one) makes a terminal invocation behave like one. A
+    double-click has no parent console, and nothing changes."""
+    if not (sys.platform.startswith("win") and getattr(sys, "frozen", False)):
+        return False
+    if sys.stdout is not None:
+        return False                     # a console build: nothing to do
+    try:
+        import ctypes
+        if not ctypes.windll.kernel32.AttachConsole(-1):   # ATTACH_PARENT_PROCESS
+            return False
+        out = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+        sys.stdout = sys.stderr = out
+        print()                          # the prompt was already drawn; start below it
+        return True
+    except Exception:
+        return False
+
+
+def _cli_say(text, title="LazeR"):
+    """Report the outcome of a one-shot CLI action. Prints when there is a
+    console; otherwise (a shortcut or Run entry to the windowed exe) shows a
+    message box, so the result is never silently lost."""
+    if sys.stdout is not None:
+        print(text)
+        return
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, text, title, 0x40)  # MB_ICONINFORMATION
+        except Exception:
+            pass
+
+
+def _resume_request():
+    """The bytes `--resume` sends: RESUME plus this install's token (see
+    singleton_serve). Read from the token file, never created here."""
+    try:
+        with open(TOKEN_FILE, "r") as f:
+            tok = f.read().strip()
+    except OSError:
+        tok = ""
+    return b"RESUME " + tok.encode("utf-8")
+
+
+def _resume_exit_code(reply):
+    """`--resume`'s exit status for the running copy's [reply]: 0 resumed, 1 refused,
+    2 unconfirmed (a copy older than this one resumes without answering)."""
+    if reply == RESUME_OK:
+        return 0
+    return 1 if reply == RESUME_DENIED else 2
+
+
+def _resume_outcome(reply):
+    """What `--resume` reports for the running copy's [reply]."""
+    if reply == RESUME_OK:
+        return "[resume] remote control resumed."
+    if reply == RESUME_DENIED:
+        return ("[resume] the running LazeR refused: this install's pairing code "
+                "doesn't match its own. Run --resume from the same folder as it.")
+    return ("[resume] sent, but the running LazeR didn't confirm (a version older "
+            "than this one doesn't). Check its window.")
+
+
+def _probe_udp_port():
+    """None if UDP PORT can be bound, else the OSError. Run before starting, so
+    a port already held (another LazeR, or anything else) is reported once, in
+    words, instead of as a receive loop that crashes and restarts forever."""
+    try:
+        s = open_socket()
+    except OSError as e:
+        return e
+    s.close()
+    return None
+
+
+PORT_BUSY_TEXT = (f"UDP port {PORT} is already in use — most likely another copy of "
+                  "LazeR (check the tray and Task Manager). Close it and start LazeR "
+                  "again. Two servers on one port split the phone's packets, which "
+                  "looks like a flaky connection.")
+
+
 def main():
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
+        if sys.stdout is not None:
+            sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+    if len(sys.argv) > 1 and sys.argv[1:] != ["--minimized"]:
+        _attach_parent_console()
 
     ap = argparse.ArgumentParser(description="LazeR server")
     ap.add_argument("--no-gui", action="store_true", help="terminal/headless mode")
+    ap.add_argument("--minimized", action="store_true",
+                    help="start hidden in the system tray (used by Start with Windows)")
     ap.add_argument("--secure-only", action="store_true",
-                    help="(now the default) reject plaintext v1 clients; kept so "
-                         "existing scripts and shortcuts keep working")
+                    help="(deprecated: now the default) reject plaintext v1 clients; "
+                         "kept so existing scripts and shortcuts keep working")
     ap.add_argument("--no-update-check", action="store_true",
                     help="never contact GitHub to see if a newer release exists. "
                          "This is the only outbound internet request LazeR makes; "
@@ -4039,54 +5039,86 @@ def main():
     ap.add_argument("--resume", action="store_true",
                     help="tell an already-running LazeR to resume remote control "
                          "(clears a panic latch) and exit")
+    ap.add_argument("--regenerate", action="store_true",
+                    help="make a new pairing code and key (every paired phone must "
+                         "scan the new QR) and exit. Restart a running LazeR after")
     ap.add_argument("--setup-firewall", action="store_true",
                     help="add the Windows Firewall inbound rule (self-elevates) and exit")
     ap.add_argument("--enable-startup", action="store_true",
-                    help="register LazeR to launch at Windows login (Startup folder) and exit")
+                    help="launch LazeR at Windows login (HKCU Run key, starts in the "
+                         "tray) and exit")
     ap.add_argument("--disable-startup", action="store_true",
                     help="remove the launch-at-login registration and exit")
     args = ap.parse_args()
 
     if args.enable_startup or args.disable_startup:
         if not sys.platform.startswith("win"):
-            print("[startup] launch-at-login is Windows-only.")
+            _cli_say("[startup] launch-at-login is Windows-only.")
             return
         want = args.enable_startup
         if set_startup(want):
-            print(f"[startup] launch-at-login {'enabled' if want else 'disabled'}."
-                  + ("\n[startup] registered under HKCU\\...\\Run as 'LazeR' — it now "
-                     "appears in Task Manager → Startup apps." if want else ""))
+            _cli_say(f"[startup] launch-at-login {'enabled' if want else 'disabled'}."
+                     + ("\n[startup] registered under HKCU\\...\\Run as 'LazeR' — it now "
+                        "appears in Task Manager → Startup apps." if want else ""))
         else:
             reason = getattr(set_startup, "last_error", "") or "unknown error"
-            print(f"[startup] could not change launch-at-login: {reason}")
+            _cli_say(f"[startup] could not change launch-at-login: {reason}")
         return
 
     if args.resume:
         try:
             c = socket.create_connection(("127.0.0.1", SINGLETON_PORT), timeout=1.0)
         except OSError:
-            print("[resume] no running LazeR found — start it first.")
-            return
+            _cli_say("[resume] no running LazeR found — start it first.")
+            sys.exit(1)
+        reply = b""
         try:
-            c.sendall(b"RESUME")
+            c.sendall(_resume_request())
+            c.settimeout(2.0)
+            reply = c.recv(16)
+        except OSError:
+            pass
         finally:
             c.close()
-        print("[resume] asked the running LazeR to resume remote control.")
+        _cli_say(_resume_outcome(reply))
+        sys.exit(_resume_exit_code(reply))
+
+    if args.regenerate:
+        wire = Wire(load_or_create_token(), load_or_create_key(), True)
+        try:
+            token, _ = rotate_secrets(wire)
+        except OSError as e:
+            _cli_say(f"[pairing] could not save a new code ({e}). Nothing changed. "
+                     f"Is {_APP_DIR} writable?")
+            return
+        _cli_say(f"[pairing] new pairing code {token} and key saved. Every paired "
+                 "phone must scan the new QR. A LazeR that is already running keeps "
+                 "the old code until it is restarted.")
         return
 
     if args.setup_firewall:
         if not sys.platform.startswith("win"):
-            print("[firewall] --setup-firewall is Windows-only; on macOS/Linux allow "
-                  f"inbound UDP {PORT} in your firewall.")
+            _cli_say("[firewall] --setup-firewall is Windows-only; on macOS/Linux allow "
+                     f"inbound UDP {PORT} in your firewall.")
             return
         if ensure_firewall_rule(allow_elevate=True):
-            print(f"[firewall] inbound rule '{FW_RULE_NAME}' is in place — phones can reach UDP {PORT}.")
+            msg = (f"[firewall] inbound rule '{FW_RULE_NAME}' is in place — phones can "
+                   f"reach UDP {PORT}.")
         else:
-            print("[firewall] could not add the rule (UAC declined?). Re-run and accept the prompt.")
+            msg = ("[firewall] the rule was not added: the admin prompt was declined "
+                   "or failed. Run this again and choose Yes.")
         # Say this even on success — the rule can be in place and still inert.
         advice = firewall_advice()
         if advice:
-            print(f"[firewall] {advice}")
+            msg += f"\n[firewall] {advice}"
+        _cli_say(msg)
+        return
+
+    if args.no_gui and sys.stdout is None:
+        # The windowed exe started with --no-gui and no terminal to attach to: that
+        # would be a server with no window, no tray and no way to quit.
+        _cli_say("--no-gui runs LazeR in a terminal. Start it from Command Prompt or "
+                 "PowerShell, or leave the flag off to get the window.")
         return
 
     token = load_or_create_token()
@@ -4100,40 +5132,70 @@ def main():
     # resolving a contradiction toward the weaker wire is how a "harmless" leftover
     # flag in a script silently turns encryption off.
     require_secure = not args.allow_plaintext or args.secure_only
+    # Startup notices, (tag, text). Printed in a terminal; the window logs them and
+    # raises the warnings, since the windowed exe has no terminal to print them to.
+    notices = []
+    for err in SECRET_WRITE_ERRORS:
+        notices.append(("warn", "Couldn't save the pairing secrets, so this pairing "
+                                f"lasts only until LazeR closes ({err}). Move LazeR "
+                                "to a folder you can write to."))
     if args.allow_plaintext and args.secure_only:
-        print("[security] --secure-only and --allow-plaintext conflict; honouring "
-              "--secure-only (encryption required).")
+        notices.append(("warn", "--secure-only and --allow-plaintext conflict; "
+                                "honouring --secure-only (encryption required)."))
     elif args.allow_plaintext:
-        print("[security] plaintext (manual-code) pairing ALLOWED — trusted LAN "
-              "only. Omit --allow-plaintext to require encryption.")
-    ip = lan_ip()
+        notices.append(("warn", "Typed-code (plaintext) pairing is ALLOWED — trusted "
+                                "LANs only. Omit --allow-plaintext to require encryption."))
+    elif args.secure_only:
+        notices.append(("info", "--secure-only is the default now; the flag can be "
+                                "dropped."))
+    # Publish only a usable address (see usable_lan_ip: autostart often runs before
+    # Wi-Fi associates). serve_loop's address watch announces the real one once it
+    # exists, and the window paints the QR then.
+    pub_ip = usable_lan_ip()
     # Say so loudly when the default route is NOT the address we advertise: it means
     # a virtual/VPN adapter owns the route, which used to silently put an
     # unreachable IP in the QR.
     _probe = _default_route_ip()
-    if _probe and _probe != ip:
-        print(f"[network] default route is {_probe}, which phones cannot reach "
-              f"(virtual/VPN adapter) — advertising {ip} instead.")
+    if pub_ip and _probe and _probe != pub_ip:
+        notices.append(("warn", f"The default route is {_probe}, which phones cannot "
+                                f"reach (virtual/VPN adapter) — advertising {pub_ip} "
+                                "instead."))
+    if pub_ip is None:
+        notices.append(("info", "No network address yet — the QR appears once this "
+                                "laptop joins a network."))
     hostname = socket.gethostname()
 
     if not args.no_gui:
         try:
-            import tkinter
+            import tkinter  # noqa: F401
         except ImportError:
             print("[gui] tkinter unavailable — falling back to terminal mode")
         else:
-            inst_kind, inst_lsock = singleton_acquire()
+            inst_kind, inst_ret = singleton_acquire()
             if inst_kind == "existing":
-                print("LazeR is already running — opened the existing window.")
+                if inst_ret == SHOW_HEADLESS:
+                    _cli_say("LazeR is already running in a terminal window (no app "
+                             "window to show). Close that one to use the app.")
+                else:
+                    print("LazeR is already running — opened the existing window.")
                 return
+            busy = _probe_udp_port()
+            if busy is not None:
+                _cli_say(PORT_BUSY_TEXT + f"\n\n({busy})")
+                return
+            migrate_startup_command()
 
             eq = queue.Queue()
-            if inst_lsock is not None:
-                threading.Thread(target=singleton_serve, args=(inst_lsock, eq),
-                                 daemon=True).start()
-            zc, mdns_info = start_mdns(ip, hostname)
-            net = {"ip": ip, "zc": zc, "info": mdns_info}
             wire = Wire(token, key, require_secure)
+            if inst_ret is not None:
+                threading.Thread(target=singleton_serve,
+                                 args=(inst_ret, eq, lambda: wire.token),
+                                 daemon=True).start()
+            if pub_ip:
+                zc, mdns_info = start_mdns(pub_ip, hostname)
+            else:
+                zc, mdns_info = None, None
+            net = {"ip": pub_ip, "zc": zc, "info": mdns_info}
 
             def emit(kind, *a):
                 if kind == "action":
@@ -4157,8 +5219,9 @@ def main():
             t.start()
 
             try:
-                LazeRWindow(ip, PORT, wire, eq, require_secure,
-                            update_check=not args.no_update_check).run()
+                LazeRWindow(pub_ip, PORT, wire, eq, require_secure,
+                            update_check=not args.no_update_check, net=net,
+                            notices=notices, minimized=args.minimized).run()
             except KeyboardInterrupt:
                 pass
             finally:
@@ -4172,7 +5235,9 @@ def main():
                     pass
             _exit_process(0)
 
-    run_terminal(token, key, ip, require_secure,
+    for tag, text in notices:
+        print(f"[{'warn' if tag == 'warn' else 'info'}] {text}")
+    run_terminal(token, key, pub_ip, require_secure,
                  update_check=not args.no_update_check)
 
 

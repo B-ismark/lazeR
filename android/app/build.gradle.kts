@@ -120,7 +120,7 @@ dependencies {
     // QR scanning via Google's on-device code scanner (no CAMERA permission needed)
     implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
 
-    // Plain JVM unit tests (no Robolectric). SecureChannelTest asserts the v2 wire
+    // Plain JVM unit tests (no Robolectric). SecureChannelTest asserts the L3 wire
     // against the same golden packet as server/tests/test_wire.py, so a layout
     // change on either side fails CI instead of breaking pairing silently.
     // NOTE: deliberately no `testOptions { unitTests.isReturnDefaultValues = true }`

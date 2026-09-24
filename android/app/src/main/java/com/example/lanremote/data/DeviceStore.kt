@@ -9,12 +9,15 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import com.example.lanremote.net.Protocol
 import org.json.JSONArray
 import org.json.JSONObject
 
 /** A saved laptop the user can reconnect to in one tap.
  *  [key] is the base64url 256-bit secret from the QR — present ⇒ encrypted wire.
- *  Empty ⇒ legacy plaintext (manual-code pairing on a trusted network). */
+ *  Empty ⇒ legacy plaintext (manual-code pairing on a trusted network).
+ *  [bound] = this laptop has answered a bound handshake (it echoes the phone's
+ *  nonce), so an unbound answer from it is refused as a downgrade or replay. */
 data class Device(
     val id: String,
     val name: String,
@@ -22,6 +25,7 @@ data class Device(
     val port: Int,
     val token: String,
     val key: String = "",
+    val bound: Boolean = false,
 )
 
 /** A laptop found live on the network via mDNS (no token yet). */
@@ -30,6 +34,64 @@ data class DiscoveredHost(
     val ip: String,
     val port: Int,
 )
+
+private fun sameKey(a: Device, b: Device) = b.key.isNotBlank() && a.key == b.key
+private fun sameAddress(a: Device, b: Device) = a.ip == b.ip && a.port == b.port
+private fun keysConflict(a: Device, b: Device) =
+    a.key.isNotBlank() && b.key.isNotBlank() && a.key != b.key
+
+/** The saved record [device] belongs to, if any: an exact key first, then the id,
+ *  then the address — including an address whose key differs, which is the case
+ *  the caller must ask about before replacing that pairing. */
+fun savedMatch(list: List<Device>, device: Device): Device? =
+    list.firstOrNull { sameKey(it, device) }
+        ?: list.firstOrNull { it.id == device.id }
+        ?: list.firstOrNull { sameAddress(it, device) }
+
+/**
+ * [list] with [device] inserted or replacing the record it matches.
+ *
+ * A record matches on its key (for QR pairings), or on its stable id or its
+ * address when the keys don't say otherwise: a laptop whose IP changed and was
+ * scanned again is the same laptop. Every match is folded into one record — the
+ * key match, else the id match, else the first — so older duplicates are cleaned
+ * up the next time that laptop is saved.
+ *
+ * A saved key is never replaced by a blank one: saving a typed-code connection
+ * to a laptop first paired by QR would otherwise quietly downgrade it to the
+ * plaintext wire. [Device.bound] survives while the key is unchanged, since the
+ * same laptop doesn't un-learn the bound handshake — unless [rescanned]: a QR scan
+ * is the user at the laptop's screen, so the handshake it just made is the truth,
+ * and a laptop rolled back to an older build stops being refused as a downgrade.
+ */
+fun mergeDevice(list: List<Device>, device: Device, rescanned: Boolean = false): List<Device> {
+    // Two records with different keys are different laptops, whatever their address
+    // says: DHCP hands a sleeping laptop's address to the next one, and folding the
+    // two deleted the other laptop's pairing. A shared id with a different key is
+    // the one exception — the user confirmed replacing that record's pairing — and
+    // only when no record already holds this key (ids are the first "ip:port" a
+    // laptop was seen at, so a fresh one can collide with a stale record's).
+    val keyHolder = list.any { sameKey(it, device) }
+    fun matches(d: Device) = sameKey(d, device) ||
+        (!keysConflict(d, device) && (d.id == device.id || sameAddress(d, device))) ||
+        (d.id == device.id && !keyHolder)
+    val hits = list.filter(::matches)
+    if (hits.isEmpty()) return list + device
+    val old = hits.firstOrNull { sameKey(it, device) }
+        ?: hits.firstOrNull { it.id == device.id }
+        ?: hits.first()
+    val key = device.key.ifBlank { old.key }
+    val merged = device.copy(
+        id = old.id,
+        key = key,
+        bound = device.bound || (!rescanned && old.bound && old.key == key),
+    )
+    val out = ArrayList<Device>(list.size)
+    for (d in list) {
+        if (d === old) out.add(merged) else if (!matches(d)) out.add(d)
+    }
+    return out
+}
 
 /**
  * Saved devices, encrypted at rest under an Android Keystore key.
@@ -104,6 +166,7 @@ class DeviceStore(context: Context) {
                         .put("port", d.port)
                         .put("token", d.token)
                         .put("key", d.key)
+                        .put("bound", d.bound)
                 )
             }
         }.toString()
@@ -134,27 +197,21 @@ class DeviceStore(context: Context) {
                 id = o.getString("id"),
                 name = o.getString("name"),
                 ip = o.getString("ip"),
-                port = o.optInt("port", 50505),
+                port = o.optInt("port", Protocol.DEFAULT_PORT),
                 token = o.getString("token"),
                 // A "rendezvous" key may be present in records written before off-LAN
                 // access was removed; it is simply ignored, and dropped on next save.
                 key = o.optString("key", ""),
+                bound = o.optBoolean("bound", false),
             )
         }
     } catch (e: Exception) {
         emptyList()
     }
 
-    /** Insert or replace, keyed by the stable [Device.id] (falling back to ip:port
-     *  for legacy records saved before ids were stable). Matching by id — not the
-     *  live address — lets a saved laptop's IP be refreshed in place when DHCP moves
-     *  it, instead of leaving a stale duplicate. Returns the new list. */
-    fun upsert(device: Device): List<Device> {
-        val list = load().toMutableList()
-        val idx = list.indexOfFirst {
-            it.id == device.id || (it.ip == device.ip && it.port == device.port)
-        }
-        if (idx >= 0) list[idx] = device else list.add(device)
+    /** Insert or replace; see [mergeDevice]. Returns the new list. */
+    fun upsert(device: Device, rescanned: Boolean = false): List<Device> {
+        val list = mergeDevice(load(), device, rescanned)
         save(list)
         return list
     }
