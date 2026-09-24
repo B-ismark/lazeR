@@ -47,8 +47,9 @@ below.
   **Shortcuts**.)
 - **Scroll strip** on the trackpad's right edge — or the left, via **Settings →
   Scroll bar on the left**.
-- **Volume** slider — synced both ways with the laptop, with Mute beside it (on a
-  Windows laptop, lit while it is muted).
+- **Volume** slider — synced both ways with the laptop. Tap its speaker icon to
+  mute; on a Windows laptop the icon shows when it is muted, and moving the volume
+  unmutes it.
 - **Media / Keyboard** — toggle between them with the buttons up top.
 - **Turn the phone sideways** for a wide trackpad: Media and Keys move to a rail on
   the left edge, and tapping one opens its panel beside the pad.

@@ -1182,7 +1182,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun setVolume(v: Float) {
         lastUserVolumeMs = System.currentTimeMillis()
         touch()
-        update { it.copy(volume = v) }
+        // The laptop unmutes when its volume is set above 0 (set_win), so show that
+        // now rather than after the next poll. Same test as the value sent below.
+        val unmutes = v.toInt() > 0 && _state.value.muted == true
+        if (unmutes) lastUserMuteMs = lastUserVolumeMs
+        update { it.copy(volume = v, muted = if (unmutes) false else it.muted) }
         client.setVolume(v.toInt())
     }
 

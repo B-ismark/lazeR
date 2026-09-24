@@ -13,6 +13,9 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -94,6 +97,7 @@ import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.semantics
@@ -113,7 +117,7 @@ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
-import androidx.compose.material3.FilledTonalIconToggleButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonShapes
@@ -448,6 +452,10 @@ private fun ControlsPanel(state: UiState, a: ControlActions, keysBuffer: Mutable
     }
 }
 
+/** Makes a [LevelCard]'s icon a button. [on] is its toggle state: null when there
+ *  is none to show (an older laptop that doesn't report mute), so it's a plain tap. */
+private class LevelIconAction(val label: String, val on: Boolean?, val onClick: () -> Unit)
+
 /** Volume / brightness card: icon + percent, with −/＋ nudge buttons flanking the slider. */
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
@@ -457,26 +465,40 @@ private fun LevelCard(
     value: Float,
     onChange: (Float) -> Unit,
     onStep: (Float) -> Unit,
-    trailing: (@Composable () -> Unit)? = null,
+    iconAction: LevelIconAction? = null,
 ) {
     SectionCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
             // Expressive MaterialShapes flourish: the level icon sits in a 9-sided
-            // "cookie" tonal badge instead of a bare glyph.
-            Box(
-                modifier = Modifier
-                    .size(36.dp)
-                    .clip(MaterialShapes.Cookie9Sided.toShape())
-                    .background(MaterialTheme.colorScheme.primaryContainer),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(icon, contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
+            // "cookie" tonal badge instead of a bare glyph. When it's a button, "on"
+            // swaps the badge to the error colours (and the caller swaps the glyph).
+            val on = iconAction?.on == true
+            val bg by animateColorAsState(
+                if (on) MaterialTheme.colorScheme.errorContainer
+                else MaterialTheme.colorScheme.primaryContainer, label = "badge")
+            val fg by animateColorAsState(
+                if (on) MaterialTheme.colorScheme.onErrorContainer
+                else MaterialTheme.colorScheme.onPrimaryContainer, label = "badgeIcon")
+            var badge = Modifier as Modifier
+            if (iconAction != null) {
+                // 48 dp of touch around the 36 dp badge.
+                badge = badge.minimumInteractiveComponentSize()
+            }
+            badge = badge.size(36.dp).clip(MaterialShapes.Cookie9Sided.toShape()).background(bg)
+            if (iconAction != null) {
+                badge = if (iconAction.on != null) {
+                    badge.toggleable(value = iconAction.on, role = Role.Switch,
+                        onValueChange = { iconAction.onClick() })
+                } else {
+                    badge.clickable(role = Role.Button, onClick = iconAction.onClick)
+                }
+            }
+            Box(modifier = badge, contentAlignment = Alignment.Center) {
+                Icon(icon, contentDescription = iconAction?.label, tint = fg,
                     modifier = Modifier.size(20.dp))
             }
             Text("  $label  ${value.toInt()}%", style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.weight(1f))
-            trailing?.invoke()
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -500,28 +522,16 @@ private fun MediaPanel(state: UiState, a: ControlActions) {
     fun seek(name: String) { a.onButtonTap(); a.onSpecialKey(name) }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         // Volume now lives with the media transport instead of at the top of the page.
+        // The speaker icon is the mute toggle. muted is null from an older laptop that
+        // doesn't report it: the tap still toggles, there's just no state to show.
         LevelCard(
-            icon = Icons.AutoMirrored.Filled.VolumeUp,
+            icon = if (state.muted == true) Icons.AutoMirrored.Filled.VolumeOff
+                   else Icons.AutoMirrored.Filled.VolumeUp,
             label = "Volume",
             value = state.volume,
             onChange = a.onVolume,
             onStep = { d -> a.onButtonTap(); a.onVolume((state.volume + d).coerceIn(0f, 100f)) },
-            trailing = {
-                val muted = state.muted
-                if (muted == null) {
-                    // An older laptop doesn't say whether it's muted: a plain button.
-                    IconButton(onClick = { a.onButtonTap(); a.onSystem("mute") }) {
-                        Icon(Icons.AutoMirrored.Filled.VolumeOff, contentDescription = "Mute")
-                    }
-                } else {
-                    FilledTonalIconToggleButton(
-                        checked = muted,
-                        onCheckedChange = { a.onButtonTap(); a.onSystem("mute") },
-                    ) {
-                        Icon(Icons.AutoMirrored.Filled.VolumeOff, contentDescription = "Mute")
-                    }
-                }
-            },
+            iconAction = LevelIconAction("Mute", state.muted) { a.onButtonTap(); a.onSystem("mute") },
         )
         SectionCard {
             Row(

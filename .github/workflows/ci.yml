@@ -63,7 +63,7 @@ jobs:
       - name: Install SDK packages
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
-      - uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a  # v4
+      - uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c  # v5.0.2
 
       # Debug only: assembleRelease signs with the local ~/.android/debug.keystore
       # "sideload" config, which doesn't exist on a runner.
