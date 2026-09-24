@@ -23,8 +23,9 @@ What the last two rounds changed:
 - **`--resume`:** the running copy answers `RESUMED`/`DENIED`; the CLI exits 0/1/2
   (resumed / refused or none running / unconfirmed). A bare RESUME (an older
   `--resume`) gets a warning naming that cause.
-- **Mute:** `VOL n [0|1]` from Windows (pycaw `GetMute`); the phone shows a toggle
-  when the laptop reports mute, the plain button when it doesn't. Reset when the
+- **Mute:** `VOL n [0|1]` from Windows (pycaw `GetMute`); the Volume card's speaker
+  icon is the toggle when the laptop reports mute, a plain button when it doesn't.
+  Setting a level above 0 unmutes (Windows), like Windows' own slider. Reset when the
   phone connects to another laptop. One reading is skipped after a lost VGET, since
   its late reply would carry pre-tap state. A failed mute read no longer drops the
   volume, and no output device skips the mute read.

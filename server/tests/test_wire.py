@@ -1422,9 +1422,10 @@ class _FakeEndpoint:
     """Stands in for an IAudioEndpointVolume. [dead] mimics the invalidation
     Windows performs on resume or an output-device change: every call raises."""
 
-    def __init__(self, level=0.56, dead=False):
+    def __init__(self, level=0.56, dead=False, muted=False):
         self.level = level
         self.dead = dead
+        self.muted = muted
 
     def GetMasterVolumeLevelScalar(self):
         if self.dead:
@@ -1435,6 +1436,16 @@ class _FakeEndpoint:
         if self.dead:
             raise OSError("AUDCLNT_E_DEVICE_INVALIDATED")
         self.level = scalar
+
+    def GetMute(self):
+        if self.dead:
+            raise OSError("AUDCLNT_E_DEVICE_INVALIDATED")
+        return int(self.muted)
+
+    def SetMute(self, muted, _guid):
+        if self.dead:
+            raise OSError("AUDCLNT_E_DEVICE_INVALIDATED")
+        self.muted = bool(muted)
 
 
 class WindowsVolumeBackend(unittest.TestCase):
@@ -1534,6 +1545,21 @@ class WindowsVolumeBackend(unittest.TestCase):
         stale.dead = True
         set_fn(90)
         self.assertAlmostEqual(fresh.level, 0.90, places=6)
+
+    def test_setting_a_level_unmutes_like_the_windows_slider(self):
+        # SetMasterVolumeLevelScalar leaves mute alone, so a muted laptop stayed
+        # silent however far the phone's slider moved.
+        ep = _FakeEndpoint(0.20, muted=True)
+        _get, set_fn, _label, _calls = self._make([ep])
+        set_fn(40)
+        self.assertAlmostEqual(ep.level, 0.40, places=6)
+        self.assertFalse(ep.muted, "setting a level left the laptop muted")
+
+    def test_setting_zero_leaves_mute_alone(self):
+        ep = _FakeEndpoint(0.20, muted=True)
+        _get, set_fn, _label, _calls = self._make([ep])
+        set_fn(0)
+        self.assertTrue(ep.muted, "dragging to 0 unmuted the laptop")
 
 
 class PanicChord(unittest.TestCase):

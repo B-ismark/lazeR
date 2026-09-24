@@ -238,7 +238,14 @@ def make_volume():
             return None if v is None else int(round(v * 100))
 
         def set_win(pct):
-            _on_endpoint(lambda e: e.SetMasterVolumeLevelScalar(pct / 100.0, None))
+            def apply(e):
+                e.SetMasterVolumeLevelScalar(pct / 100.0, None)
+                # Setting the level leaves mute as it was (measured), so a muted
+                # laptop stayed silent while the phone's slider moved. Windows' own
+                # slider unmutes when dragged; this does the same.
+                if pct > 0 and e.GetMute():
+                    e.SetMute(0, None)
+            _on_endpoint(apply)
 
         def muted_win():
             m = _on_endpoint(lambda e: e.GetMute())
