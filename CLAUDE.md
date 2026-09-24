@@ -106,7 +106,7 @@ on the old commit and the notes as they were. So:
    Compare the release's signer with the local key before building:
    `apksigner verify --print-certs LazeR.apk` (from the release) against
    `keytool -list -v -keystore %USERPROFILE%\.android\debug.keystore -storepass android`.
-   v2.0.0 through v2.2.0 are signed with SHA-1 `45e9b7d6…52267d4`.
+   Releases from v2.0.0 on are signed with SHA-1 `45e9b7d6…52267d4`.
 1. Move the tag to the new commit: `git tag -f v1.2.0 origin/main` then
    `git push -f origin refs/tags/v1.2.0`.
 2. On an up-to-date `main`, run the script as above. It rebuilds both artifacts from
