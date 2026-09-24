@@ -6,3 +6,9 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    ignore:
+      # v6 moved setup-gradle's caching into a proprietary component under
+      # Gradle's own terms (gradle.com/legal/terms-of-use); v5 is MIT throughout.
+      # Taking v6 means accepting those terms, which is the owner's decision.
+      - dependency-name: gradle/actions*
+        update-types: [version-update:semver-major]
