@@ -1457,9 +1457,9 @@ class WindowsVolumeBackend(unittest.TestCase):
     after a wake killed the only receive thread. Portable: sys.platform and the
     pycaw/comtypes imports are stubbed, so it runs on any OS."""
 
-    def _make(self, endpoints):
-        """Build the Windows backend over a queue of endpoints, newest last.
-        Returns (get, set, label, speaker_calls)."""
+    def _make(self, endpoints, audio=None, co_init=None):
+        """Build the Windows backend over a queue of endpoints, newest last, or
+        over [audio] as AudioUtilities. Returns (get, set, label, speaker_calls)."""
         calls = []
 
         class FakeAudioUtilities:
@@ -1473,8 +1473,10 @@ class WindowsVolumeBackend(unittest.TestCase):
 
         pycaw_pkg = types.ModuleType("pycaw")
         pycaw_mod = types.ModuleType("pycaw.pycaw")
-        pycaw_mod.AudioUtilities = FakeAudioUtilities
+        pycaw_mod.AudioUtilities = audio or FakeAudioUtilities
         pycaw_mod.IAudioEndpointVolume = object
+        pycaw_mod.EDataFlow = types.SimpleNamespace(eRender=types.SimpleNamespace(value=0))
+        pycaw_mod.ERole = types.SimpleNamespace(eMultimedia=types.SimpleNamespace(value=1))
         pycaw_pkg.pycaw = pycaw_mod
 
         # comtypes has to be stubbed as well, not just pycaw. _endpoint() calls
@@ -1491,7 +1493,7 @@ class WindowsVolumeBackend(unittest.TestCase):
         # defined anyway so that path would raise something honest rather than
         # AttributeError if it ever did.
         comtypes_mod = types.ModuleType("comtypes")
-        comtypes_mod.CoInitialize = lambda: None
+        comtypes_mod.CoInitialize = co_init or (lambda: None)
         comtypes_mod.CLSCTX_ALL = 0x17
 
         # The module stubs have to outlive make_volume(). _endpoint() imports
@@ -1554,6 +1556,68 @@ class WindowsVolumeBackend(unittest.TestCase):
         set_fn(40)
         self.assertAlmostEqual(ep.level, 0.40, places=6)
         self.assertFalse(ep.muted, "setting a level left the laptop muted")
+
+    def _switchable(self, devices, default, inited=None):
+        """AudioUtilities over {id: endpoint}, whose default output is default[0].
+        With [inited], a default-device lookup on a thread that hasn't called
+        CoInitialize raises, as the real one does."""
+        class Audio:
+            lookups = 0
+
+            @staticmethod
+            def GetSpeakers():
+                return types.SimpleNamespace(EndpointVolume=devices[default[0]],
+                                             id=default[0])
+
+            @staticmethod
+            def GetDeviceEnumerator():
+                if inited is not None and threading.get_ident() not in inited:
+                    raise OSError("CoInitialize has not been called")
+                Audio.lookups += 1
+                return types.SimpleNamespace(GetDefaultAudioEndpoint=lambda _f, _r:
+                    types.SimpleNamespace(GetId=lambda: default[0]))
+        return Audio
+
+    def test_a_new_default_output_device_is_followed(self):
+        # Switching output (headphones, a monitor, Bluetooth) leaves the old
+        # endpoint working, so nothing raised and the phone kept driving the old
+        # device's volume.
+        speakers, phones = _FakeEndpoint(0.74), _FakeEndpoint(0.40)
+        default = ["speakers"]
+        audio = self._switchable({"speakers": speakers, "headphones": phones}, default)
+        get_fn, set_fn, _label, _calls = self._make([], audio=audio)
+        with mock.patch.object(rs, "AUDIO_DEVICE_CHECK_S", 0):
+            self.assertEqual(get_fn(), 74)
+            default[0] = "headphones"
+            self.assertEqual(get_fn(), 40, "still reading the old output device")
+            set_fn(55)
+        self.assertAlmostEqual(phones.level, 0.55, places=6)
+        self.assertAlmostEqual(speakers.level, 0.74, places=6)
+
+    def test_the_default_device_check_is_throttled(self):
+        audio = self._switchable({"a": _FakeEndpoint(0.5)}, ["a"])
+        get_fn, _set, _label, _calls = self._make([], audio=audio)
+        for _ in range(20):
+            get_fn()
+        # AUDIO_DEVICE_CHECK_S is 1 s and this loop takes microseconds.
+        self.assertLessEqual(audio.lookups, 1, f"{audio.lookups} lookups for 20 reads")
+
+    def test_the_default_device_check_initializes_com_on_its_thread(self):
+        # The check runs on the UDP thread, not the one that built the backend.
+        inited = set()
+        speakers, phones = _FakeEndpoint(0.74), _FakeEndpoint(0.40)
+        default = ["speakers"]
+        audio = self._switchable({"speakers": speakers, "headphones": phones},
+                                 default, inited)
+        get_fn, _set, _label, _calls = self._make(
+            [], audio=audio, co_init=lambda: inited.add(threading.get_ident()))
+        default[0] = "headphones"
+        got = []
+        with mock.patch.object(rs, "AUDIO_DEVICE_CHECK_S", 0):
+            t = threading.Thread(target=lambda: got.append(get_fn()))
+            t.start()
+            t.join(5)
+        self.assertEqual(got, [40], "the check failed off the main thread")
 
     def test_setting_zero_leaves_mute_alone(self):
         ep = _FakeEndpoint(0.20, muted=True)
