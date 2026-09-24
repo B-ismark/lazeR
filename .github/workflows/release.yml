@@ -115,7 +115,7 @@ jobs:
           # The phone's in-app updater downloads LazeR.apk only if it matches this.
           (cd out && sha256sum LazeR.apk > LazeR.apk.sha256 && cat LazeR.apk.sha256)
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: LazeR.apk
           path: |
@@ -160,7 +160,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           if (-not (Test-Path dist/LazeR.exe)) { Write-Error "dist/LazeR.exe not built"; exit 1 }
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: LazeR.exe
           path: dist/LazeR.exe
