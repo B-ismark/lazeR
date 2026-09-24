@@ -56,6 +56,9 @@ POST_WAKE_GRACE_S = 8
 # (mDNS record + the on-screen QR) until the app is restarted, which is exactly
 # what "I had to close it and start again" looked like.
 NET_WATCH_S = 5
+# How often the Windows volume backend checks that it is still on the default
+# output device (see _follow_default in make_volume).
+AUDIO_DEVICE_CHECK_S = 1.0
 # After a wake, the NIC is usually still coming up: lan_ip() called at that instant
 # returns the loopback fallback, and re-announcing THAT poisons mDNS with 127.0.0.1
 # for the rest of the process. Wait (bounded) for a real address before announcing.
@@ -187,31 +190,37 @@ def make_volume():
         # the status dot stayed green, and nothing short of restarting the app brought
         # it back. VGET is the phone's own liveness probe, so this fired every time.
         try:
-            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+            from pycaw.pycaw import AudioUtilities, EDataFlow, ERole, IAudioEndpointVolume
         except Exception as e:
             print(f"[volume] pycaw unavailable ({e}); pip install pycaw")
             return None, None, None
 
         _ep = [None]
+        _ep_id = [None]         # the device _ep belongs to
+        _checked = [0.0]        # when the default device was last compared to it
+
+        def _com():
+            # COM is per-thread, and comtypes only initializes the thread that
+            # imports it — the main one. Re-acquisition and the default-device
+            # check run on the UDP receive thread, where COM calls otherwise fail
+            # every time with "CoInitialize has not been called" (measured). That
+            # would have made both no-ops. Idempotent, so it's free after the first.
+            import comtypes
+            try:
+                comtypes.CoInitialize()
+            except OSError:
+                # RPC_E_CHANGED_MODE: this thread already has an apartment of
+                # the other kind. That is fine — it has one, which is all we
+                # need. Anything else surfaces on the COM call that follows.
+                pass
+
+        def _device_id(dev):
+            i = getattr(dev, "id", None)        # pycaw's AudioDevice
+            return i if i is not None else dev.GetId()   # a bare IMMDevice
 
         def _endpoint():
             if _ep[0] is None:
-                # COM is per-thread, and comtypes only initializes the thread that
-                # imports it — the main one. Re-acquisition happens on the UDP
-                # receive thread, where GetSpeakers() otherwise fails every time
-                # with "CoInitialize has not been called" (measured). That would
-                # have made this whole recovery path a no-op: the first stale
-                # endpoint would leave volume dead until a restart, which is the
-                # symptom it exists to remove. Idempotent, so calling it on each
-                # re-acquire is free after the first.
-                import comtypes
-                try:
-                    comtypes.CoInitialize()
-                except OSError:
-                    # RPC_E_CHANGED_MODE: this thread already has an apartment of
-                    # the other kind. That is fine — it has one, which is all we
-                    # need. Anything else surfaces on the GetSpeakers call below.
-                    pass
+                _com()
                 devices = AudioUtilities.GetSpeakers()
                 vol = getattr(devices, "EndpointVolume", None)
                 if vol is None:
@@ -220,12 +229,41 @@ def make_volume():
                     iface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
                     vol = cast(iface, POINTER(IAudioEndpointVolume))
                 _ep[0] = vol
+                try:
+                    _ep_id[0] = _device_id(devices)
+                except Exception:
+                    _ep_id[0] = None
+                _checked[0] = time.monotonic()
             return _ep[0]
+
+        def _follow_default():
+            """Drop the endpoint if Windows' default output has moved to another
+            device. Switching to headphones, a monitor or a Bluetooth speaker
+            doesn't invalidate the old device's endpoint — it keeps answering for
+            the device it was bound to — so the stale-endpoint retry never fires,
+            and the phone went on reading and setting the old device's volume
+            (measured: phone at the monitor's 74 %, headphones at 40 %). Checked at
+            most once a second: this lookup costs ~2.5 ms, GetSpeakers() ~65."""
+            now = time.monotonic()
+            if _ep[0] is None or now - _checked[0] < AUDIO_DEVICE_CHECK_S:
+                return
+            _checked[0] = now
+            try:
+                _com()
+                en = AudioUtilities.GetDeviceEnumerator()
+                cur = en.GetDefaultAudioEndpoint(EDataFlow.eRender.value,
+                                                 ERole.eMultimedia.value).GetId()
+            except Exception:
+                return      # can't tell: keep the endpoint; its own errors still recover
+            if cur != _ep_id[0]:
+                _ep[0] = None
 
         def _on_endpoint(call):
             """Run [call] against the endpoint, re-acquiring once if it has gone
-            stale. Returns None if even a fresh endpoint fails (no output device at
-            all), so callers can degrade instead of raising."""
+            stale or the default output device has changed. Returns None if even a
+            fresh endpoint fails (no output device at all), so callers can degrade
+            instead of raising."""
+            _follow_default()
             for _ in (0, 1):            # try, then retry once on a fresh endpoint
                 try:
                     return call(_endpoint())
