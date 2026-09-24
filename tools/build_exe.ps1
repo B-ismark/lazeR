@@ -139,6 +139,9 @@ if (-not (Test-Path $exe)) {
 # binds a port, so this is safe next to a running LazeR. A crash shows a
 # dialog and never exits, hence the timeout.
 $p = Start-Process -FilePath $exe -ArgumentList "--help" -PassThru -WindowStyle Hidden
+# Hold a handle now: without one, ExitCode can come back $null once the process
+# has gone, which the check below would read as a failure.
+$null = $p.Handle
 if (-not $p.WaitForExit(60000)) {
     & taskkill.exe /T /F /PID $p.Id | Out-Null
     Write-Host "LazeR.exe did not start (no exit within 60 s; likely a startup error dialog)." -ForegroundColor Red
