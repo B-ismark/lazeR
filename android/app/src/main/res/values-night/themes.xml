@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark twin of values/themes.xml: the fallback dark scheme's `surface`, so a
+         dark-mode launch no longer flashes a white window. -->
+    <style name="Theme.LanRemote" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/lazer_surface_dark</item>
+    </style>
+
+    <style name="Theme.LanRemote.Starting" parent="Theme.SplashScreen.IconBackground">
+        <item name="windowSplashScreenBackground">@color/lazer_surface_dark</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <item name="windowSplashScreenIconBackgroundColor">@color/lazer_icon_disc</item>
+        <item name="postSplashScreenTheme">@style/Theme.LanRemote</item>
+    </style>
+</resources>

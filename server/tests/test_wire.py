@@ -1007,8 +1007,13 @@ class ServeLoopResilience(unittest.TestCase):
 
         pkt, _ = fc.seal("MOVE 1 1")
         self.cli.sendto(pkt, self.srv)
-        self._await_event(lambda e: e[0] == "warn" and "MOVE" in str(e[1]),
+        self._await_event(lambda e: e[0] == "warn" and "skipped" in str(e[1]),
                           "a warning about the failed MOVE")
+        # The banner says it in plain words; the verb and exception go to the log.
+        warn = next(e for e in self.events if e[0] == "warn")
+        self.assertNotIn("RuntimeError", str(warn[1]))
+        self.assertTrue(any(e[0] == "log" and "MOVE" in str(e[1])
+                            and "RuntimeError" in str(e[1]) for e in self.events))
         self.assertTrue(self.thread.is_alive(), "the raise killed the loop")
 
         # The real proof: the very next packet is still served.
@@ -2668,6 +2673,25 @@ class RefusalHints(unittest.TestCase):
         self.assertTrue(lim.allow(("10.0.0.1", 1000), 1.0))
 
 
+class DpiMove(unittest.TestCase):
+    """A DPI-aware GUI moves in real pixels; deltas must keep --no-gui's speed."""
+
+    def setUp(self):
+        for name, val in (("_UI_SCALE", [1.5]), ("_move_residual", [0.0, 0.0])):
+            p = mock.patch.object(rs, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_deltas_scale_and_slow_drags_keep_their_fraction(self):
+        self.assertEqual(rs._dpi_move(10, -4), (15, -6))
+        # Ten 1-px nudges at 150% must add up to 15 px, not 10 or 20.
+        self.assertEqual(sum(rs._dpi_move(1, 0)[0] for _ in range(10)), 15)
+
+    def test_unscaled_is_untouched(self):
+        rs._UI_SCALE[0] = 1.0
+        self.assertEqual(rs._dpi_move(7, 3), (7, 3))
+
+
 class SecretFiles(unittest.TestCase):
     """The token and key are everything needed to drive the laptop."""
 
@@ -2766,6 +2790,43 @@ class SecretFiles(unittest.TestCase):
         with open(self.tok) as f:
             self.assertEqual(f.read(), token)
         self.assertEqual(rs.load_or_create_key(), key)
+
+    def _legacy(self):
+        d = os.path.join(self.tmp.name, "beside-exe")
+        os.mkdir(d)
+        for name, val in ((".lazer_token", TOKEN), (".lazer_key", rs.key_b64(KEY))):
+            with open(os.path.join(d, name), "w") as f:
+                f.write(val)
+        return d
+
+    def test_an_old_pair_beside_the_exe_moves_to_the_data_folder(self):
+        d = self._legacy()
+        rs.migrate_legacy_secrets(d)
+        self.assertEqual(os.listdir(d), [])                # Downloads is clean again
+        self.assertEqual(rs.load_or_create_token(), TOKEN) # ...and the phone stays paired
+        self.assertEqual(rs.load_or_create_key(), KEY)
+
+    def test_migration_never_overwrites_an_existing_pair(self):
+        rs.write_secret(self.tok, "NEWTOK")
+        d = self._legacy()
+        rs.migrate_legacy_secrets(d)
+        with open(self.tok) as f:
+            self.assertEqual(f.read(), "NEWTOK")
+        self.assertEqual(sorted(os.listdir(d)), [".lazer_key", ".lazer_token"])
+
+    def test_a_migration_that_fails_halfway_leaves_no_half_pair(self):
+        d = self._legacy()
+        real = rs.write_secret
+
+        def key_fails(path, text):
+            if path == self.key:
+                raise PermissionError(13, "Access is denied")
+            return real(path, text)
+
+        with mock.patch.object(rs, "write_secret", key_fails):
+            rs.migrate_legacy_secrets(d)
+        self.assertFalse(os.path.exists(self.tok))
+        self.assertEqual(sorted(os.listdir(d)), [".lazer_key", ".lazer_token"])
 
     def test_an_unwritable_folder_is_reported_at_startup(self):
         with mock.patch.object(rs, "write_secret",

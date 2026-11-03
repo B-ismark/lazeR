@@ -43,7 +43,10 @@ See [PROTOCOL.md](PROTOCOL.md) for the packet format.
 
 **Windows, no Python:** download `LazeR.exe` from the
 [latest release](https://github.com/B-ismark/lazeR/releases/latest) and run it. It
-bundles everything.
+bundles everything and creates no files beside itself. The exe isn't code-signed
+yet, so SmartScreen shows "Windows protected your PC" on a fresh download: click
+**More info → Run anyway**. To remove it, run `LazeR.exe --uninstall` (removes the
+login entry, the firewall rule and the saved pairing), then delete the exe.
 
 **From source** (Python 3.8+):
 
@@ -201,11 +204,14 @@ in Play Services. No volume-button hooks.
   python remote_server.py --resume     # or: LazeR.exe --resume
   ```
   It exits 0 once the running copy confirms, 1 if it refused or none is running, and
-  2 if it didn't answer (a copy older than this one). Run it from the running copy's
-  folder: it proves itself with that install's pairing code.
-- The pairing **token + key are persistent** (`.lazer_token`, `.lazer_key` next to
-  the running program: `server/` from source, the exe's folder for `LazeR.exe`), are
-  readable only by your Windows account, and are reused across launches.
+  2 if it didn't answer (a copy older than this one). It proves itself with the
+  pairing code saved for your account.
+- The pairing **token + key are persistent** (`.lazer_token`, `.lazer_key` in
+  `%LOCALAPPDATA%\LazeR`; `~/Library/Application Support/LazeR` on macOS,
+  `~/.config/lazer` elsewhere), are readable only by your account, and are reused
+  across launches. The exe leaves nothing beside itself; a pair an older version
+  left there is moved in on first launch, so phones stay paired. `--uninstall`
+  deletes that folder along with the login entry and the firewall rule.
   **Regenerate** (in Show details), **New code** (on the Connected card), or
   `--regenerate` replaces both and disconnects the phone at once. If they can't be
   saved, LazeR says so and keeps the old ones rather than pretending.

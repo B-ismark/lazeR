@@ -262,14 +262,12 @@ recovery above into a no-op until it was caught.
 
 ## Secrets
 
-`.lazer_token` / `.lazer_key` (per install, incl. the exe's own next to `dist/`)
-are gitignored — never commit them.
+`.lazer_token` / `.lazer_key` are gitignored — never commit them.
 
-They live next to the **running** binary (`_APP_DIR`), so `server/.lazer_*` and
-`dist/.lazer_*` are two different identities: switching between
-`python remote_server.py` and `dist/LazeR.exe` invalidates the phone's saved pairing.
-The phone just reports a failed connect, which is indistinguishable from a firewall or
-network problem. To test from source against an already-paired phone, copy
-`dist/.lazer_*` into `server/` rather than re-pairing — and keep any backup **outside**
-the repo, since `.gitignore` matches those two names exactly and a `.lazer_token.bak`
-is therefore NOT ignored.
+Since 2.4 they live in the per-user data folder (`_DATA_DIR`: `%LOCALAPPDATA%\LazeR`
+on Windows — Local, not Roaming, so laptops on one account don't share an identity),
+so `python remote_server.py` and `dist/LazeR.exe` share one pairing.
+`migrate_legacy_secrets()` moves a pair an older build left beside the binary
+(`_APP_DIR`) on first launch, all-or-nothing, and never overwrites an existing pair.
+Keep any backup **outside** the repo: `.gitignore` matches those two names exactly,
+so a `.lazer_token.bak` is NOT ignored.

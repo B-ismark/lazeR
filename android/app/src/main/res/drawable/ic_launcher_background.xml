@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon background: the periwinkle vertical gradient from
+     tools/gen_icons.py (BG_TOP #8C9BFF to BG_BOT #6575E0), full bleed — the
+     launcher applies its own mask shape. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:pathData="M0,0h108v108h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="54"
+                android:startY="0"
+                android:endX="54"
+                android:endY="108"
+                android:startColor="#FF8C9BFF"
+                android:endColor="#FF6575E0" />
+        </aapt:attr>
+    </path>
+</vector>

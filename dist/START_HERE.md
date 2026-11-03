@@ -14,9 +14,16 @@ LazeR.apk   the Android app
 
 ## 1. Laptop
 
-Double-click **`LazeR.exe`**. A window opens with a QR code. Windows may ask to allow
-it through the firewall — allow it, or click **Allow through firewall** in the
-window later (one admin prompt).
+Double-click **`LazeR.exe`**. A window opens with a QR code. Put the exe wherever
+you like (Downloads is fine) — it creates no files beside itself.
+
+**"Windows protected your PC"?** LazeR isn't code-signed yet, so SmartScreen warns
+about any new download of it. Click **More info → Run anyway**. You only see this
+once per download.
+
+Windows may then ask whether to allow LazeR through the firewall: click **Allow**.
+If you clicked **Cancel**, click **Allow through firewall** in the LazeR window
+(one admin prompt) — the window tells you if Windows is still blocking it.
 
 **Start with Windows:** open **Show details** and flip **Start with Windows** on.
 LazeR then starts in the tray at every login.
@@ -63,6 +70,12 @@ below.
   **Settings → Updates** can download and install it. The laptop window's **Version**
   line in Show details says when the laptop app is out of date; download `LazeR.exe`
   from the release page and update both together.
+
+## Removing LazeR
+
+Run `LazeR.exe --uninstall` (one admin prompt, for the firewall rule), then delete
+the exe. That removes the Start with Windows entry, LazeR's firewall rule and its
+saved pairing in `%LOCALAPPDATA%\LazeR` — nothing else is left behind.
 
 ## If the phone won't connect
 

@@ -6,15 +6,21 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -54,9 +60,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.lanremote.ConnState
 import com.example.lanremote.UiState
@@ -95,6 +103,8 @@ fun ConnectionScreen(
         modifier = Modifier
             .fillMaxSize()
             .statusBarsPadding()
+            // Landscape: keep the side nav bar and any cutout off the content.
+            .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
             .imePadding(),
     ) {
         // Scrollable content fills the space above the pinned action.
@@ -193,10 +203,11 @@ fun ConnectionScreen(
             ) {
                 val message = state.scanError ?: state.error
                 if (message != null && !connecting) {
-                    Text(
-                        message,
+                    FailureMessage(
+                        headline = message,
+                        // The detail belongs to [UiState.error], not to a scan error.
+                        detail = if (state.scanError == null) state.errorDetail else null,
                         color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.padding(bottom = 12.dp),
                     )
                 }
@@ -247,6 +258,55 @@ fun ConnectionScreen(
 
     if (showSettings) {
         SettingsSheet(state, settings, onDismiss = { showSettings = false })
+    }
+}
+
+/**
+ * A short [headline] with its [detail] behind a "Why?" toggle. The connect screen's
+ * error sits in a pinned bar that doesn't scroll, so a full diagnosis there pushed
+ * the Scan button half off a landscape screen. The detail scrolls inside a capped
+ * height for the same reason.
+ */
+@Composable
+internal fun FailureMessage(
+    headline: String,
+    detail: String?,
+    color: Color,
+    modifier: Modifier = Modifier,
+    centered: Boolean = false,
+) {
+    // Keyed on the text, so a new diagnosis starts collapsed.
+    var expanded by rememberSaveable(headline, detail) { mutableStateOf(false) }
+    val align = if (centered) TextAlign.Center else TextAlign.Start
+    Column(
+        modifier,
+        horizontalAlignment = if (centered) Alignment.CenterHorizontally else Alignment.Start,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                headline,
+                color = color,
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = align,
+                modifier = Modifier.weight(1f, fill = false),
+            )
+            if (detail != null) {
+                TextButton(onClick = { expanded = !expanded }) {
+                    Text(if (expanded) "Hide" else "Why?")
+                }
+            }
+        }
+        AnimatedVisibility(visible = expanded && detail != null) {
+            Text(
+                detail.orEmpty(),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = align,
+                modifier = Modifier
+                    .heightIn(max = 140.dp)
+                    .verticalScroll(rememberScrollState()),
+            )
+        }
     }
 }
 

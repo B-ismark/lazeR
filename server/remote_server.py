@@ -73,15 +73,33 @@ QR_HIDE_AFTER_MS = 5 * 60 * 1000
 SERVICE_TYPE = "_lazer._udp.local."
 # Resource vs. writable paths differ when frozen into a PyInstaller onefile exe:
 # bundled data lives in the temp _MEIPASS extraction dir (read-only), while the
-# token must persist next to the exe across launches.
+# token must persist across launches.
 if getattr(sys, "frozen", False):
     _BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
     _APP_DIR = os.path.dirname(sys.executable)
 else:
     _BUNDLE_DIR = os.path.dirname(os.path.abspath(__file__))
     _APP_DIR = _BUNDLE_DIR
-TOKEN_FILE = os.path.join(_APP_DIR, ".lazer_token")
-KEY_FILE = os.path.join(_APP_DIR, ".lazer_key")
+
+
+def _user_data_dir():
+    """Per-user folder for the pairing secrets. Windows uses Local, not Roaming
+    AppData: a roamed key would give every laptop on the account one identity."""
+    if sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+        return os.path.join(base, "LazeR")
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/LazeR")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "lazer")
+
+
+# The secrets used to sit beside the binary (_APP_DIR), which littered Downloads
+# with two dotfiles and gave the exe and a source run different identities. They
+# now live in the user's data folder; migrate_legacy_secrets() moves an old pair.
+_DATA_DIR = _user_data_dir()
+TOKEN_FILE = os.path.join(_DATA_DIR, ".lazer_token")
+KEY_FILE = os.path.join(_DATA_DIR, ".lazer_key")
 ICON_FILE = os.path.join(_BUNDLE_DIR, "LazeR.ico")
 
 # HELLO freshness: a secure HELLO is answered with a one-time random challenge the
@@ -924,6 +942,7 @@ def _write_secret_tmp(path, text):
     """Write [text] to a fresh owner-only temp file beside [path]; return its path.
     Raises OSError on any failure (and leaves no temp file behind)."""
     tmp = _secret_tmp_path(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     try:
         if sys.platform.startswith("win"):
             f = _win_create_private(tmp)
@@ -998,6 +1017,62 @@ def _harden_existing_secret(path, text):
             write_secret(path, text)
         except OSError:
             pass
+
+
+def migrate_legacy_secrets(legacy_dir=None):
+    """Move a pair saved beside the binary (before 2.4) into the data folder, so an
+    update keeps every phone paired. Never overwrites: a data folder that already
+    holds either file wins. Best effort — a failure just leaves the old files."""
+    legacy_dir = _APP_DIR if legacy_dir is None else legacy_dir
+    moves = [(os.path.join(legacy_dir, os.path.basename(p)), p)
+             for p in (TOKEN_FILE, KEY_FILE)]
+    if any(os.path.normcase(os.path.abspath(old)) == os.path.normcase(os.path.abspath(new))
+           or os.path.exists(new) for old, new in moves):
+        return
+    found = []
+    for old, new in moves:
+        try:
+            with open(old, "r") as f:
+                found.append((old, new, f.read().strip()))
+        except OSError:
+            pass
+    written = []
+    try:
+        for _, new, text in found:
+            write_secret(new, text)
+            written.append(new)
+    except OSError:
+        # Half a pair in the data folder would stop the next launch retrying and
+        # pair the moved token with a fresh key. Undo; the old pair still works.
+        for new in written:
+            try:
+                os.remove(new)
+            except OSError:
+                pass
+        return
+    for old, _, _ in found:
+        try:
+            os.remove(old)
+        except OSError:
+            pass   # a read-only folder keeps a stale copy; the new one is used
+
+
+def remove_data_dir():
+    """Delete the saved pairing (and the folder, once empty). Returns the paths
+    that couldn't be removed."""
+    left = []
+    for p in (TOKEN_FILE, KEY_FILE):
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            left.append(p)
+    try:
+        os.rmdir(_DATA_DIR)
+    except OSError:
+        pass                  # absent, or holds something that isn't ours
+    return left
 
 
 def _new_token():
@@ -1838,7 +1913,7 @@ def handle_packet(verb, rest):
             dx, dy = _clamp_int(a, MOVE_MAX_PX), _clamp_int(b, MOVE_MAX_PX)
         except ValueError:        # wrong arity or non-numeric
             return
-        mouse.move(dx, dy)
+        mouse.move(*_dpi_move(dx, dy))
 
     elif verb == "SCROLL":
         try:
@@ -2477,9 +2552,19 @@ def _startup_command(minimized=True):
     return f'"{pyw}" "{SCRIPT_PATH}"{flag}'
 
 
+def _startup_target_missing(cmd):
+    """True when a Run command's quoted program or script no longer exists — the
+    exe was moved or re-downloaded elsewhere. Windows then launches nothing at
+    login while the toggle still reads On."""
+    import re
+    paths = re.findall(r'"([^"]+)"', cmd)
+    return bool(paths) and any(not os.path.exists(p) for p in paths)
+
+
 def migrate_startup_command():
-    """Add --minimized to a Run entry an older release registered for THIS
-    binary. An entry pointing anywhere else is the user's choice — left alone."""
+    """Repair the Run entry for THIS binary: add --minimized to one an older
+    release registered, and re-point one whose program has gone. An entry pointing
+    at a different binary that still exists is the user's choice — left alone."""
     if not sys.platform.startswith("win"):
         return
     try:
@@ -2487,7 +2572,7 @@ def migrate_startup_command():
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0,
                             winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE) as k:
             cur, _ = winreg.QueryValueEx(k, _RUN_VALUE)
-            if cur == _startup_command(minimized=False):
+            if cur == _startup_command(minimized=False) or _startup_target_missing(cur):
                 winreg.SetValueEx(k, _RUN_VALUE, 0, winreg.REG_SZ, _startup_command())
     except OSError:
         pass
@@ -2740,6 +2825,50 @@ def firewall_advice_for(inert):
             f"Windows classifies that way — mark such networks Private.")
 
 
+# Clicking Cancel on Windows' "allow this app?" prompt doesn't just decline: it
+# adds an enabled inbound BLOCK rule for the exe, and a block rule beats our
+# port allow rule. Everything else then reads healthy while phones time out.
+def _self_program():
+    return os.path.abspath(sys.executable)
+
+
+def _cmd_safe(text):
+    """True when [text] can sit inside the cmd.exe chain ensure_firewall_rule
+    builds: a path holding cmd metacharacters (a folder named "R&D") would split it."""
+    return not any(c in text for c in '&|<>^%"')
+
+
+def firewall_block_rules():
+    """Display names of enabled inbound rules that block this program. Read-only,
+    no admin. Enum values (Inbound/Block/True) are not localized, unlike netsh's
+    output. Empty when there are none or we can't tell."""
+    if not sys.platform.startswith("win"):
+        return []
+    import subprocess
+    prog = _self_program().replace("'", "''")
+    cmd = ("Get-NetFirewallApplicationFilter -PolicyStore ActiveStore "
+           f"-Program '{prog}' -ErrorAction SilentlyContinue | "
+           "Get-NetFirewallRule -ErrorAction SilentlyContinue | "
+           "Where-Object { $_.Direction -eq 'Inbound' -and $_.Action -eq 'Block' "
+           "-and $_.Enabled -eq 'True' } | ForEach-Object { $_.DisplayName }")
+    try:
+        r = subprocess.run([win_exe(*POWERSHELL), "-NoProfile", "-NonInteractive",
+                            "-Command", cmd],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=15, creationflags=_no_window_flags())
+        return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+    except Exception:
+        return []
+
+
+def _firewall_unblock_args():
+    """netsh args dropping every inbound rule tied to this program. Our own rule is
+    port-only, so it never matches; an allow rule Windows made for the exe goes too,
+    which costs nothing while the port rule stands."""
+    return ["advfirewall", "firewall", "delete", "rule", "name=all", "dir=in",
+            f"program={_self_program()}"]
+
+
 def _firewall_purge_legacy_direct():
     """Drop the pre-fix private,domain rules (needs elevation; best effort)."""
     import subprocess
@@ -2759,14 +2888,16 @@ def _firewall_add_direct():
     the old private,domain rule so a dead one isn't left sitting behind."""
     import subprocess
     _firewall_purge_legacy_direct()
-    try:
-        subprocess.run(
-            [win_exe("netsh.exe")] + _FW_ADD_ARGS,
-            capture_output=True, text=True, timeout=8,
-            creationflags=_no_window_flags())
-    except Exception:
-        pass
-    return firewall_rule_exists()
+    for args in ([_firewall_unblock_args()] if _owned_program_rules() else []) + \
+            ([] if firewall_rule_exists() else [_FW_ADD_ARGS]):
+        try:
+            subprocess.run(
+                [win_exe("netsh.exe")] + args,
+                capture_output=True, text=True, timeout=8,
+                creationflags=_no_window_flags())
+        except Exception:
+            pass
+    return firewall_rule_exists() and not firewall_block_rules()
 
 
 def _run_elevated_and_wait(exe, params, timeout_ms=30000):
@@ -2812,7 +2943,9 @@ def ensure_firewall_rule(allow_elevate=False):
     [allow_elevate] lets us pop a single UAC prompt when we aren't already admin."""
     if not sys.platform.startswith("win"):
         return True
-    if firewall_rule_exists():
+    blocked = firewall_block_rules()
+    have = firewall_rule_exists()
+    if have and not blocked:
         return True
     if is_admin():
         return _firewall_add_direct()
@@ -2825,14 +2958,114 @@ def ensure_firewall_rule(allow_elevate=False):
             f'{netsh} advfirewall firewall delete rule name="{name}" >nul 2>nul'
             for name in _FW_LEGACY_RULE_NAMES
         ]
-        parts.append(netsh + " " + " ".join(
-            f'name="{FW_RULE_NAME}"' if a.startswith("name=") else a
-            for a in _FW_ADD_ARGS))
+        if blocked and _owned_program_rules():
+            parts.append(f'{netsh} advfirewall firewall delete rule name=all dir=in '
+                         f'program="{_self_program()}" >nul 2>nul')
+        if not have:                     # netsh add happily makes a duplicate
+            parts.append(netsh + " " + " ".join(
+                f'name="{FW_RULE_NAME}"' if a.startswith("name=") else a
+                for a in _FW_ADD_ARGS))
         # cmd.exe /c strips one pair of outer quotes when the line starts with one,
         # so wrap the whole chain in an extra pair to keep netsh's path quoted.
         _run_elevated_and_wait(win_exe("cmd.exe"), '/c "' + " & ".join(parts) + '"')
-        return firewall_rule_exists()
+        return firewall_rule_exists() and not firewall_block_rules()
     return False
+
+
+def _firewall_remove_ours():
+    """Delete LazeR's rules (ours, the legacy ones, any Windows made for the exe) in
+    one elevated shell. Returns True when none of ours is left."""
+    import subprocess
+    netsh = f'"{win_exe("netsh.exe")}"'
+    # The legacy rules count too: an install from before the v2 name left one.
+    # One cheap read, so a clean machine never sees a UAC prompt for nothing.
+    present = [n for n in (FW_RULE_NAME,) + _FW_LEGACY_RULE_NAMES if _fw_rule_named(n)]
+    ours = _owned_program_rules()
+    if not present and not ours:
+        return True
+    parts = [f'{netsh} advfirewall firewall delete rule name="{name}" >nul 2>nul'
+             for name in present]
+    if ours:
+        parts.append(f'{netsh} advfirewall firewall delete rule name=all dir=in '
+                     f'program="{_self_program()}" >nul 2>nul')
+    chain = '/c "' + " & ".join(parts) + '"'
+    if is_admin():
+        # One string, not a list: list2cmdline would turn the inner quotes into \"
+        # which cmd.exe doesn't understand.
+        try:
+            subprocess.run(f'"{win_exe("cmd.exe")}" {chain}', capture_output=True,
+                           timeout=20, creationflags=_no_window_flags())
+        except Exception:
+            pass
+    else:
+        _run_elevated_and_wait(win_exe("cmd.exe"), chain)
+    return not firewall_rule_exists()
+
+
+def _fw_rule_named(name):
+    import subprocess
+    try:
+        r = subprocess.run(
+            [win_exe("netsh.exe"), "advfirewall", "firewall", "show", "rule",
+             f"name={name}"],
+            capture_output=True, text=True, timeout=6,
+            creationflags=_no_window_flags())
+        return r.returncode == 0 and "No rules match" not in r.stdout
+    except Exception:
+        return False
+
+
+def _owned_program_rules():
+    """True when rules tied to this program are ours to delete: only a frozen
+    LazeR.exe. From source the program is python.exe, and deleting its rules would
+    strip every other Python app's firewall exceptions."""
+    return (getattr(sys, "frozen", False) and _cmd_safe(_self_program())
+            and bool(firewall_block_rules()))
+
+
+def uninstall():
+    """Undo everything LazeR set up for this user, for --uninstall. Returns the
+    report; sets uninstall.failed when something was left behind."""
+    uninstall.failed = False
+    try:
+        socket.create_connection(("127.0.0.1", SINGLETON_PORT), timeout=0.5).close()
+        uninstall.failed = True
+        return ("[uninstall] LazeR is still running. Quit it from its tray icon "
+                "(right-click → Quit), then run --uninstall again.")
+    except OSError:
+        pass                             # nothing running: carry on
+    done, left = [], []
+    if sys.platform.startswith("win"):
+        _remove_legacy_lnk()
+        if not startup_enabled() or set_startup(False):
+            done.append("the Start with Windows entry")
+        else:
+            left.append("the Start with Windows entry (Task Manager → Startup apps)")
+        if _firewall_remove_ours():
+            done.append("the firewall rule")
+        else:
+            left.append(f"the firewall rule “{FW_RULE_NAME}” (the admin prompt was "
+                        "declined — run --uninstall again and choose Yes)")
+    stale = remove_data_dir()
+    for name in (".lazer_token", ".lazer_key"):   # a pair from before 2.4
+        try:
+            os.remove(os.path.join(_APP_DIR, name))
+        except OSError:
+            pass
+    if stale:
+        left.append("the saved pairing in " + _DATA_DIR)
+    else:
+        done.append("the saved pairing")
+    uninstall.failed = bool(left)
+    msg = "[uninstall] removed " + ", ".join(done) + "." if done else "[uninstall]"
+    if left:
+        msg += "\n[uninstall] couldn't remove " + "; ".join(left) + "."
+    else:
+        msg += " You can delete the LazeR program now."
+    return msg
+
+
+uninstall.failed = False
 
 
 _VPN_NEEDLES = ("vpn", "forti", "wireguard", "openvpn", "tap-", "tun",
@@ -3010,8 +3243,9 @@ def serve_loop(wire, emit, net, hostname):
                 if announce_network(net, hostname, wire, emit, ip):
                     emit("log", f"Reachable at {ip}")
             except Exception as e:
-                emit("warn", f"Couldn't announce this laptop for discovery ({e}). "
-                             "Phones can still connect by QR; LazeR retries by itself.")
+                emit("log", f"Discovery announce failed: {type(e).__name__}: {e}")
+                emit("warn", "Phones can't find this laptop on the network right now. "
+                             "Scanning the QR still works, and LazeR keeps retrying.")
             finally:
                 announce_busy.clear()
 
@@ -3344,8 +3578,9 @@ def serve_loop(wire, emit, net, hostname):
                         what = (what(rest) or (verb,))[0] if what else verb
                     except Exception:
                         what = verb
-                    emit("warn", f"Couldn't do “{what}” ({verb}) on this laptop and "
-                                 f"skipped it ({type(e).__name__}: {e}).")
+                    emit("log", f"{verb} failed: {type(e).__name__}: {e}")
+                    emit("warn", f"“{what}” doesn't work on this laptop, so LazeR "
+                                 "skipped it. Everything else still works.")
     finally:
         # Runs on a clean shutdown AND on a crash serve_forever will restart us from:
         # release a held button, clear the connected state and the wake hold, and close
@@ -3400,9 +3635,9 @@ def serve_forever(wire, emit, net, hostname):
                 failures = 0
             failures += 1
             emit("loopdown")
-            emit("warn", f"The connection service hit an error and restarted "
-                         f"itself ({type(e).__name__}: {e}). The phone reconnects "
-                         "on its own.")
+            emit("log", f"Receive loop crashed: {type(e).__name__}: {e}")
+            emit("warn", "LazeR's connection hit a problem and restarted itself. "
+                         "The phone reconnects on its own.")
             # Back off a little so a hard-failing loop (e.g. the port genuinely
             # taken) doesn't spin the CPU, but stay responsive enough that the
             # phone's own retry finds us again within a few seconds.
@@ -3430,6 +3665,71 @@ _C = {
 # after a network change and a wake. Moving to a Public or policy-locked network
 # is the most common real-world failure, and it can happen with no address change.
 FW_RECHECK_MS = 5 * 60 * 1000
+
+
+# Screen pixels per layout pixel. The window's paddings and drawings are written
+# for 96 DPI; _px() scales them so a DPI-aware window keeps its proportions.
+_UI_SCALE = [1.0]
+
+
+def _px(n):
+    return int(round(n * _UI_SCALE[0]))
+
+
+# DPI awareness is process-wide, so it reaches SetCursorPos too: an unaware process
+# moves in 96-DPI units (a 10 px delta = 15 real pixels at 150%), an aware one in
+# real pixels. Scale the phone's deltas back up, or the GUI's cursor is a third
+# slower than --no-gui's (which never turns awareness on, so its scale stays 1).
+# The remainder carries over, so slow drags don't lose their fraction every packet.
+# Only the receive loop calls this.
+_move_residual = [0.0, 0.0]
+
+
+def _dpi_move(dx, dy):
+    s = _UI_SCALE[0]
+    if s == 1.0:
+        return dx, dy
+    fx, fy = dx * s + _move_residual[0], dy * s + _move_residual[1]
+    ix, iy = int(round(fx)), int(round(fy))
+    _move_residual[0], _move_residual[1] = fx - ix, fy - iy
+    return ix, iy
+
+
+def _win_dpi_scale():
+    """Make this process system-DPI-aware and return the display scale (1.5 at
+    150%). Without it Windows bitmap-stretches the window and every glyph and the
+    QR are blurry. System-aware, not per-monitor: Tk 8.6 doesn't re-layout on
+    WM_DPICHANGED, so per-monitor would draw at the wrong size on a second screen.
+    Must run before the first Tk window exists."""
+    if not sys.platform.startswith("win"):
+        return 1.0
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)   # PROCESS_SYSTEM_DPI_AWARE
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()        # Windows 7/8
+        try:
+            dpi = ctypes.windll.user32.GetDpiForSystem()     # Windows 10 1607+
+        except Exception:
+            hdc = ctypes.windll.user32.GetDC(None)
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+            ctypes.windll.user32.ReleaseDC(None, hdc)
+        return max(1.0, dpi / 96.0)
+    except Exception:
+        return 1.0
+
+
+def _win_app_id():
+    """Give the process its own taskbar identity, so the taskbar shows LazeR's icon
+    and groups/pins it as LazeR rather than as python/pythonw."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LazeR")
+    except Exception:
+        pass
 
 
 def qr_box_size(screen_h):
@@ -3464,14 +3764,22 @@ class LazeRWindow:
         uri = build_uri(ip, wire.token, self._hostname, wire.key) if ip else None
         token = wire.token
 
+        _UI_SCALE[0] = _win_dpi_scale()
+        _win_app_id()
         root = tk.Tk()
         self._root = root
+        self._placed = False         # centred once; after that the user's position wins
         root.title("LazeR")
         root.configure(bg=_C["bg"])
+        try:
+            # The title bar and taskbar would otherwise show Tk's feather.
+            root.iconbitmap(default=ICON_FILE)
+        except Exception:
+            pass
         # Resizable, so large text scaling can't push controls off a fixed window.
         root.resizable(True, True)
         try:
-            root.tk.call("tk", "scaling", 1.25)
+            root.tk.call("tk", "scaling", 1.25 * _UI_SCALE[0])
         except Exception:
             pass
 
@@ -3500,7 +3808,7 @@ class LazeRWindow:
         self._vbar = tk.Scrollbar(root, orient="vertical", command=self._canvas.yview)
         self._canvas.configure(yscrollcommand=self._vbar.set)
         self._canvas.pack(side="left", fill="both", expand=True)
-        outer = tk.Frame(self._canvas, bg=_C["bg"], padx=22, pady=18)
+        outer = tk.Frame(self._canvas, bg=_C["bg"], padx=_px(22), pady=_px(18))
         self._outer = outer
         self._outer_win = self._canvas.create_window(0, 0, window=outer, anchor="nw")
         outer.bind("<Configure>", lambda e: self._canvas.configure(
@@ -3517,7 +3825,7 @@ class LazeRWindow:
 
         # swap area: QR card (not connected) <-> connected panel
         self._swap = tk.Frame(outer, bg=_C["bg"])
-        self._swap.pack(fill="x", pady=(14, 0))
+        self._swap.pack(fill="x", pady=(_px(14), 0))
         self._build_connect_card(self._swap, uri, token)
         self._build_connected_panel(self._swap)
         self._show_qr_view()   # first start: show the QR
@@ -3637,7 +3945,7 @@ class LazeRWindow:
         root = self._root
         root.update_idletasks()
         w, h = self._outer.winfo_reqwidth(), self._outer.winfo_reqheight()
-        avail = root.winfo_screenheight() - 80
+        avail = root.winfo_screenheight() - _px(80)
         if h > avail:
             self._vbar.pack(side="right", fill="y", before=self._canvas)
         else:
@@ -3680,7 +3988,7 @@ class LazeRWindow:
         tk = self._tk
         border = tk.Frame(parent, bg=_C["border"])
         inner = tk.Frame(border, bg=_C["card"])
-        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        inner.pack(fill="both", expand=True, padx=_px(1), pady=_px(1))
         border.pack(**pack)
         return inner
 
@@ -3694,35 +4002,36 @@ class LazeRWindow:
         bar = tk.Frame(parent, bg=_C["bg"])
         bar.pack(fill="x")
 
-        badge = tk.Canvas(bar, width=30, height=30, bg=_C["bg"],
+        badge = tk.Canvas(bar, width=_px(30), height=_px(30), bg=_C["bg"],
                           highlightthickness=0, bd=0)
         badge.pack(side="left")
         badge.create_oval(2, 2, 28, 28, fill=_C["accent2"], outline=_C["accent"])
         badge.create_oval(11, 11, 19, 19, fill=_C["accent"], outline="")
-        badge.create_line(15, 4, 15, 9, fill=_C["accent"], width=2)
-        badge.create_line(15, 21, 15, 26, fill=_C["accent"], width=2)
-        badge.create_line(4, 15, 9, 15, fill=_C["accent"], width=2)
-        badge.create_line(21, 15, 26, 15, fill=_C["accent"], width=2)
+        badge.create_line(15, 4, 15, 9, fill=_C["accent"], width=_px(2))
+        badge.create_line(15, 21, 15, 26, fill=_C["accent"], width=_px(2))
+        badge.create_line(4, 15, 9, 15, fill=_C["accent"], width=_px(2))
+        badge.create_line(21, 15, 26, 15, fill=_C["accent"], width=_px(2))
+        badge.scale("all", 0, 0, _UI_SCALE[0], _UI_SCALE[0])
 
         tk.Label(bar, text="LazeR", bg=_C["bg"], fg=_C["fg"],
-                 font=self.f_brand).pack(side="left", padx=(9, 0))
+                 font=self.f_brand).pack(side="left", padx=(_px(9), 0))
         tk.Label(bar, text="LAN Remote", bg=_C["bg"], fg=_C["faint"],
-                 font=self.f_sm).pack(side="left", padx=(8, 0), pady=(4, 0))
+                 font=self.f_sm).pack(side="left", padx=(_px(8), 0), pady=(_px(4), 0))
 
         quit_btn = tk.Label(bar, text="Quit", bg=_C["bg"], fg=_C["faint"],
-                            font=self.f_sm, cursor="hand2", padx=6)
-        quit_btn.pack(side="right", pady=(4, 0), padx=(10, 0))
+                            font=self.f_sm, cursor="hand2", padx=_px(6))
+        quit_btn.pack(side="right", pady=(_px(4), 0), padx=(_px(10), 0))
         self._clickable(quit_btn, self._real_quit)
 
         run = tk.Frame(bar, bg=_C["bg"])
-        run.pack(side="right", pady=(4, 0))
+        run.pack(side="right", pady=(_px(4), 0))
         # Driven by the receive loop's own events, so it goes dark with a dead loop.
         self._run_dot = tk.Label(run, text="●", bg=_C["bg"], fg=_C["faint"],
                                  font=self.f_sm)
         self._run_dot.pack(side="left")
         self._run_txt = tk.Label(run, text="starting…", bg=_C["bg"], fg=_C["dim"],
                                  font=self.f_sm)
-        self._run_txt.pack(side="left", padx=(5, 0))
+        self._run_txt.pack(side="left", padx=(_px(5), 0))
 
     def _set_serving(self, ok):
         self._run_dot.config(fg=_C["ok"] if ok else _C["warn"])
@@ -3731,27 +4040,29 @@ class LazeRWindow:
     # ── hero status card ────────────────────────────────────────────────────
     def _build_hero(self, parent):
         tk = self._tk
-        card = self._card(parent, fill="x", pady=(14, 0))
-        pad = tk.Frame(card, bg=_C["card"], padx=16, pady=14)
+        card = self._card(parent, fill="x", pady=(_px(14), 0))
+        pad = tk.Frame(card, bg=_C["card"], padx=_px(16), pady=_px(14))
         pad.pack(fill="x")
 
         # circular avatar with overlaid status dot
-        self._avatar = tk.Canvas(pad, width=52, height=52, bg=_C["card"],
+        self._avatar = tk.Canvas(pad, width=_px(52), height=_px(52), bg=_C["card"],
                                  highlightthickness=0, bd=0)
         self._avatar.pack(side="left")
         self._avatar.create_oval(2, 2, 50, 50, fill=_C["card2"],
                                  outline=_C["border"])
         self._avatar.create_text(26, 25, text="🖥", font=("Segoe UI Emoji", 17))
         self._dotid = self._avatar.create_oval(
-            36, 36, 50, 50, fill=_C["faint"], outline=_C["card"], width=2)
+            36, 36, 50, 50, fill=_C["faint"], outline=_C["card"], width=_px(2))
+        # Scales coordinates only; the emoji's point size already follows tk scaling.
+        self._avatar.scale("all", 0, 0, _UI_SCALE[0], _UI_SCALE[0])
 
         col = tk.Frame(pad, bg=_C["card"])
-        col.pack(side="left", padx=(14, 0), anchor="w")
+        col.pack(side="left", padx=(_px(14), 0), anchor="w")
         tk.Label(col, text=socket.gethostname(), bg=_C["card"], fg=_C["fg"],
                  font=self.f_hero).pack(anchor="w")
         self._status = tk.Label(col, text="Waiting for phone to connect…",
                                 bg=_C["card"], fg=_C["dim"], font=self.f_sm)
-        self._status.pack(anchor="w", pady=(2, 0))
+        self._status.pack(anchor="w", pady=(_px(2), 0))
 
     # ── notice banner: the latest warning, on the main screen ────────────────
     def _build_notice_banner(self, parent):
@@ -3760,15 +4071,16 @@ class LazeRWindow:
         tk = self._tk
         self._notice_wrap = tk.Frame(parent, bg=_C["bg"])   # packed on demand
         border = tk.Frame(self._notice_wrap, bg=_C["warn"])
-        border.pack(fill="x", pady=(12, 0))
-        inner = tk.Frame(border, bg=_C["card"], padx=14, pady=10)
-        inner.pack(fill="both", expand=True, padx=1, pady=1)
+        border.pack(fill="x", pady=(_px(12), 0))
+        inner = tk.Frame(border, bg=_C["card"], padx=_px(14), pady=_px(10))
+        inner.pack(fill="both", expand=True, padx=_px(1), pady=_px(1))
         self._notice_txt = tk.Label(inner, text="", bg=_C["card"], fg=_C["warn"],
-                                    font=self.f_sm, justify="left", wraplength=420)
+                                    font=self.f_sm, justify="left", anchor="w",
+                                    wraplength=_px(420))
         self._notice_txt.pack(side="left", anchor="w", fill="x", expand=True)
         dismiss = tk.Label(inner, text="Dismiss", bg=_C["card2"], fg=_C["fg"],
-                           font=self.f_sm, cursor="hand2", padx=10, pady=4)
-        dismiss.pack(side="right", padx=(10, 0))
+                           font=self.f_sm, cursor="hand2", padx=_px(10), pady=_px(4))
+        dismiss.pack(side="right", padx=(_px(10), 0))
         self._clickable(dismiss, self._clear_notice)
 
     def _warn(self, msg):
@@ -3795,26 +4107,26 @@ class LazeRWindow:
         self._banner_wrap = tk.Frame(parent, bg=_C["bg"])
         # packed/unpacked dynamically by _set_paused
         border = tk.Frame(self._banner_wrap, bg=_C["warn"])
-        border.pack(fill="x", pady=(12, 0))
+        border.pack(fill="x", pady=(_px(12), 0))
         pad = tk.Frame(border, bg=_C["card"])
-        pad.pack(fill="both", expand=True, padx=2, pady=2)
-        inner = tk.Frame(pad, bg=_C["card"], padx=14, pady=12)
+        pad.pack(fill="both", expand=True, padx=_px(2), pady=_px(2))
+        inner = tk.Frame(pad, bg=_C["card"], padx=_px(14), pady=_px(12))
         inner.pack(fill="x")
         self._banner_title = tk.Label(inner, text="", bg=_C["card"], fg=_C["warn"],
                                       font=self.f_hero)
         self._banner_title.pack(anchor="w")
         self._banner_sub = tk.Label(inner, text="", bg=_C["card"], fg=_C["dim"],
                                     font=self.f_sm, justify="left")
-        self._banner_sub.pack(anchor="w", pady=(2, 8))
+        self._banner_sub.pack(anchor="w", pady=(_px(2), _px(8)))
         btns = tk.Frame(inner, bg=_C["card"])
         btns.pack(anchor="w")
         resume = tk.Label(btns, text="Resume remote", bg=_C["accent"], fg=_C["bg"],
-                          font=self.f_sm, cursor="hand2", padx=14, pady=6)
+                          font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(6))
         resume.pack(side="left")
         self._clickable(resume, self._do_resume)
         quitb = tk.Label(btns, text="Quit LazeR", bg=_C["card2"], fg=_C["fg"],
-                         font=self.f_sm, cursor="hand2", padx=14, pady=6)
-        quitb.pack(side="left", padx=(8, 0))
+                         font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(6))
+        quitb.pack(side="left", padx=(_px(8), 0))
         self._clickable(quitb, self._real_quit)
 
     def _set_paused(self, latched):
@@ -3848,26 +4160,26 @@ class LazeRWindow:
         self._fw_ok = None
         self._fw_wrap = tk.Frame(parent, bg=_C["bg"])   # packed/unpacked dynamically
         border = tk.Frame(self._fw_wrap, bg=_C["warn"])
-        border.pack(fill="x", pady=(12, 0))
+        border.pack(fill="x", pady=(_px(12), 0))
         pad = tk.Frame(border, bg=_C["card"])
-        pad.pack(fill="both", expand=True, padx=2, pady=2)
-        inner = tk.Frame(pad, bg=_C["card"], padx=14, pady=12)
+        pad.pack(fill="both", expand=True, padx=_px(2), pady=_px(2))
+        inner = tk.Frame(pad, bg=_C["card"], padx=_px(14), pady=_px(12))
         inner.pack(fill="x")
         tk.Label(inner, text="Phones can't reach this laptop", bg=_C["card"],
                  fg=_C["warn"], font=self.f_hero).pack(anchor="w")
         self._fw_sub = tk.Label(inner, text="", bg=_C["card"], fg=_C["dim"],
-                                font=self.f_sm, justify="left")
-        self._fw_sub.pack(anchor="w", pady=(2, 8))
+                                font=self.f_sm, justify="left", wraplength=_px(460))
+        self._fw_sub.pack(anchor="w", pady=(_px(2), _px(8)))
         btns = tk.Frame(inner, bg=_C["card"])
         btns.pack(anchor="w")
         self._fw_btn = tk.Label(btns, text="Allow through firewall", bg=_C["accent"],
                                 fg=_C["bg"], font=self.f_sm, cursor="hand2",
-                                padx=14, pady=6)
+                                padx=_px(14), pady=_px(6))
         self._fw_btn.pack(side="left")
         self._clickable(self._fw_btn, self._fix_firewall)
         self._fw_dismiss = tk.Label(btns, text="Dismiss", bg=_C["card2"], fg=_C["fg"],
-                                    font=self.f_sm, cursor="hand2", padx=14, pady=6)
-        self._fw_dismiss.pack(side="left", padx=(8, 0))
+                                    font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(6))
+        self._fw_dismiss.pack(side="left", padx=(_px(8), 0))
         self._clickable(self._fw_dismiss, self._dismiss_firewall_banner)
         self._fw_inert = False
 
@@ -3887,17 +4199,18 @@ class LazeRWindow:
             ok = firewall_rule_exists()
             vpn = detect_vpn()
             inert = firewall_rule_is_inert()
-            self._root.after(0, lambda: self._on_firewall_status(ok, vpn, inert))
+            blocks = firewall_block_rules()
+            self._root.after(0, lambda: self._on_firewall_status(ok, vpn, inert, blocks))
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_firewall_status(self, ok, vpn, inert=None):
+    def _on_firewall_status(self, ok, vpn, inert=None, blocks=()):
         # A rule that EXISTS is not the same as a rule that WORKS. When policy
         # discards local rules on the profile we're on, the rule reads back as
         # Enabled/Allow/Profile=Any and Windows drops the packets anyway — so a
         # green pill here is a lie that costs hours. Count it as blocked.
         blocked_now = bool(inert and inert[1])
         was_ok = self._fw_ok
-        self._fw_ok = ok and not blocked_now
+        self._fw_ok = ok and not blocked_now and not blocks
         self._fw_inert = blocked_now
         if self._fw_ok is False and was_ok is not False:
             self._fw_dismissed = False       # a NEW problem deserves the banner again
@@ -3920,6 +4233,17 @@ class LazeRWindow:
             # Adding the rule again cannot help, so don't offer a button that
             # would just spend a UAC prompt to change nothing.
             sub = advice
+            self._fw_btn.pack_forget()
+        elif blocks and _owned_program_rules():
+            sub = ("Windows Firewall has a rule blocking LazeR — usually from clicking "
+                   "Cancel when Windows asked about it. One click removes it and "
+                   "allows phones in (asks for admin once).")
+            self._fw_btn.pack(side="left", before=self._fw_dismiss)
+        elif blocks:
+            # From source (the rule names python.exe) or a path cmd.exe can't carry,
+            # the button can't remove it — don't spend a UAC prompt on failing.
+            sub = ("Windows Firewall has a rule blocking “" + blocks[0] + "”. Remove it "
+                   "in Windows Defender Firewall › Advanced settings › Inbound Rules.")
             self._fw_btn.pack_forget()
         else:
             sub = (f"Windows Firewall is dropping inbound traffic on UDP {PORT}, so phones "
@@ -4052,13 +4376,13 @@ class LazeRWindow:
         tk = self._tk
         card = self._card(parent, fill="x")
         self._connect_border = card.master   # the bordered frame, for show/hide
-        pad = tk.Frame(card, bg=_C["card"], padx=20, pady=18)
+        pad = tk.Frame(card, bg=_C["card"], padx=_px(20), pady=_px(18))
         pad.pack(fill="x")
 
         tk.Label(pad, text="Connect your phone", bg=_C["card"], fg=_C["fg"],
                  font=self.f_hero).pack()
         tk.Label(pad, text="Open the LazeR app and scan this code",
-                 bg=_C["card"], fg=_C["dim"], font=self.f_md).pack(pady=(3, 0))
+                 bg=_C["card"], fg=_C["dim"], font=self.f_md).pack(pady=(_px(3), 0))
 
         self._qr_img_label = None
         self._make_qr_photo = None
@@ -4079,9 +4403,9 @@ class LazeRWindow:
             # code below the pairing chip and the plaintext note after the first
             # idle hide, and left it there.
             slot = tk.Frame(pad, bg=_C["card"])
-            slot.pack(pady=(16, 14))
+            slot.pack(pady=(_px(16), _px(14)))
             self._qr_slot = slot
-            holder = tk.Frame(slot, bg="#FFFFFF", padx=10, pady=10)
+            holder = tk.Frame(slot, bg="#FFFFFF", padx=_px(10), pady=_px(10))
             holder.pack()
             self._qr_img_label = tk.Label(holder, image=self._photo, bg="#FFFFFF")
             self._qr_img_label.pack()
@@ -4100,7 +4424,7 @@ class LazeRWindow:
         except ImportError:
             tk.Label(pad, text="Install Pillow for the QR image:\npip install pillow",
                      bg=_C["card"], fg=_C["dim"], font=self.f_sm,
-                     width=24, height=10, justify="center").pack(pady=16)
+                     width=24, height=10, justify="center").pack(pady=_px(16))
 
         # Typed-code pairing. Encryption is required by default, and the typed code
         # is the plaintext wire, so it is shown only while it can work.
@@ -4109,17 +4433,17 @@ class LazeRWindow:
         tk.Label(self._code_box, text="No scanner? Type this pairing code in the app",
                  bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack()
         chip = tk.Frame(self._code_box, bg=_C["card2"])
-        chip.pack(pady=(8, 0))
+        chip.pack(pady=(_px(8), 0))
         self._token_chip = tk.Label(chip, text=token, bg=_C["card2"], fg=_C["accent"],
-                                    font=self.f_tok, padx=16, pady=6)
+                                    font=self.f_tok, padx=_px(16), pady=_px(6))
         self._token_chip.pack(side="left")
         self._copy_btn = tk.Label(chip, text="Copy", bg=_C["accent2"], fg=_C["fg"],
-                                  font=self.f_sm, cursor="hand2", padx=14, pady=6)
+                                  font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(6))
         self._copy_btn.pack(side="left")
         self._clickable(self._copy_btn, lambda: self._copy(self._wire.token))
         tk.Label(self._code_box, text="(Typed-code pairing is NOT encrypted — "
                  "scan the QR when you can)",
-                 bg=_C["card"], fg=_C["warn"], font=self.f_lbl).pack(pady=(6, 0))
+                 bg=_C["card"], fg=_C["warn"], font=self.f_lbl).pack(pady=(_px(6), 0))
         self._copy_btn.bind("<Enter>",
                             lambda e: self._copy_btn.config(bg=_C["accent"]))
         self._copy_btn.bind("<Leave>",
@@ -4127,7 +4451,7 @@ class LazeRWindow:
         self._code_off = tk.Label(
             pad, text="Only QR pairing is on (encrypted). Typed-code pairing can be "
                       "allowed under Show details → Require encryption.",
-            bg=_C["card"], fg=_C["faint"], font=self.f_sm, wraplength=360,
+            bg=_C["card"], fg=_C["faint"], font=self.f_sm, wraplength=_px(360),
             justify="center")
         self._refresh_code_box()
         self._arm_qr_hide()
@@ -4145,45 +4469,48 @@ class LazeRWindow:
         tk = self._tk
         card = self._card(parent, fill="x")
         self._connected_border = card.master
-        pad = tk.Frame(card, bg=_C["card"], padx=20, pady=22)
+        pad = tk.Frame(card, bg=_C["card"], padx=_px(20), pady=_px(22))
         pad.pack(fill="x")
 
-        check = tk.Canvas(pad, width=44, height=44, bg=_C["card"],
+        check = tk.Canvas(pad, width=_px(44), height=_px(44), bg=_C["card"],
                           highlightthickness=0, bd=0)
         check.pack()
         check.create_oval(2, 2, 42, 42, fill=_C["card2"], outline=_C["ok"])
-        check.create_line(13, 23, 20, 30, fill=_C["ok"], width=3,
+        check.create_line(13, 23, 20, 30, fill=_C["ok"], width=_px(3),
                           capstyle="round")
-        check.create_line(20, 30, 32, 15, fill=_C["ok"], width=3,
+        check.create_line(20, 30, 32, 15, fill=_C["ok"], width=_px(3),
                           capstyle="round")
+        check.scale("all", 0, 0, _UI_SCALE[0], _UI_SCALE[0])
 
         tk.Label(pad, text="Phone connected", bg=_C["card"], fg=_C["fg"],
-                 font=self.f_hero).pack(pady=(10, 0))
+                 font=self.f_hero).pack(pady=(_px(10), 0))
         self._connected_sub = tk.Label(
             pad, text="Your phone is now controlling this computer",
             bg=_C["card"], fg=_C["dim"], font=self.f_md)
-        self._connected_sub.pack(pady=(3, 0))
+        self._connected_sub.pack(pady=(_px(3), 0))
 
         btns = tk.Frame(pad, bg=_C["card"])
-        btns.pack(pady=(16, 0))
+        btns.pack(pady=(_px(16), 0))
         show_qr = tk.Label(btns, text="Show QR code", bg=_C["card2"],
                            fg=_C["dim"], font=self.f_sm, cursor="hand2",
-                           padx=16, pady=7)
+                           padx=_px(16), pady=_px(7))
         show_qr.pack(side="left")
         self._clickable(show_qr, self._show_qr_view)
         show_qr.bind("<Enter>", lambda e: show_qr.config(fg=_C["accent"]))
         show_qr.bind("<Leave>", lambda e: show_qr.config(fg=_C["dim"]))
         kick = tk.Label(btns, text="New code (disconnects phone)…", bg=_C["card2"],
                         fg=_C["dim"], font=self.f_sm, cursor="hand2",
-                        padx=16, pady=7)
-        kick.pack(side="left", padx=(8, 0))
+                        padx=_px(16), pady=_px(7))
+        kick.pack(side="left", padx=(_px(8), 0))
         self._clickable(kick, self._confirm_regenerate)
         tk.Label(pad, text="After a drop or a sleep the phone reconnects by itself.",
-                 bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(pady=(8, 0))
+                 bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(pady=(_px(8), 0))
 
     def _build_qr_maker(self, qrcode, ImageTk):
         """Return a fn uri -> PhotoImage, so the QR can be rebuilt after an IP change."""
-        box = qr_box_size(self._root.winfo_screenheight())
+        # Sized for the screen in layout pixels, then drawn in real ones.
+        s = _UI_SCALE[0]
+        box = max(1, round(qr_box_size(self._root.winfo_screenheight() / s) * s))
 
         def make(uri):
             qr = qrcode.QRCode(border=2, box_size=box,
@@ -4268,9 +4595,9 @@ class LazeRWindow:
             rotate_secrets(self._wire)
         except OSError as e:
             # Nothing was swapped: the current pairing still works (see rotate_secrets).
-            self._warn(f"Couldn't save a new pairing code ({e}). Nothing changed — the "
-                       "current code still works. Move LazeR to a folder you can "
-                       "write to (e.g. Documents) and try again.")
+            self._log(f"Saving the new pairing failed: {e}", "warn")
+            self._warn("Couldn't save a new pairing code. Nothing changed — the "
+                       "current code still works.")
             return
         self._token = self._wire.token
         if self._ip:
@@ -4361,7 +4688,7 @@ class LazeRWindow:
     def _build_details_toggle(self, parent):
         tk = self._tk
         bar = tk.Frame(parent, bg=_C["bg"])
-        bar.pack(fill="x", pady=(12, 0))
+        bar.pack(fill="x", pady=(_px(12), 0))
         self._toggle = tk.Label(bar, text="Show details  ▾", bg=_C["bg"],
                                 fg=_C["faint"], font=self.f_sm, cursor="hand2")
         self._toggle.pack()
@@ -4372,14 +4699,14 @@ class LazeRWindow:
     # ── details panel: network info, services, activity ───────────────────────
     def _build_details(self, parent, ip, port, token):
         tk = self._tk
-        card = self._card(parent, fill="both", expand=True, pady=(12, 0))
-        pad = tk.Frame(card, bg=_C["card"], padx=16, pady=14)
+        card = self._card(parent, fill="both", expand=True, pady=(_px(12), 0))
+        pad = tk.Frame(card, bg=_C["card"], padx=_px(16), pady=_px(14))
         pad.pack(fill="both", expand=True)
         self._section_label(pad, "Network")
 
         def row(label, value):
             f = tk.Frame(pad, bg=_C["card"])
-            f.pack(fill="x", pady=(8, 0))
+            f.pack(fill="x", pady=(_px(8), 0))
             tk.Label(f, text=label, bg=_C["card"], fg=_C["dim"],
                      font=self.f_md, width=9, anchor="w").pack(side="left")
             val = tk.Label(f, text=value, bg=_C["card"], fg=_C["fg"],
@@ -4398,7 +4725,7 @@ class LazeRWindow:
         if others:
             row("Also at", ", ".join(others[:3]))
 
-        tk.Frame(pad, bg=_C["border"], height=1).pack(fill="x", pady=(14, 12))
+        tk.Frame(pad, bg=_C["border"], height=1).pack(fill="x", pady=(_px(14), _px(12)))
 
         vol_ok = VOLUME_BACKEND is not None
         self._pill(pad, "Volume control",
@@ -4457,7 +4784,7 @@ class LazeRWindow:
     def _build_security_controls(self, parent):
         """Require-encryption toggle + regenerate-code button + panic-key hint."""
         tk = self._tk
-        tk.Frame(parent, bg=_C["border"], height=1).pack(fill="x", pady=(14, 12))
+        tk.Frame(parent, bg=_C["border"], height=1).pack(fill="x", pady=(_px(14), _px(12)))
 
         f = tk.Frame(parent, bg=_C["card"])
         f.pack(fill="x")
@@ -4468,7 +4795,7 @@ class LazeRWindow:
         tk.Label(col, text="Block plaintext (manual-code) phones — QR only",
                  bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(anchor="w")
         self._secure_btn = tk.Label(f, bg=_C["card2"], fg=_C["dim"],
-                                    font=self.f_sm, cursor="hand2", padx=14, pady=5)
+                                    font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(5))
         self._secure_btn.pack(side="right")
         self._clickable(self._secure_btn, self._toggle_secure)
         if not _HAVE_CRYPTO:
@@ -4477,7 +4804,7 @@ class LazeRWindow:
             self._refresh_secure_btn()
 
         r = tk.Frame(parent, bg=_C["card"])
-        r.pack(fill="x", pady=(10, 0))
+        r.pack(fill="x", pady=(_px(10), 0))
         col2 = tk.Frame(r, bg=_C["card"])
         col2.pack(side="left", anchor="w")
         tk.Label(col2, text="Pairing code", bg=_C["card"], fg=_C["fg"],
@@ -4485,7 +4812,7 @@ class LazeRWindow:
         tk.Label(col2, text="Make a new code and QR; every paired phone must rescan",
                  bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(anchor="w")
         regen = tk.Label(r, text="Regenerate", bg=_C["accent2"], fg=_C["fg"],
-                         font=self.f_sm, cursor="hand2", padx=14, pady=5)
+                         font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(5))
         regen.pack(side="right")
         self._clickable(regen, self._confirm_regenerate)
 
@@ -4501,12 +4828,12 @@ class LazeRWindow:
                     "there is no panic key.\nTo stop the remote, quit LazeR or tap back "
                     "on the phone.")
         tk.Label(parent, text=hint, bg=_C["card"], fg=_C["faint"], font=self.f_sm,
-                 justify="left").pack(anchor="w", pady=(10, 0))
+                 justify="left").pack(anchor="w", pady=(_px(10), 0))
 
     def _build_startup_toggle(self, parent):
         """Clickable row: launch LazeR automatically when Windows starts."""
         tk = self._tk
-        tk.Frame(parent, bg=_C["border"], height=1).pack(fill="x", pady=(14, 12))
+        tk.Frame(parent, bg=_C["border"], height=1).pack(fill="x", pady=(_px(14), _px(12)))
         f = tk.Frame(parent, bg=_C["card"])
         f.pack(fill="x")
         col = tk.Frame(f, bg=_C["card"])
@@ -4516,7 +4843,7 @@ class LazeRWindow:
         tk.Label(col, text="Launch LazeR in the tray at login",
                  bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(anchor="w")
         self._startup_btn = tk.Label(f, bg=_C["accent2"], fg=_C["fg"],
-                                     font=self.f_sm, cursor="hand2", padx=14, pady=5)
+                                     font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(5))
         self._startup_btn.pack(side="right")
         self._clickable(self._startup_btn, self._toggle_startup)
         self._refresh_startup_btn()
@@ -4541,37 +4868,37 @@ class LazeRWindow:
     def _pill(self, parent, name, detail, ok):
         tk = self._tk
         f = tk.Frame(parent, bg=_C["card"])
-        f.pack(fill="x", pady=3)
+        f.pack(fill="x", pady=_px(3))
         tk.Label(f, text="●", bg=_C["card"],
                  fg=_C["ok"] if ok else _C["faint"], font=self.f_sm).pack(side="left")
         tk.Label(f, text=name, bg=_C["card"], fg=_C["fg"],
-                 font=self.f_sm).pack(side="left", padx=(7, 0))
+                 font=self.f_sm).pack(side="left", padx=(_px(7), 0))
         tk.Label(f, text=detail, bg=_C["card"], fg=_C["faint"],
-                 font=self.f_sm).pack(side="left", padx=(7, 0))
+                 font=self.f_sm).pack(side="left", padx=(_px(7), 0))
 
     def _mutable_pill(self, parent, name, detail):
         """Like _pill but returns (dot, detail) labels so status can change later."""
         tk = self._tk
         f = tk.Frame(parent, bg=_C["card"])
-        f.pack(fill="x", pady=3)
+        f.pack(fill="x", pady=_px(3))
         dot = tk.Label(f, text="●", bg=_C["card"], fg=_C["faint"], font=self.f_sm)
         dot.pack(side="left")
         tk.Label(f, text=name, bg=_C["card"], fg=_C["fg"],
-                 font=self.f_sm).pack(side="left", padx=(7, 0))
+                 font=self.f_sm).pack(side="left", padx=(_px(7), 0))
         val = tk.Label(f, text=detail, bg=_C["card"], fg=_C["faint"], font=self.f_sm)
-        val.pack(side="left", padx=(7, 0))
+        val.pack(side="left", padx=(_px(7), 0))
         return dot, val
 
     # ── activity feed ─────────────────────────────────────────────────────────
     def _build_activity(self, parent):
         tk = self._tk
-        card = self._card(parent, fill="both", expand=True, pady=(14, 0))
-        pad = tk.Frame(card, bg=_C["card"], padx=16, pady=12)
+        card = self._card(parent, fill="both", expand=True, pady=(_px(14), 0))
+        pad = tk.Frame(card, bg=_C["card"], padx=_px(16), pady=_px(12))
         pad.pack(fill="both", expand=True)
         self._section_label(pad, "Activity")
 
         wrap = tk.Frame(pad, bg=_C["card"])
-        wrap.pack(fill="both", expand=True, pady=(8, 0))
+        wrap.pack(fill="both", expand=True, pady=(_px(8), 0))
         sb = tk.Scrollbar(wrap, orient="vertical")
         sb.pack(side="right", fill="y")
         self._log_txt = tk.Text(
@@ -4627,13 +4954,23 @@ class LazeRWindow:
         # very tall). Cap the height — the activity log scrolls to absorb the rest —
         # and clamp the position so the whole window, especially the bottom controls,
         # stays on screen above the taskbar.
-        avail = sh - 80
+        avail = sh - _px(80)
         if h > avail:
             h = avail
             self._root.geometry(f"{w}x{h}")
             self._root.update_idletasks()
+        if self._placed:
+            # Every connect, banner and details toggle refits the window. Snapping it
+            # back to the middle each time undid wherever the user had put it, even
+            # on another monitor — so after the first show it stays put, and only
+            # moves up when it has grown past the bottom of the screen.
+            y = self._root.winfo_y()
+            if y + h > sh - _px(48):
+                self._root.geometry(f"+{self._root.winfo_x()}+{max(0, sh - h - _px(48))}")
+            return
+        self._placed = True
         x = max(0, (sw - w) // 2)
-        y = max(0, min((sh - h) // 3, sh - h - 48))
+        y = max(0, min((sh - h) // 3, sh - h - _px(48)))
         self._root.geometry(f"+{x}+{y}")
 
     def _copy(self, text):
@@ -4822,7 +5159,7 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
         if not ensure_firewall_rule():
             print(f"  [firewall] Inbound UDP {PORT} appears blocked — phones may not connect.")
             print("             Fix once (accepts a UAC prompt):")
-            print("               python remote_server.py --setup-firewall")
+            print(f"               {_self_invocation()} --setup-firewall")
             vpn = detect_vpn()
             if vpn:
                 print(f"             VPN '{vpn}' is active — if it blocks LAN, also enable "
@@ -4995,7 +5332,15 @@ def _attach_parent_console():
         return False
 
 
-def _cli_say(text, title="LazeR"):
+def _dialog_text(text):
+    """A console line as dialog text: the "[startup] " style tags help in a
+    terminal log, but in a message box they're just developer noise."""
+    import re
+    lines = [re.sub(r"^\[[a-z]+\] ", "", ln) for ln in text.split("\n")]
+    return "\n".join(ln[:1].upper() + ln[1:] for ln in lines)
+
+
+def _cli_say(text, title="LazeR", error=False):
     """Report the outcome of a one-shot CLI action. Prints when there is a
     console; otherwise (a shortcut or Run entry to the windowed exe) shows a
     message box, so the result is never silently lost."""
@@ -5005,7 +5350,8 @@ def _cli_say(text, title="LazeR"):
     if sys.platform.startswith("win"):
         try:
             import ctypes
-            ctypes.windll.user32.MessageBoxW(None, text, title, 0x40)  # MB_ICONINFORMATION
+            icon = 0x30 if error else 0x40   # MB_ICONWARNING / MB_ICONINFORMATION
+            ctypes.windll.user32.MessageBoxW(None, _dialog_text(text), title, icon)
         except Exception:
             pass
 
@@ -5034,8 +5380,9 @@ def _resume_outcome(reply):
     if reply == RESUME_OK:
         return "[resume] remote control resumed."
     if reply == RESUME_DENIED:
-        return ("[resume] the running LazeR refused: this install's pairing code "
-                "doesn't match its own. Run --resume from the same folder as it.")
+        return ("[resume] the running LazeR refused: its pairing code doesn't match "
+                "this one's. It may be an older version, or running as another "
+                "Windows user.")
     return ("[resume] sent, but the running LazeR didn't confirm (a version older "
             "than this one doesn't). Check its window.")
 
@@ -5094,27 +5441,38 @@ def main():
                          "tray) and exit")
     ap.add_argument("--disable-startup", action="store_true",
                     help="remove the launch-at-login registration and exit")
+    ap.add_argument("--uninstall", action="store_true",
+                    help="remove everything LazeR set up — the launch-at-login entry, "
+                         "its firewall rule (one admin prompt) and the saved pairing "
+                         "— and exit. Then delete the exe")
     args = ap.parse_args()
+    if not args.uninstall:
+        migrate_legacy_secrets()
 
     if args.enable_startup or args.disable_startup:
         if not sys.platform.startswith("win"):
-            _cli_say("[startup] launch-at-login is Windows-only.")
+            _cli_say("[startup] launch-at-login is Windows-only.", error=True)
             return
         want = args.enable_startup
         if set_startup(want):
-            _cli_say(f"[startup] launch-at-login {'enabled' if want else 'disabled'}."
-                     + ("\n[startup] registered under HKCU\\...\\Run as 'LazeR' — it now "
-                        "appears in Task Manager → Startup apps." if want else ""))
+            _cli_say("[startup] LazeR now starts in the tray when you sign in to "
+                     "Windows. Turn it off in Task Manager → Startup apps or in "
+                     "LazeR's Show details." if want else
+                     "[startup] LazeR no longer starts when you sign in to Windows.")
         else:
             reason = getattr(set_startup, "last_error", "") or "unknown error"
-            _cli_say(f"[startup] could not change launch-at-login: {reason}")
+            _cli_say(f"[startup] could not change launch-at-login: {reason}", error=True)
+        return
+
+    if args.uninstall:
+        _cli_say(uninstall(), error=bool(getattr(uninstall, "failed", False)))
         return
 
     if args.resume:
         try:
             c = socket.create_connection(("127.0.0.1", SINGLETON_PORT), timeout=1.0)
         except OSError:
-            _cli_say("[resume] no running LazeR found — start it first.")
+            _cli_say("[resume] no running LazeR found — start it first.", error=True)
             sys.exit(1)
         reply = b""
         try:
@@ -5125,8 +5483,9 @@ def main():
             pass
         finally:
             c.close()
-        _cli_say(_resume_outcome(reply))
-        sys.exit(_resume_exit_code(reply))
+        code = _resume_exit_code(reply)
+        _cli_say(_resume_outcome(reply), error=code != 0)
+        sys.exit(code)
 
     if args.regenerate:
         wire = Wire(load_or_create_token(), load_or_create_key(), True)
@@ -5134,7 +5493,7 @@ def main():
             token, _ = rotate_secrets(wire)
         except OSError as e:
             _cli_say(f"[pairing] could not save a new code ({e}). Nothing changed. "
-                     f"Is {_APP_DIR} writable?")
+                     f"Is {_DATA_DIR} writable?", error=True)
             return
         _cli_say(f"[pairing] new pairing code {token} and key saved. Every paired "
                  "phone must scan the new QR. A LazeR that is already running keeps "
@@ -5144,11 +5503,11 @@ def main():
     if args.setup_firewall:
         if not sys.platform.startswith("win"):
             _cli_say("[firewall] --setup-firewall is Windows-only; on macOS/Linux allow "
-                     f"inbound UDP {PORT} in your firewall.")
+                     f"inbound UDP {PORT} in your firewall.", error=True)
             return
-        if ensure_firewall_rule(allow_elevate=True):
-            msg = (f"[firewall] inbound rule '{FW_RULE_NAME}' is in place — phones can "
-                   f"reach UDP {PORT}.")
+        ok = ensure_firewall_rule(allow_elevate=True)
+        if ok:
+            msg = "[firewall] Windows Firewall now lets phones reach LazeR."
         else:
             msg = ("[firewall] the rule was not added: the admin prompt was declined "
                    "or failed. Run this again and choose Yes.")
@@ -5156,7 +5515,7 @@ def main():
         advice = firewall_advice()
         if advice:
             msg += f"\n[firewall] {advice}"
-        _cli_say(msg)
+        _cli_say(msg, error=not ok or bool(advice))
         return
 
     if args.no_gui and sys.stdout is None:
@@ -5180,10 +5539,12 @@ def main():
     # Startup notices, (tag, text). Printed in a terminal; the window logs them and
     # raises the warnings, since the windowed exe has no terminal to print them to.
     notices = []
+    if SECRET_WRITE_ERRORS:
+        notices.append(("warn", "Couldn't save the pairing code, so phones will need to "
+                                "scan the QR again after LazeR closes. Check that "
+                                f"{_DATA_DIR} can be written to."))
     for err in SECRET_WRITE_ERRORS:
-        notices.append(("warn", "Couldn't save the pairing secrets, so this pairing "
-                                f"lasts only until LazeR closes ({err}). Move LazeR "
-                                "to a folder you can write to."))
+        notices.append(("info", f"Secret file not saved: {err}"))
     if args.allow_plaintext and args.secure_only:
         notices.append(("warn", "--secure-only and --allow-plaintext conflict; "
                                 "honouring --secure-only (encryption required)."))

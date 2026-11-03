@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -38,10 +39,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.lanremote.ui.ConnectionScreen
 import com.example.lanremote.ui.ControlActions
 import com.example.lanremote.ui.ControlScreen
+import com.example.lanremote.ui.FailureMessage
 import com.example.lanremote.ui.SettingsActions
 import com.example.lanremote.ui.theme.LanRemoteTheme
 import com.example.lanremote.util.Haptics
@@ -55,6 +58,8 @@ class MainActivity : ComponentActivity() {
     private val vm: RemoteViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Before super.onCreate: swaps the launch theme for Theme.LanRemote.
+        installSplashScreen()
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         setContent {
@@ -169,6 +174,7 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
         ConnState.Reconnecting -> ReconnectingScreen(
             name = state.deviceName.ifBlank { "the laptop" },
             hint = state.error,
+            hintDetail = state.errorDetail,
             scanError = state.scanError,
             onCancel = vm::disconnect,
             onBack = vm::stopReconnecting,
@@ -229,6 +235,7 @@ private fun ReplacePairingDialog(name: String, onConfirm: () -> Unit, onCancel: 
 private fun ReconnectingScreen(
     name: String,
     hint: String?,
+    hintDetail: String?,
     scanError: String?,
     onCancel: () -> Unit,
     onBack: () -> Unit,
@@ -237,7 +244,9 @@ private fun ReconnectingScreen(
     BackHandler(onBack = onBack)
     // Scrolls: in landscape a long network diagnosis would otherwise push the title
     // and the Cancel button off both ends. The min height keeps it centred when it fits.
-    BoxWithConstraints(Modifier.fillMaxSize()) {
+    // Edge-to-edge: inset by the status/nav bars and cutouts (the side nav bar in
+    // landscape), measured before maxHeight so the centring accounts for them.
+    BoxWithConstraints(Modifier.fillMaxSize().safeDrawingPadding()) {
     Column(
         modifier = Modifier.verticalScroll(rememberScrollState()).fillMaxWidth()
             .heightIn(min = maxHeight).padding(32.dp),
@@ -252,11 +261,11 @@ private fun ReconnectingScreen(
             textAlign = TextAlign.Center,
             modifier = Modifier.padding(top = 20.dp),
         )
-        Text(
-            hint ?: "Connection dropped. Make sure the laptop and Wi-Fi are still on.",
-            style = MaterialTheme.typography.bodyMedium,
+        FailureMessage(
+            headline = hint ?: "Connection dropped. Make sure the laptop and Wi-Fi are still on.",
+            detail = if (hint != null) hintDetail else null,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center,
+            centered = true,
             modifier = Modifier.padding(top = 8.dp),
         )
         if (hint != null) {

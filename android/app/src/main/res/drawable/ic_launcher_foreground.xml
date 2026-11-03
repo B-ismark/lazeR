@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon foreground: draw_mark() from tools/gen_icons.py — glowing dot
+     with a 4-ray crosshair — with its "size" mapped to the 72dp visible area of
+     the 108dp canvas. The outermost point (ray tips, r = 25.92dp) stays well
+     inside the 66dp safe-zone circle (r = 33dp). Also the splash screen icon. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Soft glow: three stacked translucent discs (r = 0.30 / 0.22 / 0.15 × 72). -->
+    <path
+        android:fillColor="#28FFFFFF"
+        android:pathData="M54,32.4a21.6,21.6 0,1 1,0 43.2a21.6,21.6 0,1 1,0 -43.2z" />
+    <path
+        android:fillColor="#46FFFFFF"
+        android:pathData="M54,38.16a15.84,15.84 0,1 1,0 31.68a15.84,15.84 0,1 1,0 -31.68z" />
+    <path
+        android:fillColor="#78FFFFFF"
+        android:pathData="M54,43.2a10.8,10.8 0,1 1,0 21.6a10.8,10.8 0,1 1,0 -21.6z" />
+    <!-- Core dot (r = 0.11 × 72). -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,46.08a7.92,7.92 0,1 1,0 15.84a7.92,7.92 0,1 1,0 -15.84z" />
+    <!-- Crosshair rays from 0.20 to 0.36 × 72 out, 0.035 × 72 wide. -->
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.52"
+        android:strokeLineCap="butt"
+        android:pathData="M54,28.08V39.6M54,68.4V79.92M28.08,54H39.6M68.4,54H79.92" />
+</vector>

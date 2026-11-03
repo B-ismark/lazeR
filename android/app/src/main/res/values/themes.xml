@@ -1,4 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.LanRemote" parent="android:Theme.Material.Light.NoActionBar" />
+    <!-- The window behind Compose. Its background is the fallback scheme's `surface`
+         (ui/theme/Theme.kt), so nothing flashes between the splash and the first
+         frame. values-night/themes.xml is the dark twin. -->
+    <style name="Theme.LanRemote" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/lazer_surface_light</item>
+    </style>
+
+    <!-- Launch theme (androidx.core:core-splashscreen). MainActivity calls
+         installSplashScreen(), which swaps in postSplashScreenTheme. The icon is the
+         adaptive foreground (white mark), so it sits on a brand-coloured disc. -->
+    <style name="Theme.LanRemote.Starting" parent="Theme.SplashScreen.IconBackground">
+        <item name="windowSplashScreenBackground">@color/lazer_surface_light</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <item name="windowSplashScreenIconBackgroundColor">@color/lazer_icon_disc</item>
+        <item name="postSplashScreenTheme">@style/Theme.LanRemote</item>
+    </style>
 </resources>
