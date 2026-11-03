@@ -2892,6 +2892,39 @@ class StartupDefault(unittest.TestCase):
         self.assertEqual(self.set_calls, [])
 
 
+class FirewallCleanup(unittest.TestCase):
+    """Firewall helpers must report what's really left, and not prompt for nothing."""
+
+    def setUp(self):
+        self.elevated = []
+        for attr, val in (
+                ("is_admin", lambda: False),
+                ("_run_elevated_and_wait",
+                 lambda exe, params, timeout_ms=30000: self.elevated.append(params)),
+                ("_can_remove_program_rules", lambda: False)):
+            p = mock.patch.object(rs, attr, val)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(rs.sys, "platform", "win32")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_a_declined_uninstall_prompt_is_not_reported_as_done(self):
+        # Only a legacy rule exists and the admin prompt deletes nothing.
+        with mock.patch.object(rs, "_fw_rule_named",
+                               lambda n: n in rs._FW_LEGACY_RULE_NAMES[:1]), \
+             mock.patch.object(rs, "firewall_rule_exists", lambda: False), \
+             mock.patch.object(rs, "firewall_block_rules", lambda: []):
+            self.assertFalse(rs._firewall_remove_ours())
+        self.assertEqual(len(self.elevated), 1)
+
+    def test_a_block_we_cant_lift_spends_no_admin_prompt(self):
+        with mock.patch.object(rs, "firewall_rule_exists", lambda: True), \
+             mock.patch.object(rs, "firewall_block_rules", lambda: ["python"]):
+            self.assertFalse(rs.ensure_firewall_rule(allow_elevate=True))
+        self.assertEqual(self.elevated, [])
+
+
 class SingleInstance(unittest.TestCase):
 
     def setUp(self):

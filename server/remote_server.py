@@ -2912,12 +2912,14 @@ def _firewall_purge_legacy_direct():
             pass
 
 
-def _firewall_add_direct():
+def _firewall_add_direct(blocked=()):
     """Add the rule in-process (succeeds only if already elevated). Also clears
-    the old private,domain rule so a dead one isn't left sitting behind."""
+    the old private,domain rule so a dead one isn't left sitting behind, and the
+    [blocked] rules when they're ours to delete."""
     import subprocess
     _firewall_purge_legacy_direct()
-    for args in ([_firewall_unblock_args()] if _owned_program_rules() else []) + \
+    unblock = blocked and _can_remove_program_rules()
+    for args in ([_firewall_unblock_args()] if unblock else []) + \
             ([] if firewall_rule_exists() else [_FW_ADD_ARGS]):
         try:
             subprocess.run(
@@ -2976,8 +2978,10 @@ def ensure_firewall_rule(allow_elevate=False):
     have = firewall_rule_exists()
     if have and not blocked:
         return True
+    if have and not _can_remove_program_rules():
+        return False        # a block we can't lift: an admin prompt would change nothing
     if is_admin():
-        return _firewall_add_direct()
+        return _firewall_add_direct(blocked)
     if allow_elevate:
         # Purge + add has to run in one elevated shell, or the user eats a UAC
         # prompt per netsh call. cmd.exe chains them; the rule names are quoted
@@ -2987,7 +2991,7 @@ def ensure_firewall_rule(allow_elevate=False):
             f'{netsh} advfirewall firewall delete rule name="{name}" >nul 2>nul'
             for name in _FW_LEGACY_RULE_NAMES
         ]
-        if blocked and _owned_program_rules():
+        if blocked and _can_remove_program_rules():
             parts.append(f'{netsh} advfirewall firewall delete rule name=all dir=in '
                          f'program="{_self_program()}" >nul 2>nul')
         if not have:                     # netsh add happily makes a duplicate
@@ -3009,7 +3013,7 @@ def _firewall_remove_ours():
     # The legacy rules count too: an install from before the v2 name left one.
     # One cheap read, so a clean machine never sees a UAC prompt for nothing.
     present = [n for n in (FW_RULE_NAME,) + _FW_LEGACY_RULE_NAMES if _fw_rule_named(n)]
-    ours = _owned_program_rules()
+    ours = _can_remove_program_rules() and bool(firewall_block_rules())
     if not present and not ours:
         return True
     parts = [f'{netsh} advfirewall firewall delete rule name="{name}" >nul 2>nul'
@@ -3028,7 +3032,10 @@ def _firewall_remove_ours():
             pass
     else:
         _run_elevated_and_wait(win_exe("cmd.exe"), chain)
-    return not firewall_rule_exists()
+    # Re-read everything we meant to delete: the current rule alone would report
+    # success for a declined prompt on a machine holding only a legacy rule.
+    return (not any(_fw_rule_named(n) for n in present)
+            and not (ours and firewall_block_rules()))
 
 
 def _fw_rule_named(name):
@@ -3044,12 +3051,12 @@ def _fw_rule_named(name):
         return False
 
 
-def _owned_program_rules():
+def _can_remove_program_rules():
     """True when rules tied to this program are ours to delete: only a frozen
     LazeR.exe. From source the program is python.exe, and deleting its rules would
-    strip every other Python app's firewall exceptions."""
-    return (getattr(sys, "frozen", False) and _cmd_safe(_self_program())
-            and bool(firewall_block_rules()))
+    strip every other Python app's firewall exceptions. No query, so it's safe on
+    the UI thread — callers already hold firewall_block_rules()' answer."""
+    return getattr(sys, "frozen", False) and _cmd_safe(_self_program())
 
 
 def uninstall():
@@ -4263,7 +4270,7 @@ class LazeRWindow:
             # would just spend a UAC prompt to change nothing.
             sub = advice
             self._fw_btn.pack_forget()
-        elif blocks and _owned_program_rules():
+        elif blocks and _can_remove_program_rules():
             sub = ("Windows Firewall has a rule blocking LazeR — usually from clicking "
                    "Cancel when Windows asked about it. One click removes it and "
                    "allows phones in (asks for admin once).")
@@ -4993,9 +5000,11 @@ class LazeRWindow:
             # back to the middle each time undid wherever the user had put it, even
             # on another monitor — so after the first show it stays put, and only
             # moves up when it has grown past the bottom of the screen.
-            y = self._root.winfo_y()
-            if y + h > sh - _px(48):
-                self._root.geometry(f"+{self._root.winfo_x()}+{max(0, sh - h - _px(48))}")
+            # sw/sh are the primary screen's, so leave a window on another monitor
+            # alone rather than drag it onto the primary's coordinates.
+            x, y = self._root.winfo_x(), self._root.winfo_y()
+            if 0 <= x < sw and 0 <= y < sh and y + h > sh - _px(48):
+                self._root.geometry(f"+{x}+{max(0, sh - h - _px(48))}")
             return
         self._placed = True
         x = max(0, (sw - w) // 2)
