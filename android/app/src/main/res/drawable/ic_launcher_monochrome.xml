@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed-icon (Android 13+) layer: the foreground's dot and rays only. The
+     launcher uses just the alpha channel, so the translucent glow would read as
+     muddy rings; one faint halo keeps the "laser dot" feel. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#55FFFFFF"
+        android:pathData="M54,43.2a10.8,10.8 0,1 1,0 21.6a10.8,10.8 0,1 1,0 -21.6z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M54,46.08a7.92,7.92 0,1 1,0 15.84a7.92,7.92 0,1 1,0 -15.84z" />
+    <path
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2.52"
+        android:strokeLineCap="butt"
+        android:pathData="M54,28.08V39.6M54,68.4V79.92M28.08,54H39.6M68.4,54H79.92" />
+</vector>

@@ -18,8 +18,8 @@ android {
         // dialect. These were left at 1/"1.0" through six tagged releases, so every
         // shipped APK claimed the same version and users couldn't tell builds apart.
         // publish_release.ps1 now asserts -Tag matches versionName.
-        versionCode = 20300
-        versionName = "2.3.0"
+        versionCode = 20400
+        versionName = "2.4.0"
         manifestPlaceholders["appLabel"] = "LazeR"
     }
 
@@ -104,6 +104,8 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.5")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.5")
     implementation("androidx.activity:activity-compose:1.9.2")
+    // Launch splash (Theme.LanRemote.Starting) on every API level, not just 31+.
+    implementation("androidx.core:core-splashscreen:1.0.1")
 
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")

@@ -39,6 +39,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.example.lanremote.UiState
 import com.example.lanremote.UpdateDownload
@@ -81,7 +83,8 @@ internal fun SettingsSheet(state: UiState, a: SettingsActions, onDismiss: () -> 
                 value = state.settings.sensitivity,
                 onValueChange = a.onSensitivity,
                 valueRange = 0.6f..3.0f,
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth()
+                    .semantics { contentDescription = "Cursor speed" },
             )
             Spacer(Modifier.height(8.dp))
             ToggleRow("Pointer acceleration", "Fast flicks move the cursor farther",

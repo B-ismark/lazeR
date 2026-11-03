@@ -20,6 +20,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.displayCutoutPadding
 import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.systemBarsPadding
@@ -355,6 +356,9 @@ fun ControlScreen(state: UiState, a: ControlActions) {
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
+                    // The Scaffold padding already covers the nav bar; without this,
+                    // imePadding() adds it a second time above the keyboard.
+                    .consumeWindowInsets(padding)
                     .imePadding()
                     .padding(horizontal = 16.dp, vertical = 8.dp),
             ) {
@@ -508,7 +512,8 @@ private fun LevelCard(
                 Icon(Icons.Filled.Remove, contentDescription = "$label down")
             }
             Slider(value = value, onValueChange = onChange, valueRange = 0f..100f,
-                modifier = Modifier.weight(1f).padding(horizontal = 8.dp))
+                modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                    .semantics { contentDescription = label })
             PressIconButton(onClick = { onStep(5f) }, size = 44.dp, shape = RoundedCornerShape(14.dp)) {
                 Icon(Icons.Filled.Add, contentDescription = "$label up")
             }

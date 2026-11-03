@@ -114,6 +114,39 @@ if (Test-Path (Join-Path $upxDir "upx.exe")) {
 # lives under OneDrive, sync locks those folders mid-build and the build dies with
 # "Access is denied". The final exe still lands in dist/ (a single write).
 $work = Join-Path $env:TEMP "lazeR-pyi-build"
+New-Item -ItemType Directory -Force $work | Out-Null
+
+# Version resource. Without one, Properties > Details is blank and the firewall
+# prompt, Task Manager and Startup apps show a bare "LazeR.exe" with no
+# description - which reads as suspicious next to SmartScreen's warning.
+$m = Select-String -Path $script -Pattern '^APP_VERSION\s*=\s*"(\d+)\.(\d+)\.(\d+)"' | Select-Object -First 1
+if (-not $m) { Write-Host "APP_VERSION not found in $script." -ForegroundColor Red; exit 1 }
+$v = $m.Matches[0].Groups
+$ver = "$($v[1].Value).$($v[2].Value).$($v[3].Value)"
+$tuple = "($($v[1].Value), $($v[2].Value), $($v[3].Value), 0)"
+$versionFile = Join-Path $work "version_info.txt"
+# No BOM: PyInstaller eval()s this file, and Set-Content -Encoding UTF8 adds one.
+$versionText = @"
+VSVersionInfo(
+  ffi=FixedFileInfo(filevers=$tuple, prodvers=$tuple, mask=0x3f, flags=0x0,
+                    OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[
+    StringFileInfo([StringTable('040904B0', [
+      StringStruct('CompanyName', 'LazeR'),
+      StringStruct('FileDescription', 'LazeR - use your phone as a trackpad'),
+      StringStruct('FileVersion', '$ver'),
+      StringStruct('InternalName', 'LazeR'),
+      StringStruct('LegalCopyright', 'Apache License 2.0'),
+      StringStruct('OriginalFilename', 'LazeR.exe'),
+      StringStruct('ProductName', 'LazeR'),
+      StringStruct('ProductVersion', '$ver')])]),
+    VarFileInfo([VarStruct('Translation', [0x0409, 1200])])
+  ]
+)
+"@
+[IO.File]::WriteAllText($versionFile, $versionText, (New-Object Text.UTF8Encoding $false))
+$pyiArgs += @("--version-file", $versionFile)
+
 $pyiArgs += @(
     "--distpath", (Join-Path $root "dist"),
     "--workpath", $work,

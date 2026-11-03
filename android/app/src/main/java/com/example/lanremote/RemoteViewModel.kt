@@ -8,6 +8,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.lanremote.data.ApkUpdater
@@ -81,6 +82,7 @@ private const val DISCOVERY_QUIET_MS = 8_000L
 // A reconnect this soon after the phone put the laptop to sleep is the sleep, not
 // a network problem, and is described that way.
 private const val SLEEP_EXPLAINS_MS = 30 * 60_000L
+private const val TAG = "LazeR.RemoteViewModel"
 
 /** A scanned QR that would replace the pairing of a saved laptop, waiting for the
  *  user to confirm. [existing] is the saved record it replaces. */
@@ -109,6 +111,9 @@ data class UiState(
     // uncommitted composing text. The field owns its own editing state now — see
     // KeyboardPanel — and the ViewModel keeps only the diff, not the display value.
     val error: String? = null,
+    // The longer "why" behind [error], shown only on request so the headline stays
+    // one line. Always written together with [error]; null when there's nothing more.
+    val errorDetail: String? = null,
     // A QR that couldn't be used. Kept apart from [error] so a bad scan on the
     // Reconnecting screen doesn't overwrite its diagnosis.
     val scanError: String? = null,
@@ -467,9 +472,14 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     downloadTag = release.tag
                     set(UpdateDownload.Ready)
                 }
-                is ApkUpdater.Download.Failed -> set(
-                    if (result.reason == "cancelled") UpdateDownload.Idle
-                    else UpdateDownload.Failed(downloadFailureMessage(result.reason)))
+                is ApkUpdater.Download.Failed -> {
+                    // The code itself stays out of the UI; logcat keeps it for debugging.
+                    if (result.reason != "cancelled")
+                        Log.w(TAG, "update download failed: ${result.reason}")
+                    set(
+                        if (result.reason == "cancelled") UpdateDownload.Idle
+                        else UpdateDownload.Failed(downloadFailureMessage(result.reason)))
+                }
             }
         }
     }
@@ -508,7 +518,19 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         "too-big" -> "The download was larger than any LazeR release, so it was stopped."
         "slow" -> "The download was too slow and was stopped. Try again on a better connection."
         "network" -> "The download was interrupted. Check the connection and try again."
-        else -> "Couldn't download the update ($reason). Try again, or open the release page."
+        // The rest are ApkUpdater's internal codes; they go to logcat, not the screen.
+        "url", "not-https" ->
+            "The download link didn't lead to a LazeR release, so it was refused. " +
+                "Open the release page instead."
+        "sha256" -> "The release's checksum couldn't be read. Open the release page instead."
+        "rename" -> "The phone couldn't save the download. Free up some space and try again."
+        "http-404" -> "GitHub no longer has that file. Open the release page instead."
+        else ->
+            if (reason.startsWith("http-")) {
+                "GitHub refused the download. Try again later, or open the release page."
+            } else {
+                "Couldn't download the update. Try again, or open the release page."
+            }
     }
 
     private inline fun updateSettings(block: (Settings) -> Settings) {
@@ -523,7 +545,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // --- form fields ---
-    fun onName(v: String) = update { it.copy(name = v, error = null) }
+    fun onName(v: String) = update { it.copy(name = v, error = null, errorDetail = null) }
 
     /**
      * Normalize the IP field instead of trusting the IME.
@@ -543,10 +565,14 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun onIp(v: String) = update {
         it.copy(ip = v.replace(',', '.')
             .filter { c -> c.isLetterOrDigit() || c == '.' || c == '-' },
-            error = null)
+            error = null, errorDetail = null)
     }
-    fun onPort(v: String) = update { it.copy(port = v.filter { c -> c.isDigit() }, error = null) }
-    fun onToken(v: String) = update { it.copy(token = v.trim().uppercase(), error = null) }
+    fun onPort(v: String) = update {
+        it.copy(port = v.filter { c -> c.isDigit() }, error = null, errorDetail = null)
+    }
+    fun onToken(v: String) = update {
+        it.copy(token = v.trim().uppercase(), error = null, errorDetail = null)
+    }
 
     // --- connect entry points ---
     fun connectManual() {
@@ -555,7 +581,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val s = _state.value
         val ip = s.ip.trim()
         if (ip.isBlank() || s.token.isBlank()) {
-            update { it.copy(error = "Enter the laptop's IP and its pairing code.") }
+            update { it.copy(error = "Enter the laptop's IP and its pairing code.",
+                errorDetail = null) }
             return
         }
         val port = s.port.toIntOrNull() ?: Protocol.DEFAULT_PORT
@@ -656,8 +683,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         connectJob?.cancel()
         // Clear an old scan error too: it outranks the connect's own diagnosis on the
         // connect screen, so a stale "Unrecognized QR code" would hide it.
-        update { it.copy(conn = ConnState.Connecting, error = null, scanError = null,
-            deviceName = dev.name, muted = if (keepMute) it.muted else null) }
+        update { it.copy(conn = ConnState.Connecting, error = null, errorDetail = null,
+            scanError = null, deviceName = dev.name,
+            muted = if (keepMute) it.muted else null) }
         connectJob = viewModelScope.launch {
             val (connected, outcome) = connectResolving(dev, 2000)
             if (outcome.result == ConnectResult.Cancelled) return@launch
@@ -669,9 +697,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             } else {
                 // The Reconnecting screen may have been holding the radio awake.
                 holdWifi(false)
+                val f = connectFailureMessage(dev, outcome.result)
                 update {
                     it.copy(conn = ConnState.Disconnected,
-                        error = connectFailureMessage(dev, outcome.result))
+                        error = f.headline, errorDetail = f.detail)
                 }
             }
         }
@@ -702,7 +731,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         stopDiscovery()    // no need to keep scanning Wi-Fi while controlling
         holdWifi(true)     // pin the radio low-latency for the session
         touch()
-        update { it.copy(conn = ConnState.Connected, error = null, deviceName = connected.name) }
+        update { it.copy(conn = ConnState.Connected, error = null, errorDetail = null,
+            deviceName = connected.name) }
         startHealthLoop()
     }
 
@@ -715,40 +745,53 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
      * phone and the laptop never share a subnet. We already know our own addresses,
      * so we can tell that apart from "same network, nothing answered".
      */
-    private fun connectFailureMessage(dev: Device, result: ConnectResult): String {
+    private fun connectFailureMessage(dev: Device, result: ConnectResult): ConnectFailure {
         when (result) {
-            ConnectResult.NeedsQr -> return "${dev.name} only accepts QR pairing, because " +
-                "it requires encryption. Scan the QR code in the LazeR window on the laptop."
-            ConnectResult.WrongKey -> return "${dev.name} has been re-paired since this " +
-                "phone last connected. Scan the new QR code in the LazeR window."
-            ConnectResult.Outdated -> return "${dev.name} answered in an older format. " +
-                "Update LazeR on the laptop, or scan its QR code to keep using that version."
+            ConnectResult.NeedsQr -> return ConnectFailure("${dev.name} only accepts QR " +
+                "pairing, because it requires encryption. Scan the QR code in the LazeR " +
+                "window on the laptop.")
+            ConnectResult.WrongKey -> return ConnectFailure("${dev.name} has been re-paired " +
+                "since this phone last connected. Scan the new QR code in the LazeR window.")
+            ConnectResult.Outdated -> return ConnectFailure("${dev.name} answered in an " +
+                "older format. Update LazeR on the laptop, or scan its QR code to keep " +
+                "using that version.")
             else -> {}
         }
         val mine = localIPv4s()
-        val tail = if (dev.key.isBlank()) " A typed code only works while the laptop " +
+        val tail = if (dev.key.isBlank()) "\n\nA typed code only works while the laptop " +
             "allows unencrypted pairing — scanning its QR is more reliable."
-        else " If the laptop was re-paired, scan its new QR code."
+        else "\n\nIf the laptop was re-paired, scan its new QR code."
         // The phone's own network first: a Sleep explains silence, not a phone that
         // has left the laptop's Wi-Fi. Only an IPv4 literal can be subnet-checked.
         return when {
-            mine.isEmpty() ->
-                "This phone has no Wi-Fi address — join the laptop's network and retry."
+            mine.isEmpty() -> ConnectFailure(
+                "This phone has no Wi-Fi address — join the laptop's network and retry.")
             ipv4ToInt(dev.ip) != null && mine.none { it.sharesSubnetWith(dev.ip) } ->
-                "Your phone is on ${mine.first().address} but ${dev.ip} is on a " +
-                    "different network, so they can't reach each other. Put both on the " +
-                    "same Wi-Fi — note that a router's 2.4 GHz and 5 GHz names are " +
-                    "sometimes separate networks, and guest networks always are."
-            sleptRecently(dev) ->
-                "${dev.name} is asleep. Wake it and LazeR reconnects by itself."
-            else ->
-                "${dev.ip}${if (ipv4ToInt(dev.ip) != null) " is on your network but" else ""}" +
-                    " didn't answer. Check LazeR is running " +
-                    "on the laptop and that you allowed its firewall prompt — the LazeR " +
-                    "window warns when inbound UDP is blocked. Some routers also block " +
-                    "device-to-device traffic (\"client isolation\")." + tail
+                ConnectFailure(
+                    "Your phone and ${dev.name} are on different networks.",
+                    "This phone is on ${mine.first().address} but the laptop is at " +
+                        "${dev.ip}, so they can't reach each other. Put both on the same " +
+                        "Wi-Fi — a router's 2.4 GHz and 5 GHz names are sometimes " +
+                        "separate networks, and guest networks always are.",
+                )
+            sleptRecently(dev) -> ConnectFailure(
+                "${dev.name} is asleep. Wake it and LazeR reconnects by itself.")
+            // The headline stays one line so the connect screen's pinned bottom bar
+            // (which doesn't scroll) stays short; the causes sit behind "Why?".
+            else -> ConnectFailure(
+                "Couldn't reach ${dev.name}.",
+                "Nothing answered at ${dev.ip}.\n\n" +
+                    "• Make sure LazeR is open on the laptop.\n" +
+                    "• The laptop's firewall may be blocking LazeR — open LazeR on the " +
+                    "laptop and click Allow through firewall.\n" +
+                    "• Your router may stop devices from talking to each other (common " +
+                    "on guest and campus Wi-Fi)." + tail,
+            )
         }
     }
+
+    /** [headline] is the one-line error; [detail] the plain-language "why", if any. */
+    private data class ConnectFailure(val headline: String, val detail: String? = null)
 
     private fun sleptRecently(dev: Device) = dev.id == sleptDeviceId &&
         System.currentTimeMillis() - sleepRequestedMs < SLEEP_EXPLAINS_MS
@@ -961,10 +1004,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         val dev = current ?: return disconnect()
         // Straight after a Sleep the phone sent, say so now: that IS the reason, and
         // waiting 90 s to blame the network would be wrong.
+        val slept = if (sleptRecently(dev)) connectFailureMessage(dev, ConnectResult.NoAnswer)
+        else null
         update {
             it.copy(conn = ConnState.Reconnecting, deviceName = dev.name, scanError = null,
-                error = if (sleptRecently(dev)) connectFailureMessage(dev, ConnectResult.NoAnswer)
-                else null)
+                error = slept?.headline, errorDetail = slept?.detail)
         }
         reconnectJob?.cancel()
         startDiscovery()
@@ -1010,8 +1054,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     // the cause changes — the Sleep the phone sent stops explaining it,
                     // the phone changes network — and a message set once would say
                     // "asleep" all night.
-                    val msg = connectFailureMessage(dev, lastDefinite ?: outcome.result)
-                    if (_state.value.error != msg) update { it.copy(error = msg) }
+                    val f = connectFailureMessage(dev, lastDefinite ?: outcome.result)
+                    if (_state.value.error != f.headline || _state.value.errorDetail != f.detail)
+                        update { it.copy(error = f.headline, errorDetail = f.detail) }
                 }
                 // Fast while it's likely transient, then ease off. Same shape as the
                 // health loop's backoff, and it keeps a long outage from polling the
@@ -1073,7 +1118,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // that slot while STAYING on the reconnect screen, so leaving it set here
         // would drop the user onto the device list with a red banner about a
         // device they deliberately left — and it would survive a rescan.
-        update { it.copy(conn = ConnState.Disconnected, error = null) }
+        update { it.copy(conn = ConnState.Disconnected, error = null, errorDetail = null) }
         startDiscovery()   // scan again for the connection screen
     }
 

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Launch/window colours, mirroring ui/theme/Theme.kt's fallback schemes
+         (`surface`) so the splash, the window and the first Compose frame match. -->
+    <color name="lazer_surface_light">#FFFBF8FF</color>
+    <color name="lazer_surface_dark">#FF131318</color>
+    <!-- Midpoint of the icon gradient (#8C9BFF to #6575E0): the disc behind the
+         white splash mark. -->
+    <color name="lazer_icon_disc">#FF7888EF</color>
+</resources>
