@@ -1069,6 +1069,10 @@ def remove_data_dir():
         except OSError:
             left.append(p)
     try:
+        os.remove(STARTUP_DEFAULT_MARKER)  # not a secret: never reported as left
+    except OSError:
+        pass
+    try:
         os.rmdir(_DATA_DIR)
     except OSError:
         pass                  # absent, or holds something that isn't ours
@@ -2626,6 +2630,31 @@ def set_startup(enabled):
 
 
 set_startup.last_error = ""
+
+
+# There's no installer to switch Start with Windows on, and the toggle sits in
+# Details, so almost nobody found it and LazeR quietly didn't come back after a
+# restart. The exe now turns it on once, on its first run; this marker records
+# that it did, so turning it off afterwards sticks.
+STARTUP_DEFAULT_MARKER = os.path.join(_DATA_DIR, ".startup_default_done")
+
+
+def apply_startup_default():
+    """Turn Start with Windows on the first time the packaged exe runs for this
+    user. Returns True only when it was switched on just now. A source run is a
+    developer's, so it's left alone. The marker is written first: a launch that
+    can't record the choice must not go on re-enabling it every time."""
+    if not (sys.platform.startswith("win") and getattr(sys, "frozen", False)):
+        return False
+    if os.path.exists(STARTUP_DEFAULT_MARKER):
+        return False
+    try:
+        os.makedirs(os.path.dirname(STARTUP_DEFAULT_MARKER), exist_ok=True)
+        with open(STARTUP_DEFAULT_MARKER, "w") as f:
+            f.write("1\n")
+    except OSError:
+        return False
+    return not startup_enabled() and set_startup(True)
 
 
 # ── Windows Firewall: auto-allow inbound UDP so phones can reach us ───────────
@@ -5590,6 +5619,11 @@ def main():
                 _cli_say(PORT_BUSY_TEXT + f"\n\n({busy})")
                 return
             migrate_startup_command()
+            if apply_startup_default():
+                notices.append(("info", "LazeR will now start in the tray when you sign "
+                                        "in to Windows. Turn this off with Start with "
+                                        "Windows in Details, or in Task Manager → "
+                                        "Startup apps."))
 
             eq = queue.Queue()
             wire = Wire(token, key, require_secure)

@@ -109,10 +109,12 @@ it by setting that Wi-Fi to **Private** under *Settings → Network & internet �
 policy. LazeR cannot override it — the setting exists specifically to stop apps
 doing that.
 
-**Start with Windows.** LazeR does not auto-launch out of the box. Turn on the
-**Start with Windows** toggle in the desktop GUI, or from the command line. It starts
-in the tray, so the QR (which carries the pairing key) isn't left on the screen at
-login:
+**Start with Windows.** `LazeR.exe` switches this on by itself the first time it
+runs for a user, and says so in the window's activity log. It does that once: if
+you turn it off afterwards, it stays off. A source run (`python remote_server.py`)
+leaves it alone. Change it with the **Start with Windows** toggle in the desktop
+GUI, or from the command line. It starts in the tray, so the QR (which carries the
+pairing key) isn't left on the screen at login:
 
 ```bash
 python remote_server.py --enable-startup    # register; appears in Task Manager → Startup apps

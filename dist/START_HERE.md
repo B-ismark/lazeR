@@ -25,8 +25,9 @@ Windows may then ask whether to allow LazeR through the firewall: click **Allow*
 If you clicked **Cancel**, click **Allow through firewall** in the LazeR window
 (one admin prompt) — the window tells you if Windows is still blocking it.
 
-**Start with Windows:** open **Show details** and flip **Start with Windows** on.
-LazeR then starts in the tray at every login.
+**Start with Windows:** on from the first run, so LazeR starts in the tray at every
+login. To stop that, open **Show details** and flip **Start with Windows** off. It
+stays off.
 
 **No Windows, or rather run from source?** `cd server`, then
 `uv venv && uv pip install -r requirements.txt` and `python remote_server.py`

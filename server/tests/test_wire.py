@@ -2836,6 +2836,62 @@ class SecretFiles(unittest.TestCase):
             self.assertEqual(len(rs.SECRET_WRITE_ERRORS), 1)
 
 
+class StartupDefault(unittest.TestCase):
+    """The exe turns Start with Windows on once, and never again after that."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.marker = os.path.join(self.tmp.name, "LazeR", ".startup_default_done")
+        self.enabled = False
+        self.set_calls = []
+
+        def set_startup(on):
+            self.set_calls.append(on)
+            self.enabled = on
+            return True
+
+        for target, attr, val in (
+                (rs, "STARTUP_DEFAULT_MARKER", self.marker),
+                (rs, "startup_enabled", lambda: self.enabled),
+                (rs, "set_startup", set_startup),
+                (rs.sys, "platform", "win32")):
+            p = mock.patch.object(target, attr, val)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(rs.sys, "frozen", True, create=True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_the_first_run_turns_it_on(self):
+        self.assertTrue(rs.apply_startup_default())
+        self.assertEqual(self.set_calls, [True])
+        self.assertTrue(os.path.exists(self.marker))
+
+    def test_turning_it_off_afterwards_sticks(self):
+        rs.apply_startup_default()
+        self.enabled = False                       # the user switched it off
+        self.assertFalse(rs.apply_startup_default())
+        self.assertEqual(self.set_calls, [True])
+
+    def test_an_entry_already_there_is_left_alone(self):
+        self.enabled = True
+        self.assertFalse(rs.apply_startup_default())   # no "now on" notice either
+        self.assertEqual(self.set_calls, [])
+
+    def test_a_source_run_is_left_alone(self):
+        with mock.patch.object(rs.sys, "frozen", False):
+            self.assertFalse(rs.apply_startup_default())
+        self.assertEqual(self.set_calls, [])
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_an_unwritable_marker_never_turns_it_on(self):
+        # Otherwise every launch would switch it back on after the user said no.
+        with mock.patch("builtins.open", side_effect=PermissionError(13, "denied")):
+            self.assertFalse(rs.apply_startup_default())
+        self.assertEqual(self.set_calls, [])
+
+
 class SingleInstance(unittest.TestCase):
 
     def setUp(self):
