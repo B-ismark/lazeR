@@ -2953,7 +2953,6 @@ def firewall_rule_exists():
 # netsh, PowerShell and their conhost windows under LazeR in Task Manager, and
 # PowerShell's start-up alone burns a second of CPU. The subprocess versions stay
 # as fallbacks for a machine where the COM route fails outright.
-_HR_NOT_FOUND = -2147024894            # HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
 
 
 def _fw_policy():
@@ -2975,11 +2974,22 @@ def _fw_rule_named_com(name):
     try:
         rules.Item(name)
         return True
-    except Exception as e:
-        hr = getattr(e, "hresult", None)
-        if hr is None and getattr(e, "args", None):
-            hr = e.args[0]
-        return False if hr == _HR_NOT_FOUND else None
+    except Exception:
+        pass
+    # Item() on a missing name doesn't raise ERROR_FILE_NOT_FOUND through late
+    # binding: it arrives as a bare DISP_E_EXCEPTION with the real code dropped,
+    # so the error can't tell "absent" from "broken". Walking the names can — a
+    # few hundred rules take ~10 ms — and keeps netsh out of the steady state.
+    try:
+        for r in rules:
+            try:
+                if str(r.Name) == name:
+                    return True
+            except Exception:
+                continue
+        return False
+    except Exception:
+        return None
 
 
 # Group Policy can tell Windows to ignore every locally-created firewall rule on
@@ -3165,6 +3175,53 @@ def _fw_block_rules_com():
         return None
 
 
+def _fw_policy_block_rules():
+    """Names of enabled inbound block rules for this program among the rules
+    Group Policy or MDM delivered, read from the registry; None when a policy
+    rule store exists but can't be read.
+
+    Each value is one rule in the firewall's own text form, e.g.
+    "v2.31|Action=Block|Active=TRUE|Dir=In|App=%ProgramFiles%\\x.exe|Name=...|".
+    The keys are plain ASCII field names, never localized."""
+    try:
+        import winreg
+    except Exception:
+        return []
+    prog = os.path.normcase(_self_program())
+    out = []
+    for root in _FW_POLICY_ROOTS:
+        try:
+            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, root + "\\FirewallRules")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+        with k:
+            i = 0
+            while True:
+                try:
+                    _, val, _ = winreg.EnumValue(k, i)
+                except OSError:
+                    break
+                i += 1
+                if not isinstance(val, str):
+                    continue
+                f = {}
+                for part in val.split("|"):
+                    key, sep, v = part.partition("=")
+                    if sep and key not in f:
+                        f[key] = v
+                if (f.get("Action", "").lower() != "block"
+                        or f.get("Dir", "").lower() != "in"
+                        or f.get("Active", "TRUE").upper() != "TRUE"):
+                    continue
+                app = f.get("App")
+                if not app or os.path.normcase(os.path.expandvars(app)) != prog:
+                    continue
+                out.append(f.get("Name") or "Policy rule")
+    return out
+
+
 def firewall_block_rules():
     """Display names of enabled inbound rules that block this program. Read-only,
     no admin. Empty when there are none or we can't tell."""
@@ -3172,11 +3229,14 @@ def firewall_block_rules():
         return []
     via_com = _fw_block_rules_com()
     # The firewall API lists the machine's own rules; rules that Group Policy or
-    # Intune deliver may not be among them. A clean COM answer is trusted only
-    # where no policy rules exist — on a managed PC ask the ActiveStore, which
-    # holds what is actually in force.
-    if via_com is not None and (via_com or not _fw_policy_rules_present()):
-        return via_com
+    # Intune deliver may not be among them, so those are read from the policy
+    # store in the registry. Both are in-process; PowerShell is only for a
+    # machine where one of them can't be read at all.
+    if via_com is not None:
+        via_policy = (_fw_policy_block_rules()
+                      if _fw_policy_rules_present() else [])
+        if via_policy is not None:
+            return via_com + [n for n in via_policy if n not in via_com]
     # Fallback. Enum values (Inbound/Block/True) are not localized, unlike netsh's.
     import subprocess
     prog = _self_program().replace("'", "''")

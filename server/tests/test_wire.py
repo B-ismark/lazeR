@@ -3260,5 +3260,106 @@ class ConnectedEventListeners(unittest.TestCase):
         self.assertEqual(hits, [1])
 
 
+class FirewallReadsStayInProcess(unittest.TestCase):
+    """The firewall checks run every recheck; on a real PC they must answer
+    without starting netsh or PowerShell."""
+
+    class _Rule:
+        def __init__(self, name):
+            self.Name = name
+
+    class _Rules:
+        def __init__(self, names):
+            self._names = names
+
+        def Item(self, name):
+            if name in self._names:
+                return FirewallReadsStayInProcess._Rule(name)
+            # What late binding really delivers on Windows: DISP_E_EXCEPTION,
+            # with the not-found code dropped.
+            raise OSError(-2147352567, "Exception occurred.")
+
+        def __iter__(self):
+            return iter([FirewallReadsStayInProcess._Rule(n) for n in self._names])
+
+    def _policy(self, names):
+        rules = self._Rules(names)
+        return lambda: type("P", (), {"Rules": rules})()
+
+    def test_missing_rule_is_a_clean_no(self):
+        with mock.patch.object(rs, "_fw_policy", self._policy(["Other"])):
+            self.assertIs(rs._fw_rule_named_com("LazeR inbound UDP 50505 v2"), False)
+
+    def test_present_rule_is_a_yes(self):
+        name = "LazeR inbound UDP 50505 v2"
+        with mock.patch.object(rs, "_fw_policy", self._policy([name])):
+            self.assertIs(rs._fw_rule_named_com(name), True)
+
+    def test_unreachable_api_is_unknown(self):
+        def boom():
+            raise OSError("no COM")
+        with mock.patch.object(rs, "_fw_policy", boom):
+            self.assertIsNone(rs._fw_rule_named_com("x"))
+
+    def _fake_winreg(self, stores):
+        """stores: {root: [values]} or {root: PermissionError}."""
+        class Key:
+            def __init__(self, vals):
+                self.vals = vals
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def OpenKey(hive, path):
+            root = path.rsplit("\\", 1)[0]
+            v = stores.get(root)
+            if v is None:
+                raise FileNotFoundError(path)
+            if isinstance(v, type) and issubclass(v, Exception):
+                raise v(path)
+            return Key(v)
+
+        def EnumValue(k, i):
+            if i >= len(k.vals):
+                raise OSError("no more")
+            return (f"r{i}", k.vals[i], 1)
+
+        return type("W", (), {"HKEY_LOCAL_MACHINE": 0,
+                              "OpenKey": staticmethod(OpenKey),
+                              "EnumValue": staticmethod(EnumValue)})
+
+    def test_policy_block_rule_for_us_is_found(self):
+        exe = os.path.join(os.sep, "apps", "LazeR.exe")
+        gpo, mdm = rs._FW_POLICY_ROOTS
+        reg = self._fake_winreg({
+            gpo: [f"v2.31|Action=Block|Active=TRUE|Dir=In|App={exe}|Name=IT block|",
+                  f"v2.31|Action=Block|Active=FALSE|Dir=In|App={exe}|Name=Off|",
+                  f"v2.31|Action=Allow|Active=TRUE|Dir=In|App={exe}|Name=Allow|",
+                  "v2.31|Action=Block|Active=TRUE|Dir=In|App=C:\\x.exe|Name=Other|"],
+            mdm: [f"v2.31|Action=Block|Dir=In|App={exe}|Name=Intune block|"],
+        })
+        with mock.patch.dict(sys.modules, {"winreg": reg}), \
+             mock.patch.object(rs, "_self_program", lambda: exe):
+            self.assertEqual(rs._fw_policy_block_rules(), ["IT block", "Intune block"])
+
+    def test_unreadable_policy_store_is_unknown(self):
+        gpo, _ = rs._FW_POLICY_ROOTS
+        reg = self._fake_winreg({gpo: PermissionError})
+        with mock.patch.dict(sys.modules, {"winreg": reg}):
+            self.assertIsNone(rs._fw_policy_block_rules())
+
+    def test_managed_pc_needs_no_powershell(self):
+        import subprocess as sp
+        with mock.patch.object(rs.sys, "platform", "win32"), \
+             mock.patch.object(rs, "_fw_block_rules_com", lambda: []), \
+             mock.patch.object(rs, "_fw_policy_rules_present", lambda: True), \
+             mock.patch.object(rs, "_fw_policy_block_rules", lambda: ["IT block"]), \
+             mock.patch.object(sp, "run", side_effect=AssertionError("spawned")):
+            self.assertEqual(rs.firewall_block_rules(), ["IT block"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
