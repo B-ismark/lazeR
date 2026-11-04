@@ -3209,6 +3209,56 @@ class PortBusyDiagnosis(unittest.TestCase):
             self.assertIsNone(rs._probe_udp_port(retry_s=5.0))
         self.assertEqual(len(calls), 3)
 
+    def _reserved(self):
+        return ("reserved", "Windows has reserved UDP port 50505.", None)
+
+    def test_declined_admin_prompt_says_so_and_does_not_wait(self):
+        said, probes = [], []
+        with mock.patch.object(rs, "diagnose_port_busy", lambda e: self._reserved()), \
+             mock.patch.object(rs, "_ask_yes_no", lambda *a, **k: True), \
+             mock.patch.object(rs, "_reserve_port_for_lazer", lambda: False), \
+             mock.patch.object(rs, "_probe_udp_port", lambda **k: probes.append(k)), \
+             mock.patch.object(rs, "_cli_say", lambda t, **k: said.append(t)):
+            self.assertFalse(rs.resolve_port_busy(OSError(13, "x")))
+        self.assertEqual(probes, [])                      # no pointless 3 s wait
+        self.assertEqual(len(said), 1)
+        self.assertIn("admin permission", said[0])
+        self.assertNotIn("Restart the laptop", said[0])
+
+    def test_granted_fix_continues_once_the_port_is_free(self):
+        with mock.patch.object(rs, "diagnose_port_busy", lambda e: self._reserved()), \
+             mock.patch.object(rs, "_ask_yes_no", lambda *a, **k: True), \
+             mock.patch.object(rs, "_reserve_port_for_lazer", lambda: True), \
+             mock.patch.object(rs, "_probe_udp_port", lambda **k: None):
+            self.assertTrue(rs.resolve_port_busy(OSError(13, "x")))
+
+    def test_gui_path_asks_in_a_box_not_the_terminal(self):
+        seen = {}
+
+        def ask(text, title="LazeR", box=False):
+            seen["box"] = box
+            return False
+        with mock.patch.object(rs, "diagnose_port_busy", lambda e: self._reserved()), \
+             mock.patch.object(rs, "_ask_yes_no", ask):
+            rs.resolve_port_busy(OSError(13, "x"), box=True)
+        self.assertTrue(seen["box"])
+
+
+class ConnectedEventListeners(unittest.TestCase):
+    """_client_connected tells the input guard the moment a phone pairs — and,
+    since set() runs on the UDP thread, a failing listener must never escape."""
+
+    def test_listener_runs_on_set_and_errors_are_swallowed(self):
+        ev = rs._ConnectedEvent()
+        hits = []
+
+        def boom():
+            raise RuntimeError("listener bug")
+        ev.listeners += [boom, lambda: hits.append(1)]
+        ev.set()                                   # must not raise
+        self.assertTrue(ev.is_set())
+        self.assertEqual(hits, [1])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

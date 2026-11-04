@@ -149,7 +149,26 @@ _stop = threading.Event()   # set by GUI close or KeyboardInterrupt
 # latches the pause until the user explicitly resumes.
 _remote_paused = threading.Event()   # set ⇒ ignore remote control verbs
 _panic_latched = threading.Event()   # set ⇒ stay paused until user resumes
-_client_connected = threading.Event()  # a phone is currently paired
+class _ConnectedEvent(threading.Event):
+    """threading.Event that also tells listeners when it is set, so the input
+    guard can put its mouse hook in place the moment a phone pairs rather than on
+    its next timer tick. set() runs on the UDP thread, which must never raise
+    (see CLAUDE.md), so a failing listener is ignored."""
+
+    def __init__(self):
+        super().__init__()
+        self.listeners = []
+
+    def set(self):
+        super().set()
+        for fn in list(self.listeners):
+            try:
+                fn()
+            except Exception:
+                pass
+
+
+_client_connected = _ConnectedEvent()  # a phone is currently paired
 _last_physical_ts = [0.0]            # monotonic time of last physical input
 _input_guard = [None]                # the live LocalInputGuard, for serve_loop's wake handling
 PHYSICAL_RESUME_GRACE_S = 2.0        # auto-resume this long after local input stops
@@ -408,14 +427,30 @@ def _wmi_service(namespace):
         loc = comtypes.client.CreateObject("WbemScripting.SWbemLocator", dynamic=True)
         svc = loc.ConnectServer(".", namespace)
         cache[namespace] = svc
+        made = getattr(_wmi_local, "made", None)
+        if made is None:
+            made = _wmi_local.made = {}
+        made[namespace] = time.monotonic()
     return svc
+
+
+_WMI_RECONNECT_S = 60.0
 
 
 def _wmi_forget(namespace):
     """Drop this thread's connection, so the next call reconnects. A connection
-    made before a sleep can go stale, like the audio endpoint."""
+    made before a sleep can go stale, like the audio endpoint.
+
+    At most once a minute per namespace: on a desktop the brightness query fails
+    on every poll (there is no panel), and a fresh locator + ConnectServer each
+    time would be pure waste for an answer that won't change."""
     cache = getattr(_wmi_local, "svc", None)
-    if cache is not None:
+    if cache is None or namespace not in cache:
+        return
+    stamps = getattr(_wmi_local, "made", None)
+    if stamps is None:
+        stamps = _wmi_local.made = {}
+    if time.monotonic() - stamps.get(namespace, 0.0) >= _WMI_RECONNECT_S:
         cache.pop(namespace, None)
 
 
@@ -1750,7 +1785,8 @@ class LocalInputGuard:
     PANIC_MODIFIERS = (0x10, 0x11, 0x12)             # shift, ctrl, alt (generic)
 
     WM_REARM = 0x8000 + 1        # WM_APP+1: our private "re-install the hooks" ping
-    MOUSE_SYNC_MS = 250          # how often the mouse hook follows the connection
+    WM_SYNC = 0x8000 + 2         # WM_APP+2: "a phone just connected — hook the mouse"
+    MOUSE_SYNC_MS = 250          # backstop: how often the mouse hook follows the connection
 
     def __init__(self, on_physical, on_panic):
         self._on_physical = on_physical
@@ -1764,7 +1800,21 @@ class LocalInputGuard:
             return False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        _client_connected.listeners.append(self._sync_now)
         return True
+
+    def _sync_now(self):
+        """Ask the hook thread to install the mouse hook now (a phone connected).
+        Without it, physical mouse input in the first timer period after pairing
+        went unnoticed and didn't pause the phone."""
+        tid = self._tid
+        if tid is None:
+            return
+        try:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(tid, self.WM_SYNC, 0, 0)
+        except Exception:
+            pass
 
     def rearm(self):
         """Re-install the hooks after a wake or a lock/unlock.
@@ -1880,7 +1930,7 @@ class LocalInputGuard:
             r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if r in (0, -1):
                 break
-            if msg.message == WM_TIMER and not msg.hwnd:
+            if (msg.message == WM_TIMER and not msg.hwnd) or msg.message == self.WM_SYNC:
                 want = _client_connected.is_set()
                 if want and not ms_hook:
                     ms_hook = install_ms() or None
@@ -2990,6 +3040,28 @@ def _fw_profiles_ignoring_local_rules():
     return out
 
 
+def _fw_policy_rules_present():
+    """True when Group Policy or MDM delivers firewall rules to this PC (either
+    root's FirewallRules key holds any). A registry read: no subprocess."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import winreg
+    except Exception:
+        return False
+    for root in _FW_POLICY_ROOTS:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                root + "\\FirewallRules") as k:
+                if winreg.QueryInfoKey(k)[1] > 0:      # value count
+                    return True
+        except OSError:
+            continue
+        except Exception:
+            continue
+    return False
+
+
 def _fw_current_profile_types():
     """Bitmask of the firewall profiles in force right now (1 Domain / 2 Private
     / 4 Public), or None if we can't tell.
@@ -3099,7 +3171,11 @@ def firewall_block_rules():
     if not sys.platform.startswith("win"):
         return []
     via_com = _fw_block_rules_com()
-    if via_com is not None:
+    # The firewall API lists the machine's own rules; rules that Group Policy or
+    # Intune deliver may not be among them. A clean COM answer is trusted only
+    # where no policy rules exist — on a managed PC ask the ActiveStore, which
+    # holds what is actually in force.
+    if via_com is not None and (via_com or not _fw_policy_rules_present()):
         return via_com
     # Fallback. Enum values (Inbound/Block/True) are not localized, unlike netsh's.
     import subprocess
@@ -4096,6 +4172,7 @@ class LazeRWindow:
     BANNER_R = 20
     PAGE_W = 440         # content column width
     GUTTER = 20
+    IMG_CACHE_MAX = 256
 
     def __init__(self, ip, port, wire, event_q, require_secure, update_check=True,
                  net=None, notices=(), minimized=False):
@@ -4298,10 +4375,29 @@ class LazeRWindow:
         draw(ImageDraw.Draw(big), s)
         img = ImageTk.PhotoImage(big.resize((max(1, w), max(1, h)), Image.LANCZOS),
                                  master=self._root)
-        if len(self._img_cache) > 160:      # window resizes make one-off sizes
-            self._img_cache.clear()
+        if len(self._img_cache) >= self.IMG_CACHE_MAX:
+            # Window resizes mint one-off sizes, so trim the oldest half. Safe:
+            # whatever is on screen is also held by its widget (see _put), so
+            # dropping it here never blanks it.
+            for k in list(self._img_cache)[:self.IMG_CACHE_MAX // 2]:
+                del self._img_cache[k]
         self._img_cache[key] = img
         return img
+
+    @staticmethod
+    def _put(widget, img, item=None):
+        """Show [img] on a label (item None) or a canvas item, and keep it alive.
+        Tk holds an image only by name: once the last Python reference goes, the
+        image is deleted and whatever showed it goes blank. The widget therefore
+        holds a reference per slot, so the shape cache is free to evict."""
+        held = widget.__dict__.setdefault("_lazer_held", {})
+        held[item] = img
+        if img is None:
+            return
+        if item is None:
+            widget.config(image=img)
+        else:
+            widget.itemconfigure(item, image=img)
 
     def _rrect(self, w, h, r, fill, outline=None, width=1):
         def draw(d, s):
@@ -4399,7 +4495,7 @@ class LazeRWindow:
             drawn[0] = (w, h)
             img = self._rrect(w, h, r, color, outline)
             if img is not None:
-                cv.itemconfigure(img_id, image=img)
+                self._put(cv, img, img_id)
             else:
                 cv.configure(bg=color)
 
@@ -4472,7 +4568,7 @@ class LazeRWindow:
             cv.configure(width=w)
             img = self._rrect(w, h, h // 2, fill, outline, _px(2) if state["focus"] else 1)
             if img is not None:
-                cv.itemconfigure(img_id, image=img)
+                self._put(cv, img, img_id)
             cv.coords(txt_id, w / 2, h / 2)
             cv.itemconfigure(txt_id, text=state["text"], fill=fg)
 
@@ -4526,7 +4622,7 @@ class LazeRWindow:
         track = cv.create_image(0, 0, anchor="nw")
         thumb = cv.create_image(0, 0, anchor="center")
         st = {"on": bool(on), "pos": 1.0 if on else 0.0, "hover": False,
-              "focus": False, "anim": None, "enabled": enabled}
+              "focus": False, "anim": None, "enabled": enabled, "press": False}
 
         def paint():
             pos = st["pos"]
@@ -4546,11 +4642,11 @@ class LazeRWindow:
                 th_col = _C["outline"] if not st["hover"] else _C["on_variant"]
                 d = _px(16 + 8 * pos)
             if tr is not None:
-                cv.itemconfigure(track, image=tr)
+                self._put(cv, tr, track)
             x = _px(16) + (W - _px(32)) * pos
             img = self._dot_img(th_col, d)
             if img is not None:
-                cv.itemconfigure(thumb, image=img)
+                self._put(cv, img, thumb)
             cv.coords(thumb, x, H / 2)
 
         def animate():
@@ -4578,7 +4674,18 @@ class LazeRWindow:
             if st["enabled"]:
                 command()
 
-        cv.bind("<ButtonRelease-1>", click)
+        def press(_e):
+            st["press"] = True
+
+        def release(e):
+            # Like _button: only a press that began here and ends here toggles,
+            # so dragging across the switch and letting go on it changes nothing.
+            pressed, st["press"] = st["press"], False
+            if pressed and 0 <= e.x < cv.winfo_width() and 0 <= e.y < cv.winfo_height():
+                click()
+
+        cv.bind("<ButtonPress-1>", press)
+        cv.bind("<ButtonRelease-1>", release)
         cv.bind("<Return>", click)
         cv.bind("<space>", click)
         cv.bind("<Enter>", lambda e: (st.update(hover=True), paint()))
@@ -4617,10 +4724,10 @@ class LazeRWindow:
             cv.configure(width=w)
             img = self._rrect(w, h, h // 2, fill)
             if img is not None:
-                cv.itemconfigure(img_id, image=img)
+                self._put(cv, img, img_id)
             di = self._dot_img(dot, _px(8))
             if di is not None:
-                cv.itemconfigure(dot_id, image=di)
+                self._put(cv, di, dot_id)
             cv.coords(dot_id, _px(12), h / 2)
             cv.coords(txt_id, _px(28), h / 2)
             cv.itemconfigure(txt_id, text=t, fill=fg)
@@ -4773,8 +4880,8 @@ class LazeRWindow:
             self._brand_img = ImageTk.PhotoImage(im, master=self._root)
             mark.config(image=self._brand_img)
         except Exception:
-            mark.config(image=self._icon("shield", _px(32), _C["on_primary_ctr"],
-                                         _C["primary_ctr"]) or "")
+            self._put(mark, self._icon("shield", _px(32), _C["on_primary_ctr"],
+                                       _C["primary_ctr"]))
         mark.pack(side="left")
 
         names = tk.Frame(bar, bg=_C["surface"])
@@ -4803,7 +4910,7 @@ class LazeRWindow:
         self._avatar.pack(side="left")
         ic = self._icon("laptop", n, _C["on_primary_ctr"], _C["primary_ctr"])
         if ic is not None:
-            self._avatar.create_image(0, 0, anchor="nw", image=ic)
+            self._put(self._avatar, ic, self._avatar.create_image(0, 0, anchor="nw"))
         self._dotid = self._avatar.create_image(n, n, anchor="se")
         self._paint_avatar_dot(False)
 
@@ -4819,7 +4926,7 @@ class LazeRWindow:
         img = self._dot_img(_C["ok"] if connected else _C["outline"], _px(16),
                             ring=_C["container"], ring_w=_px(3))
         if img is not None:
-            self._avatar.itemconfigure(self._dotid, image=img)
+            self._put(self._avatar, img, self._dotid)
 
     # ── banners ──────────────────────────────────────────────────────────────
     def _banner(self, parent, icon):
@@ -4832,7 +4939,7 @@ class LazeRWindow:
         ic = self._icon(icon, _px(24), _C["on_warn_ctr"])
         lead = tk.Label(card, bg=_C["warn_ctr"], bd=0)
         if ic is not None:
-            lead.config(image=ic)
+            self._put(lead, ic)
         lead.pack(side="left", anchor="n", padx=(0, _px(12)))
         col = tk.Frame(card, bg=_C["warn_ctr"])
         col.pack(side="left", fill="x", expand=True)
@@ -5164,20 +5271,16 @@ class LazeRWindow:
             # Click-to-show placeholder swapped in by the idle hide
             # (QR_HIDE_AFTER_MS): an unattended laptop must not advertise its
             # token+key to every passer-by indefinitely.
-            qw, qh = self._photo.width(), self._photo.height()
-            ph = tk.Canvas(slot, width=qw, height=qh, bg=bg, highlightthickness=0, bd=0,
-                           takefocus=1)
-            shape = self._rrect(qw, qh, _px(20), _C["container_hi"])
-            if shape is not None:
-                ph.create_image(0, 0, anchor="nw", image=shape)
-            self._ph_text = ph.create_text(qw / 2, qh / 2, text="", width=qw - _px(40),
-                                           justify="center", font=self.f_md,
-                                           fill=_C["on_variant"])
+            ph = tk.Canvas(slot, bg=bg, highlightthickness=0, bd=0, takefocus=1)
+            self._ph_shape = ph.create_image(0, 0, anchor="nw")
+            self._ph_text = ph.create_text(0, 0, text="", justify="center",
+                                           font=self.f_md, fill=_C["on_variant"])
             ph.bind("<Button-1>", lambda e: self._show_qr())
             ph.bind("<Return>", lambda e: self._show_qr())
             ph.bind("<space>", lambda e: self._show_qr())
             self._qr_placeholder = ph
             self._qr_ph_label = ph
+            self._fit_placeholder()
         except ImportError:
             tk.Label(pad, text="Install Pillow for the QR image:\npip install pillow",
                      bg=bg, fg=_C["on_variant"], font=self.f_sm,
@@ -5227,7 +5330,7 @@ class LazeRWindow:
         ic = self._icon("check", n, _C["on_ok_ctr"], _C["ok_ctr"])
         check = tk.Label(pad, bg=bg, bd=0)
         if ic is not None:
-            check.config(image=ic)
+            self._put(check, ic)
         check.pack()
 
         tk.Label(pad, text="Phone connected", bg=bg, fg=_C["on_surface"],
@@ -5282,11 +5385,25 @@ class LazeRWindow:
         self._repaint_qr(new_uri)
         self._refresh_discovery_pill()
 
+    def _fit_placeholder(self):
+        """Size the hidden-QR tile to the QR it stands in for. A new address can
+        change the QR's version and so its size; a tile left at the old size
+        made the card jump on every idle hide."""
+        ph, photo = getattr(self, "_qr_placeholder", None), getattr(self, "_photo", None)
+        if ph is None or photo is None:
+            return
+        qw, qh = photo.width(), photo.height()
+        ph.configure(width=qw, height=qh)
+        self._put(ph, self._rrect(qw, qh, _px(20), _C["container_hi"]), self._ph_shape)
+        ph.coords(self._ph_text, qw / 2, qh / 2)
+        ph.itemconfigure(self._ph_text, width=max(1, qw - _px(40)))
+
     def _repaint_qr(self, uri):
         if self._make_qr_photo and self._qr_img_label is not None:
             try:
                 self._photo = self._make_qr_photo(uri)
                 self._qr_img_label.config(image=self._photo)
+                self._fit_placeholder()
                 # A freshly painted QR exists to be scanned — show it and restart
                 # the idle-hide clock.
                 self._show_qr()
@@ -5589,7 +5706,7 @@ class LazeRWindow:
         ic = self._icon("info", _px(18), _C["on_variant"])
         lead = tk.Label(box, bg=_C["surface_low"], bd=0)
         if ic is not None:
-            lead.config(image=ic)
+            self._put(lead, ic)
         lead.pack(side="left", anchor="n", padx=(0, _px(10)))
         tk.Label(box, text=text, bg=_C["surface_low"], fg=_C["on_variant"],
                  font=self.f_sm, justify="left", anchor="w",
@@ -5697,7 +5814,11 @@ class LazeRWindow:
         else:
             text, fg = "Details", _C["primary"]
         img = self._icon(icon, _px(18), fg)
-        self._toggle.config(text=text + "  ", fg=fg, image=img or "")
+        self._toggle.config(text=text + "  ", fg=fg)
+        if img is not None:
+            self._put(self._toggle, img)
+        else:
+            self._toggle.config(image="")
 
     def _center(self):
         self._root.update_idletasks()
@@ -6099,11 +6220,12 @@ def _dialog_text(text):
     return "\n".join(ln[:1].upper() + ln[1:] for ln in lines)
 
 
-def _cli_say(text, title="LazeR", error=False):
+def _cli_say(text, title="LazeR", error=False, box=False):
     """Report the outcome of a one-shot CLI action. Prints when there is a
     console; otherwise (a shortcut or Run entry to the windowed exe) shows a
-    message box, so the result is never silently lost."""
-    if sys.stdout is not None:
+    message box, so the result is never silently lost. [box] forces the message
+    box on Windows, for the GUI's own start-up errors."""
+    if sys.stdout is not None and not (box and sys.platform.startswith("win")):
         print(text)
         return
     if sys.platform.startswith("win"):
@@ -6285,22 +6407,40 @@ def _reserve_port_for_lazer():
     winnat holds the Hyper-V/WSL/Docker reservations, and an exclusion can't be
     added over a range it holds, so it is stopped for the moment the exclusion is
     added and started again — WSL/Docker networking blinks for about a second.
-    The exclusion is persistent: later reboots reserve around it."""
+    The exclusion is persistent: later reboots reserve around it.
+
+    winnat is stopped and started again only if it was running: starting a NAT
+    service the user (or their setup) had left stopped would be a side effect
+    nobody asked for. False when the user declined the UAC prompt."""
     if not sys.platform.startswith("win"):
         return False
     net = f'"{win_exe("net.exe")}"'
     netsh = f'"{win_exe("netsh.exe")}"'
-    chain = (f'{net} stop winnat >nul 2>nul & '
-             f'{netsh} int ipv4 add excludedportrange protocol=udp startport={PORT} '
-             f'numberofports=1 store=persistent >nul 2>nul & '
-             f'{net} start winnat >nul 2>nul')
+    add = (f'{netsh} int ipv4 add excludedportrange protocol=udp startport={PORT} '
+           f'numberofports=1 store=persistent >nul 2>nul')
+    if _winnat_running() is False:
+        chain = add
+    else:       # running, or can't tell: the stop/start pair is what makes room
+        chain = (f'{net} stop winnat >nul 2>nul & {add} & '
+                 f'{net} start winnat >nul 2>nul')
     return _run_elevated_and_wait(win_exe("cmd.exe"), '/c "' + chain + '"', 60000)
 
 
-def _ask_yes_no(text, title="LazeR"):
-    """A Yes/No question: a message box for the windowed app, a prompt in a
-    terminal. False when nobody can answer."""
-    if sys.platform.startswith("win") and sys.stdout is None:
+def _winnat_running():
+    """True/False for the winnat service, None when it can't be read. psutil asks
+    the service manager directly — no `sc.exe`."""
+    try:
+        import psutil
+        return psutil.win_service_get("winnat").status() == "running"
+    except Exception:
+        return None
+
+
+def _ask_yes_no(text, title="LazeR", box=False):
+    """A Yes/No question: a message box for the windowed app (or whenever [box]
+    is set — the GUI must not wait on a terminal prompt nobody is looking at), a
+    prompt in a terminal. False when nobody can answer."""
+    if sys.platform.startswith("win") and (box or sys.stdout is None):
         try:
             import ctypes
             # MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND; IDYES = 6
@@ -6314,29 +6454,37 @@ def _ask_yes_no(text, title="LazeR"):
         return False
 
 
-def resolve_port_busy(err):
+def resolve_port_busy(err, box=False):
     """Explain a failed bind and offer the fix that fits. True when the port is
-    free afterwards and starting can continue."""
+    free afterwards and starting can continue. [box]: ask and report in message
+    boxes even when a console is attached (the GUI path)."""
     kind, text, pid = diagnose_port_busy(err)
+
+    def say(msg):
+        _cli_say(msg, error=True, box=box)
+
     if kind == "lazer":
-        if _ask_yes_no(text + "\n\nEnd it and start this one?"):
+        if _ask_yes_no(text + "\n\nEnd it and start this one?", box=box):
             if _end_process(pid) and _probe_udp_port(retry_s=3.0) is None:
                 return True
-            _cli_say("Couldn't end the other LazeR. Restart Windows, or end it in Task "
-                     "Manager → Details as the user who started it.", error=True)
+            say("Couldn't end the other LazeR. Restart Windows, or end it in Task "
+                "Manager → Details as the user who started it.")
         return False
     if kind == "reserved":
         if _ask_yes_no(text + f"\n\nLazeR can ask Windows to keep port {PORT} free "
                        "for it from now on. This needs admin once, and briefly "
                        "restarts Windows' NAT service (WSL and Docker networking "
-                       "blink for a second).\n\nFix it now?"):
-            _reserve_port_for_lazer()
+                       "blink for a second).\n\nFix it now?", box=box):
+            if not _reserve_port_for_lazer():
+                say("Nothing was changed — Windows didn't get admin permission. "
+                    "Start LazeR again to retry.")
+                return False
             if _probe_udp_port(retry_s=3.0) is None:
                 return True
-            _cli_say("Windows still won't let LazeR use the port. Restart the laptop "
-                     "and start LazeR again.", error=True)
+            say("Windows still won't let LazeR use the port. Restart the laptop "
+                "and start LazeR again.")
         return False
-    _cli_say(text + f"\n\n({err})", error=True)
+    say(text + f"\n\n({err})")
     return False
 
 
@@ -6521,7 +6669,7 @@ def main():
                     print("LazeR is already running — opened the existing window.")
                 return
             busy = _probe_udp_port(retry_s=2.0)
-            if busy is not None and not resolve_port_busy(busy):
+            if busy is not None and not resolve_port_busy(busy, box=True):
                 return
             migrate_startup_command()
             if apply_startup_default():
