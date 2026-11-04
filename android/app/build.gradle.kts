@@ -18,8 +18,8 @@ android {
         // dialect. These were left at 1/"1.0" through six tagged releases, so every
         // shipped APK claimed the same version and users couldn't tell builds apart.
         // publish_release.ps1 now asserts -Tag matches versionName.
-        versionCode = 20501
-        versionName = "2.5.1"
+        versionCode = 20500
+        versionName = "2.5.0"
         manifestPlaceholders["appLabel"] = "LazeR"
     }
 
