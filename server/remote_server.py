@@ -16,6 +16,7 @@ import base64
 import ipaddress
 import os
 import queue
+import re
 import secrets
 import socket
 import string
@@ -376,6 +377,135 @@ get_volume, set_volume, VOLUME_BACKEND = make_volume()
 
 
 # ── brightness ──────────────────────────────────────────────────────────────
+# ── in-process WMI (no PowerShell) ─────────────────────────────────────────────
+# Brightness and the chassis type used to be read by starting `powershell.exe` —
+# ~0.5–1 s of CPU and a PowerShell + conhost pair in Task Manager on every poll,
+# plus one warm PowerShell kept alive for writes. WMI is a COM API, and comtypes
+# (already here for pycaw) talks to it directly from our own process in a few
+# milliseconds. PowerShell stays only as the fallback for a machine where the COM
+# route doesn't work at all.
+#
+# COM is per-thread (see make_volume), so each thread gets its own initialized
+# connection. Every property and method goes through the SWbemScripting type
+# library (Properties_ / Methods_ / ExecMethod_) rather than through WMI's dynamic
+# members: comtypes binds names against the type library, where a WMI class's own
+# properties don't exist.
+_wmi_local = threading.local()
+
+
+def _wmi_service(namespace):
+    cache = getattr(_wmi_local, "svc", None)
+    if cache is None:
+        cache = _wmi_local.svc = {}
+    svc = cache.get(namespace)
+    if svc is None:
+        import comtypes
+        import comtypes.client
+        try:
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        loc = comtypes.client.CreateObject("WbemScripting.SWbemLocator", dynamic=True)
+        svc = loc.ConnectServer(".", namespace)
+        cache[namespace] = svc
+    return svc
+
+
+def _wmi_forget(namespace):
+    """Drop this thread's connection, so the next call reconnects. A connection
+    made before a sleep can go stale, like the audio endpoint."""
+    cache = getattr(_wmi_local, "svc", None)
+    if cache is not None:
+        cache.pop(namespace, None)
+
+
+def _wmi_first(namespace, wql):
+    """First object a WQL query returns, or None when it returns nothing.
+    Raises on a COM/WMI failure."""
+    for obj in _wmi_service(namespace).ExecQuery(wql):
+        return obj
+    return None
+
+
+def _wmi_prop(obj, name):
+    return obj.Properties_.Item(name).Value
+
+
+def _wmi_com_works():
+    """True when in-process WMI answers on this machine (Win32_OperatingSystem
+    always exists), so a later brightness failure means "no panel", not "broken
+    plumbing"."""
+    try:
+        return _wmi_first(r"root\cimv2",
+                          "SELECT Caption FROM Win32_OperatingSystem") is not None
+    except Exception:
+        return False
+
+
+def _wmi_brightness_get():
+    """0..100 from the integrated panel, or None when there is none right now
+    (desktop, lid closed, docked to an external screen only)."""
+    try:
+        obj = _wmi_first(r"root\WMI",
+                         "SELECT CurrentBrightness FROM WmiMonitorBrightness")
+        return None if obj is None else int(_wmi_prop(obj, "CurrentBrightness"))
+    except Exception:
+        _wmi_forget(r"root\WMI")
+        return None
+
+
+def _wmi_brightness_set(pct):
+    """Apply [pct]. True when applied, None when there is no panel to apply it to,
+    False on a COM/WMI failure (the caller may try another route)."""
+    try:
+        obj = _wmi_first(r"root\WMI", "SELECT * FROM WmiMonitorBrightnessMethods")
+        if obj is None:
+            return None
+        args = obj.Methods_.Item("WmiSetBrightness").InParameters.SpawnInstance_()
+        args.Properties_.Item("Timeout").Value = 1
+        args.Properties_.Item("Brightness").Value = max(0, min(100, int(pct)))
+        obj.ExecMethod_("WmiSetBrightness", args)
+        return True
+    except Exception:
+        _wmi_forget(r"root\WMI")
+        return False
+
+
+_LAPTOP_CHASSIS = {8, 9, 10, 11, 12, 14, 30, 31, 32}
+
+
+def _wmi_is_laptop():
+    """Chassis says portable → True; says desktop → False; can't tell → None."""
+    try:
+        obj = _wmi_first(r"root\cimv2",
+                         "SELECT ChassisTypes FROM Win32_SystemEnclosure")
+        if obj is None:
+            return None
+        types = {int(t) for t in (_wmi_prop(obj, "ChassisTypes") or ())}
+        return bool(types & _LAPTOP_CHASSIS)
+    except Exception:
+        return None
+
+
+def _has_system_battery():
+    """GetSystemPowerStatus: BatteryFlag 128 = no system battery, 255 = unknown."""
+    try:
+        import ctypes
+
+        class SPS(ctypes.Structure):
+            _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                        ("BatteryLifePercent", ctypes.c_ubyte),
+                        ("SystemStatusFlag", ctypes.c_ubyte),
+                        ("BatteryLifeTime", ctypes.c_ulong),
+                        ("BatteryFullLifeTime", ctypes.c_ulong)]
+        st = SPS()
+        if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(st)):
+            return False
+        return st.BatteryFlag not in (128, 255)
+    except Exception:
+        return False
+
+
 def make_brightness():
     """Return (get_brightness, set_brightness, label); fns may be None if absent.
     Same shape as make_volume — best effort per OS, integrated display only."""
@@ -468,6 +598,18 @@ def make_brightness():
         # would hide the slider for the entire session in those cases (the recurring
         # "brightness slider keeps disappearing" bug). get_win returns None while the
         # class is absent, so the service simply reports unavailable until it shows up.
+        if _wmi_com_works():
+            # The normal path: no child processes at all. A failed COM write (a
+            # driver that rejects WmiSetBrightness through this route) falls back
+            # to the warm PowerShell for that write, so the slider keeps working.
+            def set_com(pct):
+                if _wmi_brightness_set(pct) is False:
+                    set_win(pct)
+
+            laptop = _wmi_is_laptop()
+            if laptop is None:
+                laptop = _has_system_battery()
+            return _wmi_brightness_get, set_com, "wmi", laptop
         return get_win, set_win, "wmi", _is_laptop()
 
     if plat == "darwin":
@@ -1608,6 +1750,7 @@ class LocalInputGuard:
     PANIC_MODIFIERS = (0x10, 0x11, 0x12)             # shift, ctrl, alt (generic)
 
     WM_REARM = 0x8000 + 1        # WM_APP+1: our private "re-install the hooks" ping
+    MOUSE_SYNC_MS = 250          # how often the mouse hook follows the connection
 
     def __init__(self, on_physical, on_panic):
         self._on_physical = on_physical
@@ -1652,6 +1795,7 @@ class LocalInputGuard:
         WH_KEYBOARD_LL, WH_MOUSE_LL = 13, 14
         WM_KEYDOWN, WM_SYSKEYDOWN = 0x0100, 0x0104
         WM_KEYUP, WM_SYSKEYUP = 0x0101, 0x0105
+        WM_TIMER = 0x0113
         LLKHF_INJECTED, LLMHF_INJECTED = 0x10, 0x01
 
         LRESULT = ctypes.c_ssize_t
@@ -1709,7 +1853,25 @@ class LocalInputGuard:
             return (user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kb_cb, hmod, 0),
                     user32.SetWindowsHookExW(WH_MOUSE_LL, self._ms_cb, hmod, 0))
 
-        kb_hook, ms_hook = install()
+        def install_kb():
+            return user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kb_cb, hmod, 0)
+
+        def install_ms():
+            return user32.SetWindowsHookExW(WH_MOUSE_LL, self._ms_cb, hmod, 0)
+
+        # The MOUSE hook is installed only while a phone is connected. A low-level
+        # mouse hook sits in front of every physical mouse event on the machine:
+        # Windows waits for our Python callback (and so for the GIL) before the
+        # pointer moves. With no phone attached the callback had nothing to do
+        # (_physical_event returns at once) but the laptop's own mouse still paid
+        # that round trip on every move — up to 1000 times a second on a gaming
+        # mouse, and a visible hitch whenever another of our threads held the GIL.
+        # A 250 ms thread timer syncs the hook with the connection, so serve_loop
+        # needs no knowledge of us. The keyboard hook stays: keys are rare and the
+        # panic chord must always work.
+        kb_hook = install_kb()
+        ms_hook = install_ms() if _client_connected.is_set() else None
+        user32.SetTimer(None, 0, self.MOUSE_SYNC_MS, None)
         # Set LAST: rearm() posts to this id, and a caller that read it before the
         # hooks existed would ping a thread with nothing to re-install.
         self._tid = kernel32.GetCurrentThreadId()
@@ -1718,6 +1880,22 @@ class LocalInputGuard:
             r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if r in (0, -1):
                 break
+            if msg.message == WM_TIMER and not msg.hwnd:
+                want = _client_connected.is_set()
+                if want and not ms_hook:
+                    ms_hook = install_ms() or None
+                elif not want and ms_hook:
+                    user32.UnhookWindowsHookEx(ms_hook)
+                    ms_hook = None
+                continue
+            if msg.message == self.WM_REARM and not ms_hook:
+                # Mouse hook is off (no phone): re-install just the keyboard one,
+                # new before old for the same reason as below.
+                new_kb = install_kb()
+                if new_kb:
+                    user32.UnhookWindowsHookEx(kb_hook)
+                    kb_hook = new_kb
+                continue
             if msg.message == self.WM_REARM:
                 # A thread-message has no window, so it is never dispatched — handle
                 # it here.
@@ -1737,7 +1915,8 @@ class LocalInputGuard:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
         user32.UnhookWindowsHookEx(kb_hook)
-        user32.UnhookWindowsHookEx(ms_hook)
+        if ms_hook:
+            user32.UnhookWindowsHookEx(ms_hook)
 
 
 # ── packet handler ────────────────────────────────────────────────────────────
@@ -2715,16 +2894,42 @@ def firewall_rule_exists():
     instead — only we create it, and only ever with profile=any."""
     if not sys.platform.startswith("win"):
         return True   # we only manage Windows Firewall; assume OK elsewhere
-    import subprocess
+    return _fw_rule_named(FW_RULE_NAME)
+
+
+# The firewall reads go through the firewall's own COM API (HNetCfg.FwPolicy2)
+# in-process. They used to start netsh.exe and powershell.exe — at launch, every
+# FW_RECHECK_MS, after every network change and every wake — which is what put
+# netsh, PowerShell and their conhost windows under LazeR in Task Manager, and
+# PowerShell's start-up alone burns a second of CPU. The subprocess versions stay
+# as fallbacks for a machine where the COM route fails outright.
+_HR_NOT_FOUND = -2147024894            # HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+
+
+def _fw_policy():
+    import comtypes
+    import comtypes.client
     try:
-        r = subprocess.run(
-            [win_exe("netsh.exe"), "advfirewall", "firewall", "show", "rule",
-             f"name={FW_RULE_NAME}"],
-            capture_output=True, text=True, timeout=6,
-            creationflags=_no_window_flags())
-        return r.returncode == 0 and "No rules match" not in r.stdout
+        comtypes.CoInitialize()        # COM is per-thread; callers run on workers
     except Exception:
-        return False
+        pass
+    return comtypes.client.CreateObject("HNetCfg.FwPolicy2", dynamic=True)
+
+
+def _fw_rule_named_com(name):
+    """True/False from the firewall API, or None when it can't be asked."""
+    try:
+        rules = _fw_policy().Rules
+    except Exception:
+        return None
+    try:
+        rules.Item(name)
+        return True
+    except Exception as e:
+        hr = getattr(e, "hresult", None)
+        if hr is None and getattr(e, "args", None):
+            hr = e.args[0]
+        return False if hr == _HR_NOT_FOUND else None
 
 
 # Group Policy can tell Windows to ignore every locally-created firewall rule on
@@ -2804,8 +3009,7 @@ def _fw_current_profile_types():
     except Exception:
         pass
     try:
-        return int(comtypes.client.CreateObject("HNetCfg.FwPolicy2")
-                   .CurrentProfileTypes)
+        return int(_fw_policy().CurrentProfileTypes)
     except Exception:
         return None
 
@@ -2867,12 +3071,37 @@ def _cmd_safe(text):
     return not any(c in text for c in '&|<>^%"')
 
 
+def _fw_block_rules_com():
+    """Names of enabled inbound block rules for this program, or None when the
+    firewall API can't be asked. Checks the program first: it's the one test that
+    rules out nearly every rule, so most cost a single COM call."""
+    prog = os.path.normcase(_self_program())
+    try:
+        rules = _fw_policy().Rules
+        out = []
+        for r in rules:
+            try:
+                app = r.ApplicationName
+                if not app or os.path.normcase(os.path.expandvars(app)) != prog:
+                    continue
+                if r.Direction == 1 and r.Action == 0 and r.Enabled:  # in / block
+                    out.append(str(r.Name))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return None
+
+
 def firewall_block_rules():
     """Display names of enabled inbound rules that block this program. Read-only,
-    no admin. Enum values (Inbound/Block/True) are not localized, unlike netsh's
-    output. Empty when there are none or we can't tell."""
+    no admin. Empty when there are none or we can't tell."""
     if not sys.platform.startswith("win"):
         return []
+    via_com = _fw_block_rules_com()
+    if via_com is not None:
+        return via_com
+    # Fallback. Enum values (Inbound/Block/True) are not localized, unlike netsh's.
     import subprocess
     prog = _self_program().replace("'", "''")
     cmd = ("Get-NetFirewallApplicationFilter -PolicyStore ActiveStore "
@@ -3039,12 +3268,17 @@ def _firewall_remove_ours():
 
 
 def _fw_rule_named(name):
+    if not sys.platform.startswith("win"):
+        return False
+    via_com = _fw_rule_named_com(name)
+    if via_com is not None:
+        return via_com
     import subprocess
     try:
         r = subprocess.run(
             [win_exe("netsh.exe"), "advfirewall", "firewall", "show", "rule",
              f"name={name}"],
-            capture_output=True, text=True, timeout=6,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=6,
             creationflags=_no_window_flags())
         return r.returncode == 0 and "No rules match" not in r.stdout
     except Exception:
@@ -5144,9 +5378,14 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
         print("[error] another LazeR is already running on this laptop. Close it "
               "first — two servers split the phone's packets between them.")
         _exit_process(1)
-    busy = _probe_udp_port()
+    busy = _probe_udp_port(retry_s=2.0)
     if busy is not None:
-        print(f"[error] {PORT_BUSY_TEXT} ({busy})")
+        kind, text, _ = diagnose_port_busy(busy)
+        print(f"[error] {text} ({busy})")
+        if kind == "reserved":
+            print(f"[error] Fix (admin terminal): net stop winnat, then netsh int ipv4 "
+                  f"add excludedportrange protocol=udp startport={PORT} "
+                  f"numberofports=1, then net start winnat.")
         _exit_process(1)
     uri = build_uri(ip, token, hostname, key) if ip else None
     zc, mdns_info = start_mdns(ip, hostname) if ip else (None, None)
@@ -5425,22 +5664,198 @@ def _resume_outcome(reply):
             "than this one doesn't). Check its window.")
 
 
-def _probe_udp_port():
+def _probe_udp_port(retry_s=0.0):
     """None if UDP PORT can be bound, else the OSError. Run before starting, so
     a port already held (another LazeR, or anything else) is reported once, in
-    words, instead of as a receive loop that crashes and restarts forever."""
-    try:
-        s = open_socket()
-    except OSError as e:
-        return e
-    s.close()
-    return None
+    words, instead of as a receive loop that crashes and restarts forever.
+
+    [retry_s] keeps trying for that long first: a LazeR that was just quit (or
+    restarted by Start with Windows) can hold the port for a moment while it exits,
+    and that is no reason to show anyone an error."""
+    deadline = time.monotonic() + retry_s
+    while True:
+        try:
+            s = open_socket()
+        except OSError as e:
+            if time.monotonic() >= deadline:
+                return e
+            time.sleep(0.25)
+            continue
+        s.close()
+        return None
 
 
+# Why the port couldn't be bound. A blanket "another LazeR is running" was wrong
+# often enough to send people hunting through Task Manager for a copy that didn't
+# exist. In particular WinError 10013 (WSAEACCES) with nobody holding the port is
+# Windows' own port reservation: Hyper-V, WSL 2 and Docker reserve blocks of the
+# dynamic range (49152–65535, 50505 included) at boot, at random, so it can come
+# and go between reboots.
 PORT_BUSY_TEXT = (f"UDP port {PORT} is already in use — most likely another copy of "
                   "LazeR (check the tray and Task Manager). Close it and start LazeR "
                   "again. Two servers on one port split the phone's packets, which "
                   "looks like a flaky connection.")
+
+
+def _udp_port_owner(port):
+    """(pid, process name) of whoever holds UDP [port] here, or None. psutil reads
+    the owning PID straight from the UDP table — no admin, no subprocess."""
+    try:
+        import psutil
+        for c in psutil.net_connections(kind="udp"):
+            if c.laddr and c.laddr.port == port and c.pid and c.pid != os.getpid():
+                try:
+                    name = psutil.Process(c.pid).name()
+                except Exception:
+                    name = None
+                return c.pid, name
+    except Exception:
+        pass
+    return None
+
+
+def _is_lazer_process(pid, name):
+    """Is [pid] a LazeR server — the exe, or `python remote_server.py`?"""
+    own = os.path.basename(sys.executable).lower()
+    if name and ("lazer" in name.lower()
+                 or (getattr(sys, "frozen", False) and name.lower() == own)):
+        return True
+    try:
+        import psutil
+        return any("remote_server" in str(a) for a in psutil.Process(pid).cmdline())
+    except Exception:
+        return False
+
+
+def _windows_reserved_range(port):
+    """(start, end) of a Windows port reservation covering UDP [port], or None.
+    Reads `netsh int ipv4 show excludedportrange` — only ever on this error path.
+    The numbers aren't localized; the labels around them are ignored."""
+    if not sys.platform.startswith("win"):
+        return None
+    import subprocess
+    try:
+        r = subprocess.run(
+            [win_exe("netsh.exe"), "int", "ipv4", "show", "excludedportrange",
+             "protocol=udp"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=6,
+            creationflags=_no_window_flags())
+        return parse_reserved_range(r.stdout, port)
+    except Exception:
+        return None
+
+
+def parse_reserved_range(text, port):
+    for line in (text or "").splitlines():
+        nums = re.findall(r"\d+", line)
+        if len(nums) >= 2:
+            lo, hi = int(nums[0]), int(nums[1])
+            if lo <= port <= hi:
+                return lo, hi
+    return None
+
+
+def diagnose_port_busy(err):
+    """(kind, message, pid) for a failed bind. kind is "lazer" (another LazeR holds
+    it — pid set), "other" (another program — pid set), "reserved" (Windows
+    reserved it for Hyper-V/WSL/Docker) or "unknown"."""
+    owner = _udp_port_owner(PORT)
+    if owner is not None:
+        pid, name = owner
+        if _is_lazer_process(pid, name):
+            return ("lazer",
+                    f"Another copy of LazeR (process {pid}) is already using UDP port "
+                    f"{PORT} but isn't answering — it may be stuck, or running for "
+                    "another Windows user.", pid)
+        label = name or f"process {pid}"
+        return ("other",
+                f"UDP port {PORT} is being used by {label} (process {pid}). LazeR needs "
+                f"that port — close {label} and start LazeR again.", pid)
+    if getattr(err, "winerror", None) == 10013 or getattr(err, "errno", None) == 13:
+        rng = _windows_reserved_range(PORT)
+        where = f" (ports {rng[0]}–{rng[1]})" if rng else ""
+        return ("reserved",
+                f"Windows has reserved UDP port {PORT} for Hyper-V, WSL or Docker"
+                f"{where}, so LazeR isn't allowed to use it. This isn't another copy "
+                "of LazeR. It happens at random after a restart.", None)
+    return ("unknown", PORT_BUSY_TEXT, None)
+
+
+def _end_process(pid, timeout=4.0):
+    """Stop [pid]; True once it's gone. Fails (False) for another user's process."""
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        p.terminate()
+        try:
+            p.wait(timeout)
+        except psutil.TimeoutExpired:
+            p.kill()
+            p.wait(timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _reserve_port_for_lazer():
+    """Ask Windows (one UAC prompt) to keep PORT out of the dynamic reservations.
+
+    winnat holds the Hyper-V/WSL/Docker reservations, and an exclusion can't be
+    added over a range it holds, so it is stopped for the moment the exclusion is
+    added and started again — WSL/Docker networking blinks for about a second.
+    The exclusion is persistent: later reboots reserve around it."""
+    if not sys.platform.startswith("win"):
+        return False
+    net = f'"{win_exe("net.exe")}"'
+    netsh = f'"{win_exe("netsh.exe")}"'
+    chain = (f'{net} stop winnat >nul 2>nul & '
+             f'{netsh} int ipv4 add excludedportrange protocol=udp startport={PORT} '
+             f'numberofports=1 store=persistent >nul 2>nul & '
+             f'{net} start winnat >nul 2>nul')
+    return _run_elevated_and_wait(win_exe("cmd.exe"), '/c "' + chain + '"', 60000)
+
+
+def _ask_yes_no(text, title="LazeR"):
+    """A Yes/No question: a message box for the windowed app, a prompt in a
+    terminal. False when nobody can answer."""
+    if sys.platform.startswith("win") and sys.stdout is None:
+        try:
+            import ctypes
+            # MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND; IDYES = 6
+            return ctypes.windll.user32.MessageBoxW(
+                None, _dialog_text(text), title, 0x4 | 0x20 | 0x10000) == 6
+        except Exception:
+            return False
+    try:
+        return input(text + " [y/N] ").strip().lower() in ("y", "yes")
+    except Exception:
+        return False
+
+
+def resolve_port_busy(err):
+    """Explain a failed bind and offer the fix that fits. True when the port is
+    free afterwards and starting can continue."""
+    kind, text, pid = diagnose_port_busy(err)
+    if kind == "lazer":
+        if _ask_yes_no(text + "\n\nEnd it and start this one?"):
+            if _end_process(pid) and _probe_udp_port(retry_s=3.0) is None:
+                return True
+            _cli_say("Couldn't end the other LazeR. Restart Windows, or end it in Task "
+                     "Manager → Details as the user who started it.", error=True)
+        return False
+    if kind == "reserved":
+        if _ask_yes_no(text + f"\n\nLazeR can ask Windows to keep port {PORT} free "
+                       "for it from now on. This needs admin once, and briefly "
+                       "restarts Windows' NAT service (WSL and Docker networking "
+                       "blink for a second).\n\nFix it now?"):
+            _reserve_port_for_lazer()
+            if _probe_udp_port(retry_s=3.0) is None:
+                return True
+            _cli_say("Windows still won't let LazeR use the port. Restart the laptop "
+                     "and start LazeR again.", error=True)
+        return False
+    _cli_say(text + f"\n\n({err})", error=True)
+    return False
 
 
 def main():
@@ -5623,9 +6038,8 @@ def main():
                 else:
                     print("LazeR is already running — opened the existing window.")
                 return
-            busy = _probe_udp_port()
-            if busy is not None:
-                _cli_say(PORT_BUSY_TEXT + f"\n\n({busy})")
+            busy = _probe_udp_port(retry_s=2.0)
+            if busy is not None and not resolve_port_busy(busy):
                 return
             migrate_startup_command()
             if apply_startup_default():

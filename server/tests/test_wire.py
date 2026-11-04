@@ -3155,5 +3155,60 @@ class SharedContract(unittest.TestCase):
                          ["VOL 42 1", "VOL 42 0", "VOL 42"])
 
 
+class PortBusyDiagnosis(unittest.TestCase):
+    """A failed bind names the real culprit instead of always blaming a second LazeR."""
+
+    NETSH = ("\nProtocol udp Port Exclusion Ranges\n\n"
+             "Start Port    End Port\n----------    --------\n"
+             "     49690       49789\n     50460       50559\n"
+             "     55000       55000     *\n\n* - Administered port exclusions.\n")
+
+    def test_reserved_range_is_found_in_netsh_output(self):
+        self.assertEqual(rs.parse_reserved_range(self.NETSH, 50505), (50460, 50559))
+        self.assertIsNone(rs.parse_reserved_range(self.NETSH, 50600))
+        self.assertIsNone(rs.parse_reserved_range("", 50505))
+
+    def test_access_denied_with_no_owner_is_a_windows_reservation(self):
+        err = OSError(13, "forbidden")
+        err.winerror = 10013
+        with mock.patch.object(rs, "_udp_port_owner", lambda port: None), \
+             mock.patch.object(rs, "_windows_reserved_range", lambda port: (50460, 50559)):
+            kind, text, pid = rs.diagnose_port_busy(err)
+        self.assertEqual(kind, "reserved")
+        self.assertIn("50460", text)
+        self.assertNotIn("another copy of LazeR (check", text)
+        self.assertIsNone(pid)
+
+    def test_another_lazer_is_named_with_its_pid(self):
+        with mock.patch.object(rs, "_udp_port_owner", lambda port: (4242, "LazeR.exe")):
+            kind, text, pid = rs.diagnose_port_busy(OSError(98, "in use"))
+        self.assertEqual((kind, pid), ("lazer", 4242))
+        self.assertIn("4242", text)
+
+    def test_a_different_program_is_named(self):
+        with mock.patch.object(rs, "_udp_port_owner", lambda port: (77, "foo.exe")), \
+             mock.patch.object(rs, "_is_lazer_process", lambda pid, name: False):
+            kind, text, pid = rs.diagnose_port_busy(OSError(98, "in use"))
+        self.assertEqual(kind, "other")
+        self.assertIn("foo.exe", text)
+
+    def test_probe_retries_until_the_port_frees(self):
+        calls = []
+
+        class FakeSock:
+            def close(self):
+                pass
+
+        def flaky():
+            calls.append(1)
+            if len(calls) < 3:
+                raise OSError(98, "in use")
+            return FakeSock()
+        with mock.patch.object(rs, "open_socket", flaky), \
+             mock.patch.object(rs.time, "sleep", lambda s: None):
+            self.assertIsNone(rs._probe_udp_port(retry_s=5.0))
+        self.assertEqual(len(calls), 3)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
