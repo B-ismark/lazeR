@@ -16,6 +16,7 @@ import base64
 import ipaddress
 import os
 import queue
+import re
 import secrets
 import socket
 import string
@@ -33,7 +34,7 @@ PORT = 50505
 # asserts the git tag matches THAT, and the update check below compares against
 # whatever tag the newest GitHub release carries, so a stale value here would
 # either nag forever or never nag at all.
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.5.0"
 RELEASES_API = "https://api.github.com/repos/B-ismark/lazeR/releases/latest"
 RELEASES_PAGE = "https://github.com/B-ismark/lazeR/releases/latest"
 UPDATE_TIMEOUT_S = 6      # a slow/blocked network must never delay the server
@@ -148,7 +149,26 @@ _stop = threading.Event()   # set by GUI close or KeyboardInterrupt
 # latches the pause until the user explicitly resumes.
 _remote_paused = threading.Event()   # set ⇒ ignore remote control verbs
 _panic_latched = threading.Event()   # set ⇒ stay paused until user resumes
-_client_connected = threading.Event()  # a phone is currently paired
+class _ConnectedEvent(threading.Event):
+    """threading.Event that also tells listeners when it is set, so the input
+    guard can put its mouse hook in place the moment a phone pairs rather than on
+    its next timer tick. set() runs on the UDP thread, which must never raise
+    (see CLAUDE.md), so a failing listener is ignored."""
+
+    def __init__(self):
+        super().__init__()
+        self.listeners = []
+
+    def set(self):
+        super().set()
+        for fn in list(self.listeners):
+            try:
+                fn()
+            except Exception:
+                pass
+
+
+_client_connected = _ConnectedEvent()  # a phone is currently paired
 _last_physical_ts = [0.0]            # monotonic time of last physical input
 _input_guard = [None]                # the live LocalInputGuard, for serve_loop's wake handling
 PHYSICAL_RESUME_GRACE_S = 2.0        # auto-resume this long after local input stops
@@ -376,6 +396,151 @@ get_volume, set_volume, VOLUME_BACKEND = make_volume()
 
 
 # ── brightness ──────────────────────────────────────────────────────────────
+# ── in-process WMI (no PowerShell) ─────────────────────────────────────────────
+# Brightness and the chassis type used to be read by starting `powershell.exe` —
+# ~0.5–1 s of CPU and a PowerShell + conhost pair in Task Manager on every poll,
+# plus one warm PowerShell kept alive for writes. WMI is a COM API, and comtypes
+# (already here for pycaw) talks to it directly from our own process in a few
+# milliseconds. PowerShell stays only as the fallback for a machine where the COM
+# route doesn't work at all.
+#
+# COM is per-thread (see make_volume), so each thread gets its own initialized
+# connection. Every property and method goes through the SWbemScripting type
+# library (Properties_ / Methods_ / ExecMethod_) rather than through WMI's dynamic
+# members: comtypes binds names against the type library, where a WMI class's own
+# properties don't exist.
+_wmi_local = threading.local()
+
+
+def _wmi_service(namespace):
+    cache = getattr(_wmi_local, "svc", None)
+    if cache is None:
+        cache = _wmi_local.svc = {}
+    svc = cache.get(namespace)
+    if svc is None:
+        import comtypes
+        import comtypes.client
+        try:
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        loc = comtypes.client.CreateObject("WbemScripting.SWbemLocator", dynamic=True)
+        svc = loc.ConnectServer(".", namespace)
+        cache[namespace] = svc
+        made = getattr(_wmi_local, "made", None)
+        if made is None:
+            made = _wmi_local.made = {}
+        made[namespace] = time.monotonic()
+    return svc
+
+
+_WMI_RECONNECT_S = 60.0
+
+
+def _wmi_forget(namespace):
+    """Drop this thread's connection, so the next call reconnects. A connection
+    made before a sleep can go stale, like the audio endpoint.
+
+    At most once a minute per namespace: on a desktop the brightness query fails
+    on every poll (there is no panel), and a fresh locator + ConnectServer each
+    time would be pure waste for an answer that won't change."""
+    cache = getattr(_wmi_local, "svc", None)
+    if cache is None or namespace not in cache:
+        return
+    stamps = getattr(_wmi_local, "made", None)
+    if stamps is None:
+        stamps = _wmi_local.made = {}
+    if time.monotonic() - stamps.get(namespace, 0.0) >= _WMI_RECONNECT_S:
+        cache.pop(namespace, None)
+
+
+def _wmi_first(namespace, wql):
+    """First object a WQL query returns, or None when it returns nothing.
+    Raises on a COM/WMI failure."""
+    for obj in _wmi_service(namespace).ExecQuery(wql):
+        return obj
+    return None
+
+
+def _wmi_prop(obj, name):
+    return obj.Properties_.Item(name).Value
+
+
+def _wmi_com_works():
+    """True when in-process WMI answers on this machine (Win32_OperatingSystem
+    always exists), so a later brightness failure means "no panel", not "broken
+    plumbing"."""
+    try:
+        return _wmi_first(r"root\cimv2",
+                          "SELECT Caption FROM Win32_OperatingSystem") is not None
+    except Exception:
+        return False
+
+
+def _wmi_brightness_get():
+    """0..100 from the integrated panel, or None when there is none right now
+    (desktop, lid closed, docked to an external screen only)."""
+    try:
+        obj = _wmi_first(r"root\WMI",
+                         "SELECT CurrentBrightness FROM WmiMonitorBrightness")
+        return None if obj is None else int(_wmi_prop(obj, "CurrentBrightness"))
+    except Exception:
+        _wmi_forget(r"root\WMI")
+        return None
+
+
+def _wmi_brightness_set(pct):
+    """Apply [pct]. True when applied, None when there is no panel to apply it to,
+    False on a COM/WMI failure (the caller may try another route)."""
+    try:
+        obj = _wmi_first(r"root\WMI", "SELECT * FROM WmiMonitorBrightnessMethods")
+        if obj is None:
+            return None
+        args = obj.Methods_.Item("WmiSetBrightness").InParameters.SpawnInstance_()
+        args.Properties_.Item("Timeout").Value = 1
+        args.Properties_.Item("Brightness").Value = max(0, min(100, int(pct)))
+        obj.ExecMethod_("WmiSetBrightness", args)
+        return True
+    except Exception:
+        _wmi_forget(r"root\WMI")
+        return False
+
+
+_LAPTOP_CHASSIS = {8, 9, 10, 11, 12, 14, 30, 31, 32}
+
+
+def _wmi_is_laptop():
+    """Chassis says portable → True; says desktop → False; can't tell → None."""
+    try:
+        obj = _wmi_first(r"root\cimv2",
+                         "SELECT ChassisTypes FROM Win32_SystemEnclosure")
+        if obj is None:
+            return None
+        types = {int(t) for t in (_wmi_prop(obj, "ChassisTypes") or ())}
+        return bool(types & _LAPTOP_CHASSIS)
+    except Exception:
+        return None
+
+
+def _has_system_battery():
+    """GetSystemPowerStatus: BatteryFlag 128 = no system battery, 255 = unknown."""
+    try:
+        import ctypes
+
+        class SPS(ctypes.Structure):
+            _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                        ("BatteryLifePercent", ctypes.c_ubyte),
+                        ("SystemStatusFlag", ctypes.c_ubyte),
+                        ("BatteryLifeTime", ctypes.c_ulong),
+                        ("BatteryFullLifeTime", ctypes.c_ulong)]
+        st = SPS()
+        if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(st)):
+            return False
+        return st.BatteryFlag not in (128, 255)
+    except Exception:
+        return False
+
+
 def make_brightness():
     """Return (get_brightness, set_brightness, label); fns may be None if absent.
     Same shape as make_volume — best effort per OS, integrated display only."""
@@ -468,6 +633,18 @@ def make_brightness():
         # would hide the slider for the entire session in those cases (the recurring
         # "brightness slider keeps disappearing" bug). get_win returns None while the
         # class is absent, so the service simply reports unavailable until it shows up.
+        if _wmi_com_works():
+            # The normal path: no child processes at all. A failed COM write (a
+            # driver that rejects WmiSetBrightness through this route) falls back
+            # to the warm PowerShell for that write, so the slider keeps working.
+            def set_com(pct):
+                if _wmi_brightness_set(pct) is False:
+                    set_win(pct)
+
+            laptop = _wmi_is_laptop()
+            if laptop is None:
+                laptop = _has_system_battery()
+            return _wmi_brightness_get, set_com, "wmi", laptop
         return get_win, set_win, "wmi", _is_laptop()
 
     if plat == "darwin":
@@ -1608,6 +1785,8 @@ class LocalInputGuard:
     PANIC_MODIFIERS = (0x10, 0x11, 0x12)             # shift, ctrl, alt (generic)
 
     WM_REARM = 0x8000 + 1        # WM_APP+1: our private "re-install the hooks" ping
+    WM_SYNC = 0x8000 + 2         # WM_APP+2: "a phone just connected — hook the mouse"
+    MOUSE_SYNC_MS = 250          # backstop: how often the mouse hook follows the connection
 
     def __init__(self, on_physical, on_panic):
         self._on_physical = on_physical
@@ -1621,7 +1800,21 @@ class LocalInputGuard:
             return False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        _client_connected.listeners.append(self._sync_now)
         return True
+
+    def _sync_now(self):
+        """Ask the hook thread to install the mouse hook now (a phone connected).
+        Without it, physical mouse input in the first timer period after pairing
+        went unnoticed and didn't pause the phone."""
+        tid = self._tid
+        if tid is None:
+            return
+        try:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(tid, self.WM_SYNC, 0, 0)
+        except Exception:
+            pass
 
     def rearm(self):
         """Re-install the hooks after a wake or a lock/unlock.
@@ -1652,6 +1845,7 @@ class LocalInputGuard:
         WH_KEYBOARD_LL, WH_MOUSE_LL = 13, 14
         WM_KEYDOWN, WM_SYSKEYDOWN = 0x0100, 0x0104
         WM_KEYUP, WM_SYSKEYUP = 0x0101, 0x0105
+        WM_TIMER = 0x0113
         LLKHF_INJECTED, LLMHF_INJECTED = 0x10, 0x01
 
         LRESULT = ctypes.c_ssize_t
@@ -1709,7 +1903,25 @@ class LocalInputGuard:
             return (user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kb_cb, hmod, 0),
                     user32.SetWindowsHookExW(WH_MOUSE_LL, self._ms_cb, hmod, 0))
 
-        kb_hook, ms_hook = install()
+        def install_kb():
+            return user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kb_cb, hmod, 0)
+
+        def install_ms():
+            return user32.SetWindowsHookExW(WH_MOUSE_LL, self._ms_cb, hmod, 0)
+
+        # The MOUSE hook is installed only while a phone is connected. A low-level
+        # mouse hook sits in front of every physical mouse event on the machine:
+        # Windows waits for our Python callback (and so for the GIL) before the
+        # pointer moves. With no phone attached the callback had nothing to do
+        # (_physical_event returns at once) but the laptop's own mouse still paid
+        # that round trip on every move — up to 1000 times a second on a gaming
+        # mouse, and a visible hitch whenever another of our threads held the GIL.
+        # A 250 ms thread timer syncs the hook with the connection, so serve_loop
+        # needs no knowledge of us. The keyboard hook stays: keys are rare and the
+        # panic chord must always work.
+        kb_hook = install_kb()
+        ms_hook = install_ms() if _client_connected.is_set() else None
+        user32.SetTimer(None, 0, self.MOUSE_SYNC_MS, None)
         # Set LAST: rearm() posts to this id, and a caller that read it before the
         # hooks existed would ping a thread with nothing to re-install.
         self._tid = kernel32.GetCurrentThreadId()
@@ -1718,6 +1930,22 @@ class LocalInputGuard:
             r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if r in (0, -1):
                 break
+            if (msg.message == WM_TIMER and not msg.hwnd) or msg.message == self.WM_SYNC:
+                want = _client_connected.is_set()
+                if want and not ms_hook:
+                    ms_hook = install_ms() or None
+                elif not want and ms_hook:
+                    user32.UnhookWindowsHookEx(ms_hook)
+                    ms_hook = None
+                continue
+            if msg.message == self.WM_REARM and not ms_hook:
+                # Mouse hook is off (no phone): re-install just the keyboard one,
+                # new before old for the same reason as below.
+                new_kb = install_kb()
+                if new_kb:
+                    user32.UnhookWindowsHookEx(kb_hook)
+                    kb_hook = new_kb
+                continue
             if msg.message == self.WM_REARM:
                 # A thread-message has no window, so it is never dispatched — handle
                 # it here.
@@ -1737,7 +1965,8 @@ class LocalInputGuard:
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
         user32.UnhookWindowsHookEx(kb_hook)
-        user32.UnhookWindowsHookEx(ms_hook)
+        if ms_hook:
+            user32.UnhookWindowsHookEx(ms_hook)
 
 
 # ── packet handler ────────────────────────────────────────────────────────────
@@ -2715,16 +2944,42 @@ def firewall_rule_exists():
     instead — only we create it, and only ever with profile=any."""
     if not sys.platform.startswith("win"):
         return True   # we only manage Windows Firewall; assume OK elsewhere
-    import subprocess
+    return _fw_rule_named(FW_RULE_NAME)
+
+
+# The firewall reads go through the firewall's own COM API (HNetCfg.FwPolicy2)
+# in-process. They used to start netsh.exe and powershell.exe — at launch, every
+# FW_RECHECK_MS, after every network change and every wake — which is what put
+# netsh, PowerShell and their conhost windows under LazeR in Task Manager, and
+# PowerShell's start-up alone burns a second of CPU. The subprocess versions stay
+# as fallbacks for a machine where the COM route fails outright.
+_HR_NOT_FOUND = -2147024894            # HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+
+
+def _fw_policy():
+    import comtypes
+    import comtypes.client
     try:
-        r = subprocess.run(
-            [win_exe("netsh.exe"), "advfirewall", "firewall", "show", "rule",
-             f"name={FW_RULE_NAME}"],
-            capture_output=True, text=True, timeout=6,
-            creationflags=_no_window_flags())
-        return r.returncode == 0 and "No rules match" not in r.stdout
+        comtypes.CoInitialize()        # COM is per-thread; callers run on workers
     except Exception:
-        return False
+        pass
+    return comtypes.client.CreateObject("HNetCfg.FwPolicy2", dynamic=True)
+
+
+def _fw_rule_named_com(name):
+    """True/False from the firewall API, or None when it can't be asked."""
+    try:
+        rules = _fw_policy().Rules
+    except Exception:
+        return None
+    try:
+        rules.Item(name)
+        return True
+    except Exception as e:
+        hr = getattr(e, "hresult", None)
+        if hr is None and getattr(e, "args", None):
+            hr = e.args[0]
+        return False if hr == _HR_NOT_FOUND else None
 
 
 # Group Policy can tell Windows to ignore every locally-created firewall rule on
@@ -2785,6 +3040,28 @@ def _fw_profiles_ignoring_local_rules():
     return out
 
 
+def _fw_policy_rules_present():
+    """True when Group Policy or MDM delivers firewall rules to this PC (either
+    root's FirewallRules key holds any). A registry read: no subprocess."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import winreg
+    except Exception:
+        return False
+    for root in _FW_POLICY_ROOTS:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                root + "\\FirewallRules") as k:
+                if winreg.QueryInfoKey(k)[1] > 0:      # value count
+                    return True
+        except OSError:
+            continue
+        except Exception:
+            continue
+    return False
+
+
 def _fw_current_profile_types():
     """Bitmask of the firewall profiles in force right now (1 Domain / 2 Private
     / 4 Public), or None if we can't tell.
@@ -2804,8 +3081,7 @@ def _fw_current_profile_types():
     except Exception:
         pass
     try:
-        return int(comtypes.client.CreateObject("HNetCfg.FwPolicy2")
-                   .CurrentProfileTypes)
+        return int(_fw_policy().CurrentProfileTypes)
     except Exception:
         return None
 
@@ -2867,12 +3143,41 @@ def _cmd_safe(text):
     return not any(c in text for c in '&|<>^%"')
 
 
+def _fw_block_rules_com():
+    """Names of enabled inbound block rules for this program, or None when the
+    firewall API can't be asked. Checks the program first: it's the one test that
+    rules out nearly every rule, so most cost a single COM call."""
+    prog = os.path.normcase(_self_program())
+    try:
+        rules = _fw_policy().Rules
+        out = []
+        for r in rules:
+            try:
+                app = r.ApplicationName
+                if not app or os.path.normcase(os.path.expandvars(app)) != prog:
+                    continue
+                if r.Direction == 1 and r.Action == 0 and r.Enabled:  # in / block
+                    out.append(str(r.Name))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return None
+
+
 def firewall_block_rules():
     """Display names of enabled inbound rules that block this program. Read-only,
-    no admin. Enum values (Inbound/Block/True) are not localized, unlike netsh's
-    output. Empty when there are none or we can't tell."""
+    no admin. Empty when there are none or we can't tell."""
     if not sys.platform.startswith("win"):
         return []
+    via_com = _fw_block_rules_com()
+    # The firewall API lists the machine's own rules; rules that Group Policy or
+    # Intune deliver may not be among them. A clean COM answer is trusted only
+    # where no policy rules exist — on a managed PC ask the ActiveStore, which
+    # holds what is actually in force.
+    if via_com is not None and (via_com or not _fw_policy_rules_present()):
+        return via_com
+    # Fallback. Enum values (Inbound/Block/True) are not localized, unlike netsh's.
     import subprocess
     prog = _self_program().replace("'", "''")
     cmd = ("Get-NetFirewallApplicationFilter -PolicyStore ActiveStore "
@@ -3039,12 +3344,17 @@ def _firewall_remove_ours():
 
 
 def _fw_rule_named(name):
+    if not sys.platform.startswith("win"):
+        return False
+    via_com = _fw_rule_named_com(name)
+    if via_com is not None:
+        return via_com
     import subprocess
     try:
         r = subprocess.run(
             [win_exe("netsh.exe"), "advfirewall", "firewall", "show", "rule",
              f"name={name}"],
-            capture_output=True, text=True, timeout=6,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=6,
             creationflags=_no_window_flags())
         return r.returncode == 0 and "No rules match" not in r.stdout
     except Exception:
@@ -3681,20 +3991,100 @@ def serve_forever(wire, emit, net, hostname):
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
-# Palette — deep neutral dark, periwinkle brand accent, calm status colors.
-_C = {
-    "bg":      "#0F0F14",   # window
-    "card":    "#181820",   # card surface
-    "card2":   "#202029",   # nested / chip
-    "border":  "#2A2A36",   # 1px card outline
-    "fg":      "#ECECF1",   # primary text
-    "dim":     "#9A9AA7",   # secondary text
-    "faint":   "#62626E",   # tertiary / timestamps
-    "accent":  "#8C9BFF",   # brand periwinkle
-    "accent2": "#3A3F66",   # accent-tinted fill
-    "ok":      "#5BD6A0",   # connected green
-    "warn":    "#FFB68A",   # attention
+# Material 3 tonal roles from a periwinkle seed (the brand colour), in a dark and
+# a light scheme. The window follows Windows' app theme (Settings › Personalization
+# › Colors) at launch. Status colours sit outside M3's roles: "ok" (green) and
+# "warn" (amber) each come with a container tone for chips and banners.
+_DARK = {
+    "surface":      "#121318", "surface_low":   "#1A1B21",
+    "container":    "#1E1F25", "container_hi":  "#292A2F",
+    "container_top": "#34343A",
+    "on_surface":   "#E3E1E9", "on_variant":    "#C6C5D0",
+    "outline":      "#90909A", "outline_var":   "#46464F",
+    "primary":      "#B9C3FF", "on_primary":    "#212C61",
+    "primary_ctr":  "#394379", "on_primary_ctr": "#DDE1FF",
+    "secondary_ctr": "#424659", "on_secondary_ctr": "#DFE1F9",
+    "ok":           "#8AD7A8", "ok_ctr":        "#1C4B30", "on_ok_ctr": "#A6F3C2",
+    "warn":         "#FFB77C", "warn_ctr":      "#4D2B0F", "on_warn_ctr": "#FFDCC2",
+    "qr_dark":      "#121318",
 }
+_LIGHT = {
+    "surface":      "#FBF8FF", "surface_low":   "#F5F2FA",
+    "container":    "#EFEDF4", "container_hi":  "#E9E7EF",
+    "container_top": "#E3E1E9",
+    "on_surface":   "#1B1B21", "on_variant":    "#46464F",
+    "outline":      "#767680", "outline_var":   "#C6C5D0",
+    "primary":      "#515B92", "on_primary":    "#FFFFFF",
+    "primary_ctr":  "#DDE1FF", "on_primary_ctr": "#394379",
+    "secondary_ctr": "#E0E1F9", "on_secondary_ctr": "#424659",
+    "ok":           "#2E6A44", "ok_ctr":        "#B1F1C3", "on_ok_ctr": "#0F5130",
+    "warn":         "#8A5100", "warn_ctr":      "#FFDCC2", "on_warn_ctr": "#6A3C00",
+    "qr_dark":      "#121318",
+}
+
+
+def _scheme(light):
+    """The palette for a theme, plus the short names older code paths use."""
+    c = dict(_LIGHT if light else _DARK)
+    c.update(bg=c["surface"], card=c["container"], card2=c["container_hi"],
+             border=c["outline_var"], fg=c["on_surface"], dim=c["on_variant"],
+             faint=c["outline"], accent=c["primary"], accent2=c["primary_ctr"])
+    return c
+
+
+_C = _scheme(False)
+
+
+def _windows_prefers_light():
+    """Windows' "Choose your app mode" (AppsUseLightTheme). Dark when unknown."""
+    if not sys.platform.startswith("win"):
+        return os.environ.get("LAZER_THEME") == "light"
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes"
+                            r"\Personalize") as k:
+            return int(winreg.QueryValueEx(k, "AppsUseLightTheme")[0]) == 1
+    except Exception:
+        return False
+
+
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _blend(base, over, amount):
+    """[over] laid on [base] at [amount] opacity — M3's state layers (8% hover,
+    12% press) as a flat colour, since Tk has no alpha on widget backgrounds."""
+    b, o = _hex_rgb(base), _hex_rgb(over)
+    return "#%02X%02X%02X" % tuple(round(x + (y - x) * amount) for x, y in zip(b, o))
+
+
+def _style_title_bar(root, light):
+    """Windows 11 chrome: a title bar painted in the window's own surface colour
+    (so it reads as one sheet, like Settings), dark caption buttons in dark mode,
+    and rounded corners. Each call is a no-op where Windows doesn't know it."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+        root.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        dwm = ctypes.windll.dwmapi
+
+        def put(attr, value):
+            v = ctypes.c_int(value)
+            dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v))
+
+        put(20, 0 if light else 1)            # DWMWA_USE_IMMERSIVE_DARK_MODE
+        put(33, 2)                            # DWMWA_WINDOW_CORNER_PREFERENCE: round
+        r, g, b = _hex_rgb(_C["surface"])
+        put(35, (b << 16) | (g << 8) | r)     # DWMWA_CAPTION_COLOR (COLORREF)
+        r, g, b = _hex_rgb(_C["outline_var"])
+        put(34, (b << 16) | (g << 8) | r)     # DWMWA_BORDER_COLOR
+    except Exception:
+        pass
 
 
 # How often the window re-checks the firewall on its own, on top of the checks
@@ -3777,6 +4167,13 @@ def qr_box_size(screen_h):
 
 
 class LazeRWindow:
+    # Layout constants, in 96-DPI layout pixels (scaled by _px).
+    CARD_R = 24          # M3 "extra large" card corner
+    BANNER_R = 20
+    PAGE_W = 440         # content column width
+    GUTTER = 20
+    IMG_CACHE_MAX = 256
+
     def __init__(self, ip, port, wire, event_q, require_secure, update_check=True,
                  net=None, notices=(), minimized=False):
         """[ip] is the published address, or None while there is none yet (the
@@ -3797,8 +4194,14 @@ class LazeRWindow:
         self._close_noticed = False  # told the user once that close != quit
         self._fw_dismissed = False
         self._vpn_logged = None
+        self._img_cache = {}         # rendered shapes, keyed by what they look like
+        self._cards = []             # (canvas, inner, pad) for _sync_cards
         uri = build_uri(ip, wire.token, self._hostname, wire.key) if ip else None
         token = wire.token
+
+        self._light = _windows_prefers_light()
+        _C.clear()
+        _C.update(_scheme(self._light))
 
         _UI_SCALE[0] = _win_dpi_scale()
         _win_app_id()
@@ -3806,7 +4209,7 @@ class LazeRWindow:
         self._root = root
         self._placed = False         # centred once; after that the user's position wins
         root.title("LazeR")
-        root.configure(bg=_C["bg"])
+        root.configure(bg=_C["surface"])
         try:
             # The title bar and taskbar would otherwise show Tk's feather.
             root.iconbitmap(default=ICON_FILE)
@@ -3819,32 +4222,65 @@ class LazeRWindow:
         except Exception:
             pass
 
-        # fonts
+        # Type scale after M3 (title large / title medium / body / label), set in
+        # Segoe UI Variable where Windows 11 has it, plain Segoe UI before that.
+        fams = set()
+        try:
+            fams = {f.lower() for f in tkf.families(root)}
+        except Exception:
+            pass
+
+        def pick(*names):
+            for n in names:
+                if n.lower() in fams:
+                    return n
+            return names[-1]
+
+        display = pick("Segoe UI Variable Display", "Segoe UI", "Inter Display", "Inter",
+                       "Segoe UI")
+        text = pick("Segoe UI Variable Text", "Segoe UI", "Inter", "Segoe UI")
+        semi = pick("Segoe UI Variable Display Semib", "Segoe UI Variable Display Semibold",
+                    "Segoe UI Semibold", "Inter Display SemiBold", "Inter SemiBold", "")
+        semi_text = pick("Segoe UI Variable Text Semibold", "Segoe UI Variable Text Semib",
+                         "Segoe UI Semibold", "Inter SemiBold", "")
+        mono = pick("Cascadia Mono", "Consolas", "DejaVu Sans Mono", "Consolas")
+
         def mkfont(fam, size, weight="normal"):
             try:
-                return tkf.Font(family=fam, size=size, weight=weight)
+                return tkf.Font(root=root, family=fam, size=size, weight=weight)
             except Exception:
                 return None
-        self.f_brand = mkfont("Segoe UI Semibold", 17, "bold")
-        self.f_hero  = mkfont("Segoe UI Semibold", 15, "bold")
-        self.f_lbl   = mkfont("Segoe UI", 8)
-        self.f_sm    = mkfont("Segoe UI", 9)
-        self.f_md    = mkfont("Segoe UI", 10)
-        self.f_val   = mkfont("Consolas", 11)
-        self.f_tok   = mkfont("Consolas", 15, "bold")
-        self.f_log   = mkfont("Consolas", 9)
+
+        def heavy(size, fam, fallback):
+            # A named Semibold face where one exists; synthetic bold otherwise.
+            return mkfont(fam, size) if fam else mkfont(fallback, size, "bold")
+
+        self.f_brand = heavy(16, semi, display)
+        self.f_hero = heavy(17, semi, display)          # title large
+        self.f_title = heavy(12, semi_text, text)        # title medium
+        self.f_btn = heavy(10, semi_text, text)          # label large
+        self.f_lbl = heavy(9, semi_text, text)           # label medium
+        self.f_sm = mkfont(text, 9)                      # body small
+        self.f_md = mkfont(text, 10)                     # body medium
+        self.f_val = mkfont(mono, 10)
+        self.f_tok = mkfont(mono, 19, "bold")
+        self.f_log = mkfont(mono, 9)
 
         self._ip, self._port = ip, port
+        self._setup_ttk()
 
         # The whole body scrolls. On a 768-pixel screen the window is taller than
         # the screen as soon as a banner shows or details open, and the height cap
         # in _center then cut the bottom off — the details panel and the typed
         # code included — with no way to reach it.
-        self._canvas = tk.Canvas(root, bg=_C["bg"], highlightthickness=0, bd=0)
-        self._vbar = tk.Scrollbar(root, orient="vertical", command=self._canvas.yview)
+        self._canvas = tk.Canvas(root, bg=_C["surface"], highlightthickness=0, bd=0)
+        self._vbar = self._ttk.Scrollbar(root, orient="vertical",
+                                         command=self._canvas.yview,
+                                         style="Lazer.Vertical.TScrollbar")
         self._canvas.configure(yscrollcommand=self._vbar.set)
         self._canvas.pack(side="left", fill="both", expand=True)
-        outer = tk.Frame(self._canvas, bg=_C["bg"], padx=_px(22), pady=_px(18))
+        outer = tk.Frame(self._canvas, bg=_C["surface"], padx=_px(self.GUTTER),
+                         pady=_px(18), width=_px(self.PAGE_W))
         self._outer = outer
         self._outer_win = self._canvas.create_window(0, 0, window=outer, anchor="nw")
         outer.bind("<Configure>", lambda e: self._canvas.configure(
@@ -3852,6 +4288,9 @@ class LazeRWindow:
         self._canvas.bind("<Configure>", lambda e: self._canvas.itemconfigure(
             self._outer_win, width=e.width))
         root.bind_all("<MouseWheel>", self._on_wheel)
+        # A strut fixes the column width, so text wraps the same way everywhere and
+        # cards don't resize as their contents change.
+        tk.Frame(outer, bg=_C["surface"], width=_px(self.PAGE_W), height=0).pack()
 
         self._build_header(outer)
         self._build_hero(outer)
@@ -3860,25 +4299,26 @@ class LazeRWindow:
         self._build_firewall_banner(outer)
 
         # swap area: QR card (not connected) <-> connected panel
-        self._swap = tk.Frame(outer, bg=_C["bg"])
-        self._swap.pack(fill="x", pady=(_px(14), 0))
+        self._swap = tk.Frame(outer, bg=_C["surface"])
+        self._swap.pack(fill="x", pady=(_px(12), 0))
         self._build_connect_card(self._swap, uri, token)
         self._build_connected_panel(self._swap)
         self._show_qr_view()   # first start: show the QR
 
         # everything technical lives behind this toggle, hidden by default
         self._build_details_toggle(outer)
-        self._details = tk.Frame(outer, bg=_C["bg"])
+        self._details = tk.Frame(outer, bg=_C["surface"])
         self._details_open = False
         self._build_details(self._details, ip, port, token)
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        _style_title_bar(root, self._light)
         self._tray = None
         self._tray_thread = None
         self._setup_tray()
         self._log("Server started", "ok")
-        for tag, text in notices:
-            self._warn(text) if tag == "warn" else self._log(text, "info")
+        for tag, text_ in notices:
+            self._warn(text_) if tag == "warn" else self._log(text_, "info")
         if uri is None:
             self._hide_qr(waiting=True)
         self._poll()
@@ -3892,6 +4332,408 @@ class LazeRWindow:
             # (token AND key) up on the screen. The tray icon is the way in.
             self._close_noticed = True
             root.withdraw()
+
+    def _setup_ttk(self):
+        """Slim, arrow-less scrollbars in the theme's colours — the classic Tk
+        scrollbar is the single most dated-looking widget on Windows."""
+        from tkinter import ttk
+        self._ttk = ttk
+        st = ttk.Style(self._root)
+        try:
+            st.theme_use("clam")
+        except Exception:
+            pass
+        st.layout("Lazer.Vertical.TScrollbar", [
+            ("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+        for name, trough in (("Lazer.Vertical.TScrollbar", _C["surface"]),
+                             ("Card.Vertical.TScrollbar", _C["container"])):
+            if name != "Lazer.Vertical.TScrollbar":
+                st.layout(name, st.layout("Lazer.Vertical.TScrollbar"))
+            st.configure(name, troughcolor=trough, background=_C["outline_var"],
+                         bordercolor=trough, lightcolor=_C["outline_var"],
+                         darkcolor=_C["outline_var"], gripcount=0,
+                         arrowsize=_px(8), relief="flat", borderwidth=0)
+            st.map(name, background=[("active", _C["outline"])],
+                   lightcolor=[("active", _C["outline"])],
+                   darkcolor=[("active", _C["outline"])])
+
+    # ── rendered shapes ───────────────────────────────────────────────────────
+    # Tk draws no anti-aliased curves, so rounded surfaces and icons are drawn with
+    # Pillow at 4× and scaled down, then cached. Without Pillow the window still
+    # works — the shapes fall back to flat rectangles.
+    def _image(self, key, draw, w, h):
+        img = self._img_cache.get(key)
+        if img is not None:
+            return img
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+        except Exception:
+            return None
+        s = 4
+        big = Image.new("RGBA", (max(1, w) * s, max(1, h) * s), (0, 0, 0, 0))
+        draw(ImageDraw.Draw(big), s)
+        img = ImageTk.PhotoImage(big.resize((max(1, w), max(1, h)), Image.LANCZOS),
+                                 master=self._root)
+        if len(self._img_cache) >= self.IMG_CACHE_MAX:
+            # Window resizes mint one-off sizes, so trim the oldest half. Safe:
+            # whatever is on screen is also held by its widget (see _put), so
+            # dropping it here never blanks it.
+            for k in list(self._img_cache)[:self.IMG_CACHE_MAX // 2]:
+                del self._img_cache[k]
+        self._img_cache[key] = img
+        return img
+
+    @staticmethod
+    def _put(widget, img, item=None):
+        """Show [img] on a label (item None) or a canvas item, and keep it alive.
+        Tk holds an image only by name: once the last Python reference goes, the
+        image is deleted and whatever showed it goes blank. The widget therefore
+        holds a reference per slot, so the shape cache is free to evict."""
+        held = widget.__dict__.setdefault("_lazer_held", {})
+        held[item] = img
+        if img is None:
+            return
+        if item is None:
+            widget.config(image=img)
+        else:
+            widget.itemconfigure(item, image=img)
+
+    def _rrect(self, w, h, r, fill, outline=None, width=1):
+        def draw(d, s):
+            d.rounded_rectangle([0, 0, w * s - 1, h * s - 1], radius=r * s, fill=fill,
+                                outline=outline, width=(width * s) if outline else 0)
+        return self._image(("rr", w, h, r, fill, outline, width), draw, w, h)
+
+    def _dot_img(self, color, d=None, ring=None, ring_w=0):
+        d = d or _px(8)
+
+        def draw(dr, s):
+            if ring:
+                dr.ellipse([0, 0, d * s - 1, d * s - 1], fill=ring)
+                k = ring_w * s
+                dr.ellipse([k, k, d * s - 1 - k, d * s - 1 - k], fill=color)
+            else:
+                dr.ellipse([0, 0, d * s - 1, d * s - 1], fill=color)
+        return self._image(("dot", color, d, ring, ring_w), draw, d, d)
+
+    def _icon(self, name, size, color, bg=None):
+        """Small line icons in the Material Symbols spirit: 2-px rounded strokes on
+        a 24-unit grid, optionally inside a filled circle."""
+        def draw(d, s):
+            u = size * s / 24.0
+            if bg:
+                d.ellipse([0, 0, size * s - 1, size * s - 1], fill=bg)
+                inset = 0.22
+            else:
+                inset = 0.0
+            k = 24 * inset
+
+            def p(x, y):
+                f = (1 - 2 * inset)
+                return (k * u + x * u * f, k * u + y * u * f)
+
+            lw = max(1, int(round(2 * u * (1 - 2 * inset) + 0.5)))
+
+            def line(*pts):
+                d.line([p(*q) for q in pts], fill=color, width=lw, joint="curve")
+                for q in (pts[0], pts[-1]):
+                    x, y = p(*q)
+                    d.ellipse([x - lw / 2, y - lw / 2, x + lw / 2, y + lw / 2], fill=color)
+
+            if name == "laptop":
+                x0, y0 = p(4, 5)
+                x1, y1 = p(20, 16)
+                d.rounded_rectangle([x0, y0, x1, y1], radius=2 * u, outline=color, width=lw)
+                line((2, 19.5), (22, 19.5))
+            elif name == "check":
+                line((5, 12.5), (10, 17.5), (19.5, 7))
+            elif name == "warn":
+                line((12, 6.5), (12, 13.5))
+                x, y = p(12, 17.5)
+                r = lw * 0.75
+                d.ellipse([x - r, y - r, x + r, y + r], fill=color)
+            elif name == "info":
+                line((12, 11), (12, 17.5))
+                x, y = p(12, 7)
+                r = lw * 0.75
+                d.ellipse([x - r, y - r, x + r, y + r], fill=color)
+            elif name == "pause":
+                line((9, 6.5), (9, 17.5))
+                line((15, 6.5), (15, 17.5))
+            elif name == "shield":
+                line((12, 3.5), (19.5, 6.5), (19.5, 12), (12, 20.5), (4.5, 12),
+                     (4.5, 6.5), (12, 3.5))
+            elif name == "chev_down":
+                line((6.5, 9.5), (12, 15), (17.5, 9.5))
+            elif name == "chev_up":
+                line((6.5, 14.5), (12, 9), (17.5, 14.5))
+        return self._image(("ic", name, size, color, bg), draw, size, size)
+
+    # ── surfaces ──────────────────────────────────────────────────────────────
+    def _card(self, parent, color=None, radius=None, pad=None, outline=None, **pack):
+        """A rounded surface. Returns the inner frame to fill; its .master is the
+        canvas that draws the shape, which is what callers pack and unpack."""
+        tk = self._tk
+        color = color or _C["container"]
+        r = _px(radius if radius is not None else self.CARD_R)
+        p = _px(pad if pad is not None else 18)
+        try:
+            pbg = parent.cget("bg")
+        except Exception:
+            pbg = _C["surface"]
+        cv = tk.Canvas(parent, bg=pbg, highlightthickness=0, bd=0)
+        img_id = cv.create_image(0, 0, anchor="nw")
+        inner = tk.Frame(cv, bg=color)
+        win = cv.create_window(p, p, window=inner, anchor="nw")
+        drawn = [None]
+
+        def redraw():
+            w, h = cv.winfo_width(), cv.winfo_height()
+            if w < 2 or h < 2 or drawn[0] == (w, h):
+                return
+            drawn[0] = (w, h)
+            img = self._rrect(w, h, r, color, outline)
+            if img is not None:
+                self._put(cv, img, img_id)
+            else:
+                cv.configure(bg=color)
+
+        def on_inner(_e=None):
+            cv.configure(width=inner.winfo_reqwidth() + 2 * p,
+                         height=inner.winfo_reqheight() + 2 * p)
+
+        def on_canvas(e):
+            cv.itemconfigure(win, width=max(1, e.width - 2 * p))
+            redraw()
+
+        inner.bind("<Configure>", on_inner)
+        cv.bind("<Configure>", on_canvas)
+        self._cards.append((cv, inner, p))
+        if pack:
+            cv.pack(**pack)
+        return inner
+
+    def _sync_cards(self):
+        """Re-measure every card: a label whose text grew changes its frame's
+        requested size without any <Configure> to tell the card."""
+        for cv, inner, p in self._cards:
+            try:
+                cv.configure(width=inner.winfo_reqwidth() + 2 * p,
+                             height=inner.winfo_reqheight() + 2 * p)
+            except Exception:
+                pass
+
+    def _section_label(self, parent, text):
+        self._tk.Label(parent, text=text, bg=parent.cget("bg"), fg=_C["primary"],
+                       font=self.f_lbl).pack(anchor="w")
+
+    # ── controls ──────────────────────────────────────────────────────────────
+    def _button(self, parent, text, command, kind="filled", small=False, ink=None):
+        """An M3 common button: filled, tonal, outlined or text. A canvas, so it
+        can be a real pill with hover/press state layers and a focus ring; Tab,
+        Enter and Space work like any button."""
+        tk = self._tk
+        pbg = parent.cget("bg")
+        h = _px(32 if small else 40)
+        padx = _px(16 if small else 24) if kind != "text" else _px(12)
+        cv = tk.Canvas(parent, bg=pbg, height=h, highlightthickness=0, bd=0,
+                       cursor="hand2", takefocus=1)
+        state = {"text": text, "hover": False, "press": False, "focus": False,
+                 "kind": kind}
+        img_id = cv.create_image(0, 0, anchor="nw")
+        txt_id = cv.create_text(0, 0, text=text, font=self.f_btn)
+
+        def colours():
+            k = state["kind"]
+            if k == "filled":
+                return _C["primary"], _C["on_primary"], None
+            if k == "tonal":
+                return _C["secondary_ctr"], _C["on_secondary_ctr"], None
+            if k == "warn":
+                return _C["warn"], _C["warn_ctr"], None
+            if k == "outlined":
+                return pbg, ink or _C["primary"], _C["outline"]
+            return pbg, ink or _C["primary"], None   # text
+
+        def paint():
+            fill, fg, outline = colours()
+            layer = 0.12 if state["press"] else 0.08 if state["hover"] else 0
+            if layer:
+                fill = _blend(fill, fg, layer)
+            if state["focus"]:
+                outline = _C["on_surface"]
+            tw = self.f_btn.measure(state["text"]) if self.f_btn else 8 * len(state["text"])
+            w = tw + 2 * padx
+            cv.configure(width=w)
+            img = self._rrect(w, h, h // 2, fill, outline, _px(2) if state["focus"] else 1)
+            if img is not None:
+                self._put(cv, img, img_id)
+            cv.coords(txt_id, w / 2, h / 2)
+            cv.itemconfigure(txt_id, text=state["text"], fill=fg)
+
+        def set_hover(v):
+            state["hover"] = v
+            if not v:
+                state["press"] = False
+            paint()
+
+        def set_press(v):
+            state["press"] = v
+            paint()
+
+        def release(e):
+            inside = 0 <= e.x < cv.winfo_width() and 0 <= e.y < cv.winfo_height()
+            state["press"] = False
+            paint()
+            if inside:
+                command()
+
+        cv.bind("<Enter>", lambda e: set_hover(True))
+        cv.bind("<Leave>", lambda e: set_hover(False))
+        cv.bind("<ButtonPress-1>", lambda e: set_press(True))
+        cv.bind("<ButtonRelease-1>", release)
+        cv.bind("<Return>", lambda e: command())
+        cv.bind("<space>", lambda e: command())
+        cv.bind("<FocusIn>", lambda e: (state.update(focus=True), paint(),
+                                        self._scroll_into_view(cv)))
+        cv.bind("<FocusOut>", lambda e: (state.update(focus=False), paint()))
+
+        def set_text(t):
+            state["text"] = t
+            paint()
+
+        def set_kind(k):
+            state["kind"] = k
+            paint()
+        cv.set_text = set_text
+        cv.set_kind = set_kind
+        paint()
+        return cv
+
+    def _switch(self, parent, on, command, enabled=True):
+        """An M3 switch: 52×32 track; the thumb grows from 16 to 24 and slides
+        across when it turns on."""
+        tk = self._tk
+        pbg = parent.cget("bg")
+        W, H = _px(52), _px(32)
+        cv = tk.Canvas(parent, bg=pbg, width=W, height=H, highlightthickness=0, bd=0,
+                       cursor="hand2" if enabled else "", takefocus=1 if enabled else 0)
+        track = cv.create_image(0, 0, anchor="nw")
+        thumb = cv.create_image(0, 0, anchor="center")
+        st = {"on": bool(on), "pos": 1.0 if on else 0.0, "hover": False,
+              "focus": False, "anim": None, "enabled": enabled, "press": False}
+
+        def paint():
+            pos = st["pos"]
+            on_ = st["on"]
+            if not st["enabled"]:
+                tr = self._rrect(W, H, H // 2, _blend(pbg, _C["on_surface"], 0.12),
+                                 _blend(pbg, _C["on_surface"], 0.12), _px(2))
+                th_col, d = _blend(pbg, _C["on_surface"], 0.38), _px(16)
+            elif on_:
+                tr = self._rrect(W, H, H // 2, _C["primary"],
+                                 _C["on_surface"] if st["focus"] else None, _px(2))
+                th_col = _C["on_primary"] if not st["hover"] else _C["primary_ctr"]
+                d = _px(16 + 8 * pos)
+            else:
+                tr = self._rrect(W, H, H // 2, _C["container_top"],
+                                 _C["on_surface"] if st["focus"] else _C["outline"], _px(2))
+                th_col = _C["outline"] if not st["hover"] else _C["on_variant"]
+                d = _px(16 + 8 * pos)
+            if tr is not None:
+                self._put(cv, tr, track)
+            x = _px(16) + (W - _px(32)) * pos
+            img = self._dot_img(th_col, d)
+            if img is not None:
+                self._put(cv, img, thumb)
+            cv.coords(thumb, x, H / 2)
+
+        def animate():
+            target = 1.0 if st["on"] else 0.0
+            step = 0.25 if target > st["pos"] else -0.25
+            st["pos"] = max(0.0, min(1.0, st["pos"] + step))
+            paint()
+            if st["pos"] != target:
+                st["anim"] = cv.after(16, animate)
+            else:
+                st["anim"] = None
+
+        def set_on(v, animated=True):
+            st["on"] = bool(v)
+            if st["anim"] is not None:
+                cv.after_cancel(st["anim"])
+                st["anim"] = None
+            if animated:
+                animate()
+            else:
+                st["pos"] = 1.0 if v else 0.0
+                paint()
+
+        def click(_e=None):
+            if st["enabled"]:
+                command()
+
+        def press(_e):
+            st["press"] = True
+
+        def release(e):
+            # Like _button: only a press that began here and ends here toggles,
+            # so dragging across the switch and letting go on it changes nothing.
+            pressed, st["press"] = st["press"], False
+            if pressed and 0 <= e.x < cv.winfo_width() and 0 <= e.y < cv.winfo_height():
+                click()
+
+        cv.bind("<ButtonPress-1>", press)
+        cv.bind("<ButtonRelease-1>", release)
+        cv.bind("<Return>", click)
+        cv.bind("<space>", click)
+        cv.bind("<Enter>", lambda e: (st.update(hover=True), paint()))
+        cv.bind("<Leave>", lambda e: (st.update(hover=False), paint()))
+        cv.bind("<FocusIn>", lambda e: (st.update(focus=True), paint(),
+                                        self._scroll_into_view(cv)))
+        cv.bind("<FocusOut>", lambda e: (st.update(focus=False), paint()))
+
+        def set_enabled(v):
+            st["enabled"] = v
+            cv.configure(cursor="hand2" if v else "", takefocus=1 if v else 0)
+            paint()
+        cv.set_on = set_on
+        cv.set_enabled = set_enabled
+        paint()
+        return cv
+
+    def _chip(self, parent, text, tone="neutral"):
+        """A status chip: dot + label on a tonal pill. .set(text, tone) restyles."""
+        tk = self._tk
+        pbg = parent.cget("bg")
+        h = _px(28)
+        cv = tk.Canvas(parent, bg=pbg, height=h, highlightthickness=0, bd=0)
+        img_id = cv.create_image(0, 0, anchor="nw")
+        dot_id = cv.create_image(0, h / 2, anchor="w")
+        txt_id = cv.create_text(0, h / 2, anchor="w", font=self.f_lbl)
+
+        def set_(t, tn="neutral"):
+            fill, fg, dot = {
+                "ok": (_C["ok_ctr"], _C["on_ok_ctr"], _C["ok"]),
+                "warn": (_C["warn_ctr"], _C["on_warn_ctr"], _C["warn"]),
+                "accent": (_C["primary_ctr"], _C["on_primary_ctr"], _C["primary"]),
+            }.get(tn, (_C["container_hi"], _C["on_variant"], _C["outline"]))
+            tw = self.f_lbl.measure(t) if self.f_lbl else 7 * len(t)
+            w = _px(12) + _px(8) + _px(8) + tw + _px(12)
+            cv.configure(width=w)
+            img = self._rrect(w, h, h // 2, fill)
+            if img is not None:
+                self._put(cv, img, img_id)
+            di = self._dot_img(dot, _px(8))
+            if di is not None:
+                self._put(cv, di, dot_id)
+            cv.coords(dot_id, _px(12), h / 2)
+            cv.coords(txt_id, _px(28), h / 2)
+            cv.itemconfigure(txt_id, text=t, fill=fg)
+        cv.set = set_
+        set_(text, tone)
+        return cv
 
     # ── system tray ───────────────────────────────────────────────────────────
     def _setup_tray(self):
@@ -3959,15 +4801,14 @@ class LazeRWindow:
 
     # ── clickable labels, made keyboard-usable ─────────────────────────────────
     def _clickable(self, widget, command):
-        """Every button here is a styled tk.Label. Bind the mouse AND make it a
-        Tab stop that Enter/Space activate, with a visible focus ring — without
-        this, nothing in the window could be reached from the keyboard."""
+        """Bind the mouse AND make a label a Tab stop that Enter/Space activate,
+        with a visible focus ring — so the keyboard reaches it too."""
         try:
             bg = widget.master.cget("bg")
         except Exception:
-            bg = _C["card"]
+            bg = _C["container"]
         widget.config(takefocus=1, highlightthickness=1, highlightbackground=bg,
-                      highlightcolor=_C["accent"])
+                      highlightcolor=_C["primary"])
         widget.bind("<Button-1>", lambda e: command())
         widget.bind("<Return>", lambda e: command())
         widget.bind("<space>", lambda e: command())
@@ -3979,6 +4820,7 @@ class LazeRWindow:
         """Size the window to its content, capped to the screen; past the cap
         the body scrolls (scrollbar shown only then)."""
         root = self._root
+        self._sync_cards()
         root.update_idletasks()
         w, h = self._outer.winfo_reqwidth(), self._outer.winfo_reqheight()
         avail = root.winfo_screenheight() - _px(80)
@@ -4018,106 +4860,104 @@ class LazeRWindow:
         except Exception:
             pass
 
-    # ── card primitive ──────────────────────────────────────────────────────
-    def _card(self, parent, **pack):
-        """A bordered surface that reads as a rounded card."""
-        tk = self._tk
-        border = tk.Frame(parent, bg=_C["border"])
-        inner = tk.Frame(border, bg=_C["card"])
-        inner.pack(fill="both", expand=True, padx=_px(1), pady=_px(1))
-        border.pack(**pack)
-        return inner
-
-    def _section_label(self, parent, text):
-        self._tk.Label(parent, text=text.upper(), bg=_C["card"], fg=_C["faint"],
-                       font=self.f_lbl).pack(anchor="w")
-
     # ── header ────────────────────────────────────────────────────────────────
     def _build_header(self, parent):
         tk = self._tk
-        bar = tk.Frame(parent, bg=_C["bg"])
+        bar = tk.Frame(parent, bg=_C["surface"])
         bar.pack(fill="x")
 
-        badge = tk.Canvas(bar, width=_px(30), height=_px(30), bg=_C["bg"],
-                          highlightthickness=0, bd=0)
-        badge.pack(side="left")
-        badge.create_oval(2, 2, 28, 28, fill=_C["accent2"], outline=_C["accent"])
-        badge.create_oval(11, 11, 19, 19, fill=_C["accent"], outline="")
-        badge.create_line(15, 4, 15, 9, fill=_C["accent"], width=_px(2))
-        badge.create_line(15, 21, 15, 26, fill=_C["accent"], width=_px(2))
-        badge.create_line(4, 15, 9, 15, fill=_C["accent"], width=_px(2))
-        badge.create_line(21, 15, 26, 15, fill=_C["accent"], width=_px(2))
-        badge.scale("all", 0, 0, _UI_SCALE[0], _UI_SCALE[0])
+        mark = tk.Label(bar, bg=_C["surface"], bd=0)
+        self._brand_img = None
+        try:
+            from PIL import Image, ImageTk
+            n = _px(32)
+            im = Image.open(ICON_FILE)
+            try:
+                im.size = max(im.info.get("sizes", [(256, 256)]))
+            except Exception:
+                pass
+            im = im.convert("RGBA").resize((n, n), Image.LANCZOS)
+            self._brand_img = ImageTk.PhotoImage(im, master=self._root)
+            mark.config(image=self._brand_img)
+        except Exception:
+            self._put(mark, self._icon("shield", _px(32), _C["on_primary_ctr"],
+                                       _C["primary_ctr"]))
+        mark.pack(side="left")
 
-        tk.Label(bar, text="LazeR", bg=_C["bg"], fg=_C["fg"],
-                 font=self.f_brand).pack(side="left", padx=(_px(9), 0))
-        tk.Label(bar, text="LAN Remote", bg=_C["bg"], fg=_C["faint"],
-                 font=self.f_sm).pack(side="left", padx=(_px(8), 0), pady=(_px(4), 0))
+        names = tk.Frame(bar, bg=_C["surface"])
+        names.pack(side="left", padx=(_px(10), 0))
+        tk.Label(names, text="LazeR", bg=_C["surface"], fg=_C["on_surface"],
+                 font=self.f_brand).pack(anchor="w")
 
-        quit_btn = tk.Label(bar, text="Quit", bg=_C["bg"], fg=_C["faint"],
-                            font=self.f_sm, cursor="hand2", padx=_px(6))
-        quit_btn.pack(side="right", pady=(_px(4), 0), padx=(_px(10), 0))
-        self._clickable(quit_btn, self._real_quit)
-
-        run = tk.Frame(bar, bg=_C["bg"])
-        run.pack(side="right", pady=(_px(4), 0))
+        quit_btn = self._button(bar, "Quit", self._real_quit, kind="text", small=True)
+        quit_btn.pack(side="right", padx=(_px(4), 0))
         # Driven by the receive loop's own events, so it goes dark with a dead loop.
-        self._run_dot = tk.Label(run, text="●", bg=_C["bg"], fg=_C["faint"],
-                                 font=self.f_sm)
-        self._run_dot.pack(side="left")
-        self._run_txt = tk.Label(run, text="starting…", bg=_C["bg"], fg=_C["dim"],
-                                 font=self.f_sm)
-        self._run_txt.pack(side="left", padx=(_px(5), 0))
+        self._run_chip = self._chip(bar, "Starting…", "neutral")
+        self._run_chip.pack(side="right")
 
     def _set_serving(self, ok):
-        self._run_dot.config(fg=_C["ok"] if ok else _C["warn"])
-        self._run_txt.config(text="ready for phones" if ok else "restarting…")
+        self._run_chip.set("Ready" if ok else "Restarting…", "ok" if ok else "warn")
 
     # ── hero status card ────────────────────────────────────────────────────
     def _build_hero(self, parent):
         tk = self._tk
-        card = self._card(parent, fill="x", pady=(_px(14), 0))
-        pad = tk.Frame(card, bg=_C["card"], padx=_px(16), pady=_px(14))
-        pad.pack(fill="x")
+        card = self._card(parent, fill="x", pady=(_px(16), 0), pad=16)
+        bg = card.cget("bg")
 
-        # circular avatar with overlaid status dot
-        self._avatar = tk.Canvas(pad, width=_px(52), height=_px(52), bg=_C["card"],
+        n = _px(52)
+        self._avatar = tk.Canvas(card, width=n, height=n, bg=bg,
                                  highlightthickness=0, bd=0)
         self._avatar.pack(side="left")
-        self._avatar.create_oval(2, 2, 50, 50, fill=_C["card2"],
-                                 outline=_C["border"])
-        self._avatar.create_text(26, 25, text="🖥", font=("Segoe UI Emoji", 17))
-        self._dotid = self._avatar.create_oval(
-            36, 36, 50, 50, fill=_C["faint"], outline=_C["card"], width=_px(2))
-        # Scales coordinates only; the emoji's point size already follows tk scaling.
-        self._avatar.scale("all", 0, 0, _UI_SCALE[0], _UI_SCALE[0])
+        ic = self._icon("laptop", n, _C["on_primary_ctr"], _C["primary_ctr"])
+        if ic is not None:
+            self._put(self._avatar, ic, self._avatar.create_image(0, 0, anchor="nw"))
+        self._dotid = self._avatar.create_image(n, n, anchor="se")
+        self._paint_avatar_dot(False)
 
-        col = tk.Frame(pad, bg=_C["card"])
-        col.pack(side="left", padx=(_px(14), 0), anchor="w")
-        tk.Label(col, text=socket.gethostname(), bg=_C["card"], fg=_C["fg"],
-                 font=self.f_hero).pack(anchor="w")
-        self._status = tk.Label(col, text="Waiting for phone to connect…",
-                                bg=_C["card"], fg=_C["dim"], font=self.f_sm)
-        self._status.pack(anchor="w", pady=(_px(2), 0))
+        col = tk.Frame(card, bg=bg)
+        col.pack(side="left", padx=(_px(14), 0), anchor="w", fill="x", expand=True)
+        tk.Label(col, text=socket.gethostname(), bg=bg, fg=_C["on_surface"],
+                 font=self.f_hero, anchor="w").pack(anchor="w")
+        self._status = tk.Label(col, text="Waiting for your phone…",
+                                bg=bg, fg=_C["on_variant"], font=self.f_md, anchor="w")
+        self._status.pack(anchor="w", pady=(_px(1), 0))
 
-    # ── notice banner: the latest warning, on the main screen ────────────────
+    def _paint_avatar_dot(self, connected):
+        img = self._dot_img(_C["ok"] if connected else _C["outline"], _px(16),
+                            ring=_C["container"], ring_w=_px(3))
+        if img is not None:
+            self._put(self._avatar, img, self._dotid)
+
+    # ── banners ──────────────────────────────────────────────────────────────
+    def _banner(self, parent, icon):
+        """An attention surface: amber container, leading icon, then a column the
+        caller fills (title, body, actions). Returns (wrap, column)."""
+        tk = self._tk
+        wrap = tk.Frame(parent, bg=_C["surface"])          # packed on demand
+        card = self._card(wrap, color=_C["warn_ctr"], radius=self.BANNER_R, pad=16,
+                          fill="x", pady=(_px(12), 0))
+        ic = self._icon(icon, _px(24), _C["on_warn_ctr"])
+        lead = tk.Label(card, bg=_C["warn_ctr"], bd=0)
+        if ic is not None:
+            self._put(lead, ic)
+        lead.pack(side="left", anchor="n", padx=(0, _px(12)))
+        col = tk.Frame(card, bg=_C["warn_ctr"])
+        col.pack(side="left", fill="x", expand=True)
+        return wrap, col
+
     def _build_notice_banner(self, parent):
         """The newest warning, shown until dismissed (in the log, per-click lines scroll
         it away); Show details is badged with the count."""
         tk = self._tk
-        self._notice_wrap = tk.Frame(parent, bg=_C["bg"])   # packed on demand
-        border = tk.Frame(self._notice_wrap, bg=_C["warn"])
-        border.pack(fill="x", pady=(_px(12), 0))
-        inner = tk.Frame(border, bg=_C["card"], padx=_px(14), pady=_px(10))
-        inner.pack(fill="both", expand=True, padx=_px(1), pady=_px(1))
-        self._notice_txt = tk.Label(inner, text="", bg=_C["card"], fg=_C["warn"],
-                                    font=self.f_sm, justify="left", anchor="w",
-                                    wraplength=_px(420))
-        self._notice_txt.pack(side="left", anchor="w", fill="x", expand=True)
-        dismiss = tk.Label(inner, text="Dismiss", bg=_C["card2"], fg=_C["fg"],
-                           font=self.f_sm, cursor="hand2", padx=_px(10), pady=_px(4))
-        dismiss.pack(side="right", padx=(_px(10), 0))
-        self._clickable(dismiss, self._clear_notice)
+        self._notice_wrap, col = self._banner(parent, "info")
+        self._notice_txt = tk.Label(col, text="", bg=_C["warn_ctr"], fg=_C["on_warn_ctr"],
+                                    font=self.f_md, justify="left", anchor="w",
+                                    wraplength=_px(self.PAGE_W - 120))
+        self._notice_txt.pack(anchor="w", fill="x")
+        btns = tk.Frame(col, bg=_C["warn_ctr"])
+        btns.pack(anchor="e", pady=(_px(8), 0))
+        self._button(btns, "Dismiss", self._clear_notice, kind="text",
+                     small=True, ink=_C["on_warn_ctr"]).pack(side="right")
 
     def _warn(self, msg):
         """Log a warning AND surface it: banner + details badge."""
@@ -4140,39 +4980,29 @@ class LazeRWindow:
     # ── local-takeover banner: shown when physical input has paused the remote ──
     def _build_pause_banner(self, parent):
         tk = self._tk
-        self._banner_wrap = tk.Frame(parent, bg=_C["bg"])
-        # packed/unpacked dynamically by _set_paused
-        border = tk.Frame(self._banner_wrap, bg=_C["warn"])
-        border.pack(fill="x", pady=(_px(12), 0))
-        pad = tk.Frame(border, bg=_C["card"])
-        pad.pack(fill="both", expand=True, padx=_px(2), pady=_px(2))
-        inner = tk.Frame(pad, bg=_C["card"], padx=_px(14), pady=_px(12))
-        inner.pack(fill="x")
-        self._banner_title = tk.Label(inner, text="", bg=_C["card"], fg=_C["warn"],
-                                      font=self.f_hero)
+        self._banner_wrap, col = self._banner(parent, "pause")
+        self._banner_title = tk.Label(col, text="", bg=_C["warn_ctr"],
+                                      fg=_C["on_warn_ctr"], font=self.f_title,
+                                      anchor="w")
         self._banner_title.pack(anchor="w")
-        self._banner_sub = tk.Label(inner, text="", bg=_C["card"], fg=_C["dim"],
-                                    font=self.f_sm, justify="left")
-        self._banner_sub.pack(anchor="w", pady=(_px(2), _px(8)))
-        btns = tk.Frame(inner, bg=_C["card"])
+        self._banner_sub = tk.Label(col, text="", bg=_C["warn_ctr"], fg=_C["on_warn_ctr"],
+                                    font=self.f_md, justify="left", anchor="w",
+                                    wraplength=_px(self.PAGE_W - 120))
+        self._banner_sub.pack(anchor="w", fill="x", pady=(_px(2), _px(10)))
+        btns = tk.Frame(col, bg=_C["warn_ctr"])
         btns.pack(anchor="w")
-        resume = tk.Label(btns, text="Resume remote", bg=_C["accent"], fg=_C["bg"],
-                          font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(6))
-        resume.pack(side="left")
-        self._clickable(resume, self._do_resume)
-        quitb = tk.Label(btns, text="Quit LazeR", bg=_C["card2"], fg=_C["fg"],
-                         font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(6))
-        quitb.pack(side="left", padx=(_px(8), 0))
-        self._clickable(quitb, self._real_quit)
+        self._button(btns, "Resume remote", self._do_resume, kind="warn",
+                     small=True).pack(side="left")
+        self._button(btns, "Quit LazeR", self._real_quit, kind="text",
+                     small=True, ink=_C["on_warn_ctr"]).pack(side="left", padx=(_px(4), 0))
 
     def _set_paused(self, latched):
         title = ("Remote stopped — you took over"
-                 if latched else "Local input — remote paused")
-        sub = ("Panic hotkey latched control OFF. Your mouse & keyboard are yours.\n"
-               "Click Resume when you're ready to hand control back, or Quit."
+                 if latched else "Paused while you use this computer")
+        sub = ("The panic hotkey turned remote control off. Your mouse and keyboard "
+               "are yours until you click Resume."
                if latched else
-               "You're using this computer — the phone is paused.\n"
-               "It resumes automatically a couple of seconds after you stop.")
+               "The phone picks up again a couple of seconds after you stop.")
         self._banner_title.config(text=title)
         self._banner_sub.config(text=sub)
         self._banner_wrap.pack(fill="x", before=self._swap)
@@ -4194,29 +5024,21 @@ class LazeRWindow:
     def _build_firewall_banner(self, parent):
         tk = self._tk
         self._fw_ok = None
-        self._fw_wrap = tk.Frame(parent, bg=_C["bg"])   # packed/unpacked dynamically
-        border = tk.Frame(self._fw_wrap, bg=_C["warn"])
-        border.pack(fill="x", pady=(_px(12), 0))
-        pad = tk.Frame(border, bg=_C["card"])
-        pad.pack(fill="both", expand=True, padx=_px(2), pady=_px(2))
-        inner = tk.Frame(pad, bg=_C["card"], padx=_px(14), pady=_px(12))
-        inner.pack(fill="x")
-        tk.Label(inner, text="Phones can't reach this laptop", bg=_C["card"],
-                 fg=_C["warn"], font=self.f_hero).pack(anchor="w")
-        self._fw_sub = tk.Label(inner, text="", bg=_C["card"], fg=_C["dim"],
-                                font=self.f_sm, justify="left", wraplength=_px(460))
-        self._fw_sub.pack(anchor="w", pady=(_px(2), _px(8)))
-        btns = tk.Frame(inner, bg=_C["card"])
+        self._fw_wrap, col = self._banner(parent, "shield")
+        tk.Label(col, text="Phones can't reach this laptop", bg=_C["warn_ctr"],
+                 fg=_C["on_warn_ctr"], font=self.f_title, anchor="w").pack(anchor="w")
+        self._fw_sub = tk.Label(col, text="", bg=_C["warn_ctr"], fg=_C["on_warn_ctr"],
+                                font=self.f_md, justify="left", anchor="w",
+                                wraplength=_px(self.PAGE_W - 120))
+        self._fw_sub.pack(anchor="w", fill="x", pady=(_px(2), _px(10)))
+        btns = tk.Frame(col, bg=_C["warn_ctr"])
         btns.pack(anchor="w")
-        self._fw_btn = tk.Label(btns, text="Allow through firewall", bg=_C["accent"],
-                                fg=_C["bg"], font=self.f_sm, cursor="hand2",
-                                padx=_px(14), pady=_px(6))
+        self._fw_btn = self._button(btns, "Allow through firewall", self._fix_firewall,
+                                    kind="warn", small=True)
         self._fw_btn.pack(side="left")
-        self._clickable(self._fw_btn, self._fix_firewall)
-        self._fw_dismiss = tk.Label(btns, text="Dismiss", bg=_C["card2"], fg=_C["fg"],
-                                    font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(6))
-        self._fw_dismiss.pack(side="left", padx=(_px(8), 0))
-        self._clickable(self._fw_dismiss, self._dismiss_firewall_banner)
+        self._fw_dismiss = self._button(btns, "Dismiss", self._dismiss_firewall_banner,
+                                        kind="text", small=True, ink=_C["on_warn_ctr"])
+        self._fw_dismiss.pack(side="left", padx=(_px(4), 0))
         self._fw_inert = False
 
     def _periodic_firewall(self):
@@ -4312,7 +5134,7 @@ class LazeRWindow:
             self._check_firewall()
 
     def _fix_firewall(self):
-        self._fw_btn.config(text="Requesting admin…")
+        self._fw_btn.set_text("Requesting admin…")
 
         def work():
             ok = ensure_firewall_rule(allow_elevate=True)
@@ -4320,7 +5142,7 @@ class LazeRWindow:
         threading.Thread(target=work, daemon=True).start()
 
     def _after_fix_firewall(self, ok):
-        self._fw_btn.config(text="Allow through firewall")
+        self._fw_btn.set_text("Allow through firewall")
         self._fw_ok = ok
         self._update_fw_pill()
         if ok:
@@ -4371,10 +5193,10 @@ class LazeRWindow:
         if link:
             # Only clickable once there IS something to open, so a dead pointer
             # cursor never invites a click that does nothing.
-            val.config(fg=_C["accent"], cursor="hand2")
+            val.config(fg=_C["primary"], cursor="hand2")
             self._clickable(val, self._open_releases)
         else:
-            val.config(fg=_C["faint"], cursor="")
+            val.config(fg=_C["on_variant"], cursor="")
             val.unbind("<Button-1>")
 
     def _open_releases(self):
@@ -4390,9 +5212,9 @@ class LazeRWindow:
             return
         dot, txt = pill
         txt.unbind("<Button-1>")
-        txt.config(cursor="")
+        txt.config(cursor="", fg=_C["on_variant"])
         if self._fw_ok is None:
-            dot.config(fg=_C["faint"]); txt.config(text="checking…")
+            dot.config(fg=_C["outline"]); txt.config(text="checking…")
         elif self._fw_ok:
             dot.config(fg=_C["ok"]); txt.config(text="inbound allowed")
         else:
@@ -4402,7 +5224,8 @@ class LazeRWindow:
             what = ("blocked by this network's policy" if self._fw_inert
                     else "blocked — inbound UDP rule missing")
             if self._fw_dismissed or self._fw_inert:
-                txt.config(text=what + " · click for details", cursor="hand2")
+                txt.config(text=what + " · click for details", cursor="hand2",
+                           fg=_C["primary"])
                 txt.bind("<Button-1>", lambda e: self._reopen_firewall_banner())
             else:
                 txt.config(text=what + " · see the banner above")
@@ -4410,15 +5233,14 @@ class LazeRWindow:
     # ── friendly connect card: just the QR + pairing code ────────────────────
     def _build_connect_card(self, parent, uri, token):
         tk = self._tk
-        card = self._card(parent, fill="x")
-        self._connect_border = card.master   # the bordered frame, for show/hide
-        pad = tk.Frame(card, bg=_C["card"], padx=_px(20), pady=_px(18))
-        pad.pack(fill="x")
+        pad = self._card(parent, pad=24)
+        self._connect_border = pad.master   # the card canvas, for show/hide
+        bg = pad.cget("bg")
 
-        tk.Label(pad, text="Connect your phone", bg=_C["card"], fg=_C["fg"],
+        tk.Label(pad, text="Connect your phone", bg=bg, fg=_C["on_surface"],
                  font=self.f_hero).pack()
-        tk.Label(pad, text="Open the LazeR app and scan this code",
-                 bg=_C["card"], fg=_C["dim"], font=self.f_md).pack(pady=(_px(3), 0))
+        tk.Label(pad, text="Open LazeR on your phone and scan this code",
+                 bg=bg, fg=_C["on_variant"], font=self.f_md).pack(pady=(_px(4), 0))
 
         self._qr_img_label = None
         self._make_qr_photo = None
@@ -4428,7 +5250,7 @@ class LazeRWindow:
         self._qr_after = None
         try:
             import qrcode
-            from PIL import ImageTk
+            from PIL import ImageTk  # noqa: F401
             self._make_qr_photo = self._build_qr_maker(qrcode, ImageTk)
             # No address yet: render a throwaway so the slot has its size; it is
             # hidden behind the "waiting" placeholder until netchange repaints it.
@@ -4438,56 +5260,53 @@ class LazeRWindow:
             # at the END of its parent's pack order, so a direct swap dropped the
             # code below the pairing chip and the plaintext note after the first
             # idle hide, and left it there.
-            slot = tk.Frame(pad, bg=_C["card"])
-            slot.pack(pady=(_px(16), _px(14)))
+            slot = tk.Frame(pad, bg=bg)
+            slot.pack(pady=(_px(18), _px(16)))
             self._qr_slot = slot
-            holder = tk.Frame(slot, bg="#FFFFFF", padx=_px(10), pady=_px(10))
+            holder = tk.Frame(slot, bg=bg)
             holder.pack()
-            self._qr_img_label = tk.Label(holder, image=self._photo, bg="#FFFFFF")
+            self._qr_img_label = tk.Label(holder, image=self._photo, bg=bg, bd=0)
             self._qr_img_label.pack()
             self._qr_holder = holder
             # Click-to-show placeholder swapped in by the idle hide
             # (QR_HIDE_AFTER_MS): an unattended laptop must not advertise its
             # token+key to every passer-by indefinitely.
-            self._qr_placeholder = tk.Frame(slot, bg=_C["card"])
-            ph = tk.Label(self._qr_placeholder,
-                          text="QR code hidden — click to show",
-                          bg=_C["card"], fg=_C["dim"], font=self.f_md,
-                          width=24, height=6, justify="center", cursor="hand2")
-            ph.pack()
+            ph = tk.Canvas(slot, bg=bg, highlightthickness=0, bd=0, takefocus=1)
+            self._ph_shape = ph.create_image(0, 0, anchor="nw")
+            self._ph_text = ph.create_text(0, 0, text="", justify="center",
+                                           font=self.f_md, fill=_C["on_variant"])
+            ph.bind("<Button-1>", lambda e: self._show_qr())
+            ph.bind("<Return>", lambda e: self._show_qr())
+            ph.bind("<space>", lambda e: self._show_qr())
+            self._qr_placeholder = ph
             self._qr_ph_label = ph
-            self._clickable(ph, self._show_qr)
+            self._fit_placeholder()
         except ImportError:
             tk.Label(pad, text="Install Pillow for the QR image:\npip install pillow",
-                     bg=_C["card"], fg=_C["dim"], font=self.f_sm,
+                     bg=bg, fg=_C["on_variant"], font=self.f_sm,
                      width=24, height=10, justify="center").pack(pady=_px(16))
 
         # Typed-code pairing. Encryption is required by default, and the typed code
         # is the plaintext wire, so it is shown only while it can work.
-        self._code_box = tk.Frame(pad, bg=_C["card"])
+        self._code_box = tk.Frame(pad, bg=bg)
         self._code_box.pack()
-        tk.Label(self._code_box, text="No scanner? Type this pairing code in the app",
-                 bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack()
-        chip = tk.Frame(self._code_box, bg=_C["card2"])
-        chip.pack(pady=(_px(8), 0))
-        self._token_chip = tk.Label(chip, text=token, bg=_C["card2"], fg=_C["accent"],
-                                    font=self.f_tok, padx=_px(16), pady=_px(6))
+        tk.Label(self._code_box, text="No camera? Type this pairing code in the app",
+                 bg=bg, fg=_C["on_variant"], font=self.f_sm).pack()
+        chip = self._card(self._code_box, color=_C["container_hi"], radius=16, pad=8,
+                          pady=(_px(8), 0))
+        self._token_chip = tk.Label(chip, text=token, bg=_C["container_hi"],
+                                    fg=_C["primary"], font=self.f_tok, padx=_px(10))
         self._token_chip.pack(side="left")
-        self._copy_btn = tk.Label(chip, text="Copy", bg=_C["accent2"], fg=_C["fg"],
-                                  font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(6))
-        self._copy_btn.pack(side="left")
-        self._clickable(self._copy_btn, lambda: self._copy(self._wire.token))
-        tk.Label(self._code_box, text="(Typed-code pairing is NOT encrypted — "
-                 "scan the QR when you can)",
-                 bg=_C["card"], fg=_C["warn"], font=self.f_lbl).pack(pady=(_px(6), 0))
-        self._copy_btn.bind("<Enter>",
-                            lambda e: self._copy_btn.config(bg=_C["accent"]))
-        self._copy_btn.bind("<Leave>",
-                            lambda e: self._copy_btn.config(bg=_C["accent2"]))
+        self._copy_btn = self._button(chip, "Copy", lambda: self._copy(self._wire.token),
+                                      kind="tonal", small=True)
+        self._copy_btn.pack(side="left", padx=(_px(6), 0))
+        tk.Label(self._code_box, text="Typed codes aren't encrypted — scan the QR "
+                 "when you can", bg=bg, fg=_C["warn"],
+                 font=self.f_sm).pack(pady=(_px(8), 0))
         self._code_off = tk.Label(
-            pad, text="Only QR pairing is on (encrypted). Typed-code pairing can be "
-                      "allowed under Show details → Require encryption.",
-            bg=_C["card"], fg=_C["faint"], font=self.f_sm, wraplength=_px(360),
+            pad, text="Pairing is QR-only and encrypted. To allow typed codes, turn off "
+                      "Require encryption in Details.",
+            bg=bg, fg=_C["on_variant"], font=self.f_sm, wraplength=_px(340),
             justify="center")
         self._refresh_code_box()
         self._arm_qr_hide()
@@ -4503,59 +5322,56 @@ class LazeRWindow:
     # ── connected panel: shown instead of the QR once a phone is paired ───────
     def _build_connected_panel(self, parent):
         tk = self._tk
-        card = self._card(parent, fill="x")
-        self._connected_border = card.master
-        pad = tk.Frame(card, bg=_C["card"], padx=_px(20), pady=_px(22))
-        pad.pack(fill="x")
+        pad = self._card(parent, pad=28)
+        self._connected_border = pad.master
+        bg = pad.cget("bg")
 
-        check = tk.Canvas(pad, width=_px(44), height=_px(44), bg=_C["card"],
-                          highlightthickness=0, bd=0)
+        n = _px(64)
+        ic = self._icon("check", n, _C["on_ok_ctr"], _C["ok_ctr"])
+        check = tk.Label(pad, bg=bg, bd=0)
+        if ic is not None:
+            self._put(check, ic)
         check.pack()
-        check.create_oval(2, 2, 42, 42, fill=_C["card2"], outline=_C["ok"])
-        check.create_line(13, 23, 20, 30, fill=_C["ok"], width=_px(3),
-                          capstyle="round")
-        check.create_line(20, 30, 32, 15, fill=_C["ok"], width=_px(3),
-                          capstyle="round")
-        check.scale("all", 0, 0, _UI_SCALE[0], _UI_SCALE[0])
 
-        tk.Label(pad, text="Phone connected", bg=_C["card"], fg=_C["fg"],
-                 font=self.f_hero).pack(pady=(_px(10), 0))
+        tk.Label(pad, text="Phone connected", bg=bg, fg=_C["on_surface"],
+                 font=self.f_hero).pack(pady=(_px(14), 0))
         self._connected_sub = tk.Label(
-            pad, text="Your phone is now controlling this computer",
-            bg=_C["card"], fg=_C["dim"], font=self.f_md)
-        self._connected_sub.pack(pady=(_px(3), 0))
+            pad, text="Your phone is controlling this computer",
+            bg=bg, fg=_C["on_variant"], font=self.f_md)
+        self._connected_sub.pack(pady=(_px(4), 0))
 
-        btns = tk.Frame(pad, bg=_C["card"])
-        btns.pack(pady=(_px(16), 0))
-        show_qr = tk.Label(btns, text="Show QR code", bg=_C["card2"],
-                           fg=_C["dim"], font=self.f_sm, cursor="hand2",
-                           padx=_px(16), pady=_px(7))
-        show_qr.pack(side="left")
-        self._clickable(show_qr, self._show_qr_view)
-        show_qr.bind("<Enter>", lambda e: show_qr.config(fg=_C["accent"]))
-        show_qr.bind("<Leave>", lambda e: show_qr.config(fg=_C["dim"]))
-        kick = tk.Label(btns, text="New code (disconnects phone)…", bg=_C["card2"],
-                        fg=_C["dim"], font=self.f_sm, cursor="hand2",
-                        padx=_px(16), pady=_px(7))
-        kick.pack(side="left", padx=(_px(8), 0))
-        self._clickable(kick, self._confirm_regenerate)
-        tk.Label(pad, text="After a drop or a sleep the phone reconnects by itself.",
-                 bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(pady=(_px(8), 0))
+        btns = tk.Frame(pad, bg=bg)
+        btns.pack(pady=(_px(20), 0))
+        self._button(btns, "Show QR code", self._show_qr_view, kind="tonal").pack(
+            side="left")
+        self._button(btns, "New code…", self._confirm_regenerate, kind="text").pack(
+            side="left", padx=(_px(8), 0))
+        tk.Label(pad, text="After a drop or a sleep, the phone reconnects by itself.",
+                 bg=bg, fg=_C["outline"], font=self.f_sm).pack(pady=(_px(14), 0))
 
     def _build_qr_maker(self, qrcode, ImageTk):
         """Return a fn uri -> PhotoImage, so the QR can be rebuilt after an IP change."""
         # Sized for the screen in layout pixels, then drawn in real ones.
         s = _UI_SCALE[0]
         box = max(1, round(qr_box_size(self._root.winfo_screenheight() / s) * s))
+        radius = _px(20)
 
         def make(uri):
+            from PIL import Image, ImageDraw
             qr = qrcode.QRCode(border=2, box_size=box,
                                error_correction=qrcode.constants.ERROR_CORRECT_M)
             qr.add_data(uri)
             qr.make(fit=True)
-            pil = qr.make_image(fill_color="#0F0F14",
-                                back_color="#FFFFFF").convert("RGB")
-            return ImageTk.PhotoImage(pil)
+            pil = qr.make_image(fill_color=_C["qr_dark"],
+                                back_color="#FFFFFF").convert("RGBA")
+            # A white tile with rounded corners. The quiet zone is kept white;
+            # only the outermost corners go, well clear of the finder patterns.
+            w, h = pil.size
+            mask = Image.new("L", (w * 4, h * 4), 0)
+            ImageDraw.Draw(mask).rounded_rectangle([0, 0, w * 4 - 1, h * 4 - 1],
+                                                   radius=radius * 4, fill=255)
+            pil.putalpha(mask.resize((w, h), Image.LANCZOS))
+            return ImageTk.PhotoImage(pil, master=self._root)
         return make
 
     def refresh_network(self, new_ip, new_uri):
@@ -4569,11 +5385,25 @@ class LazeRWindow:
         self._repaint_qr(new_uri)
         self._refresh_discovery_pill()
 
+    def _fit_placeholder(self):
+        """Size the hidden-QR tile to the QR it stands in for. A new address can
+        change the QR's version and so its size; a tile left at the old size
+        made the card jump on every idle hide."""
+        ph, photo = getattr(self, "_qr_placeholder", None), getattr(self, "_photo", None)
+        if ph is None or photo is None:
+            return
+        qw, qh = photo.width(), photo.height()
+        ph.configure(width=qw, height=qh)
+        self._put(ph, self._rrect(qw, qh, _px(20), _C["container_hi"]), self._ph_shape)
+        ph.coords(self._ph_text, qw / 2, qh / 2)
+        ph.itemconfigure(self._ph_text, width=max(1, qw - _px(40)))
+
     def _repaint_qr(self, uri):
         if self._make_qr_photo and self._qr_img_label is not None:
             try:
                 self._photo = self._make_qr_photo(uri)
                 self._qr_img_label.config(image=self._photo)
+                self._fit_placeholder()
                 # A freshly painted QR exists to be scanned — show it and restart
                 # the idle-hide clock.
                 self._show_qr()
@@ -4603,12 +5433,14 @@ class LazeRWindow:
             return                      # no Pillow, or nothing rendered
         self._qr_hidden = True
         try:
-            self._qr_ph_label.config(
-                text=("Waiting for a network connection…" if self._qr_waiting
-                      else "QR code hidden — click to show"),
-                cursor="" if self._qr_waiting else "hand2")
+            ph = self._qr_placeholder
+            ph.itemconfigure(self._ph_text,
+                             text=("Waiting for a network connection…"
+                                   if self._qr_waiting
+                                   else "QR code hidden for privacy\nClick to show"))
+            ph.configure(cursor="" if self._qr_waiting else "hand2")
             self._qr_holder.pack_forget()
-            self._qr_placeholder.pack()
+            ph.pack()
         except Exception:
             pass
         self._resize()      # let the card shrink to the placeholder
@@ -4651,13 +5483,13 @@ class LazeRWindow:
 
     def _confirm_regenerate(self):
         """Rotation kicks every paired phone and invalidates saved pairings —
-        destructive enough that one misclick on this small label must not do it."""
+        destructive enough that one misclick must not do it."""
         try:
             import tkinter.messagebox as mb
             ok = mb.askyesno(
-                "Regenerate pairing code",
-                "Generate a new pairing code? The connected phone is disconnected "
-                "now, and every paired phone must scan the new QR.")
+                "New pairing code",
+                "Make a new pairing code? The connected phone disconnects now, and "
+                "every paired phone must scan the new QR.", parent=self._root)
         except Exception:
             ok = True       # no dialog available — behave as before
         if ok:
@@ -4677,11 +5509,7 @@ class LazeRWindow:
         self._resize()
 
     def _refresh_secure_btn(self):
-        on = self._require_secure
-        self._secure_btn.config(
-            text="On" if on else "Off",
-            bg=_C["accent"] if on else _C["card2"],
-            fg=_C["bg"] if on else _C["dim"])
+        self._secure_btn.set_on(self._require_secure)
 
     # ── swap QR <-> connected ─────────────────────────────────────────────────
     def _show_qr_view(self):
@@ -4723,31 +5551,37 @@ class LazeRWindow:
     # ── details toggle (hides all the technical stuff) ────────────────────────
     def _build_details_toggle(self, parent):
         tk = self._tk
-        bar = tk.Frame(parent, bg=_C["bg"])
-        bar.pack(fill="x", pady=(_px(12), 0))
-        self._toggle = tk.Label(bar, text="Show details  ▾", bg=_C["bg"],
-                                fg=_C["faint"], font=self.f_sm, cursor="hand2")
+        bar = tk.Frame(parent, bg=_C["surface"])
+        bar.pack(fill="x", pady=(_px(10), 0))
+        self._toggle = tk.Label(bar, text="", bg=_C["surface"], fg=_C["primary"],
+                                font=self.f_btn, cursor="hand2", compound="right",
+                                padx=_px(12), pady=_px(6))
         self._toggle.pack()
         self._clickable(self._toggle, self._toggle_details)
-        self._toggle.bind("<Enter>", lambda e: self._toggle.config(fg=_C["dim"]))
-        self._toggle.bind("<Leave>", lambda e: self._refresh_details_toggle())
+        self._details_open = False
+        hover = _blend(_C["surface"], _C["primary"], 0.08)
+        self._toggle.bind("<Enter>", lambda e: self._toggle.config(bg=hover))
+        self._toggle.bind("<Leave>", lambda e: self._toggle.config(bg=_C["surface"]))
+        self._refresh_details_toggle()
 
     # ── details panel: network info, services, activity ───────────────────────
     def _build_details(self, parent, ip, port, token):
         tk = self._tk
-        card = self._card(parent, fill="both", expand=True, pady=(_px(12), 0))
-        pad = tk.Frame(card, bg=_C["card"], padx=_px(16), pady=_px(14))
-        pad.pack(fill="both", expand=True)
-        self._section_label(pad, "Network")
+        # Status
+        pad = self._card(parent, fill="x", pady=(_px(8), 0), pad=20)
+        bg = pad.cget("bg")
+        self._section_label(pad, "Connection")
+
+        grid = tk.Frame(pad, bg=bg)
+        grid.pack(fill="x", pady=(_px(6), 0))
 
         def row(label, value):
-            f = tk.Frame(pad, bg=_C["card"])
-            f.pack(fill="x", pady=(_px(8), 0))
-            tk.Label(f, text=label, bg=_C["card"], fg=_C["dim"],
-                     font=self.f_md, width=9, anchor="w").pack(side="left")
-            val = tk.Label(f, text=value, bg=_C["card"], fg=_C["fg"],
-                           font=self.f_val, anchor="w")
-            val.pack(side="left")
+            r = grid.grid_size()[1]
+            tk.Label(grid, text=label, bg=bg, fg=_C["on_variant"], font=self.f_md,
+                     anchor="w").grid(row=r, column=0, sticky="w", pady=_px(3))
+            val = tk.Label(grid, text=value, bg=bg, fg=_C["on_surface"], font=self.f_val,
+                           anchor="w")
+            val.grid(row=r, column=1, sticky="w", padx=(_px(16), 0), pady=_px(3))
             return val
 
         self._ip_value = row("IP address", ip or "no network yet")
@@ -4761,8 +5595,8 @@ class LazeRWindow:
         if others:
             row("Also at", ", ".join(others[:3]))
 
-        tk.Frame(pad, bg=_C["border"], height=1).pack(fill="x", pady=(_px(14), _px(12)))
-
+        self._divider(pad)
+        self._section_label(pad, "Status")
         vol_ok = VOLUME_BACKEND is not None
         self._pill(pad, "Volume control",
                    VOLUME_BACKEND if vol_ok else "unavailable", vol_ok)
@@ -4776,12 +5610,34 @@ class LazeRWindow:
         self._upd_pill = self._mutable_pill(
             pad, "Version", f"v{APP_VERSION} — checking for updates…")
 
-        self._build_security_controls(pad)
-
+        # Settings
+        spad = self._card(parent, fill="x", pady=(_px(12), 0), pad=20)
+        self._section_label(spad, "Settings")
+        self._build_security_controls(spad)
         if sys.platform.startswith("win"):
-            self._build_startup_toggle(pad)
+            self._build_startup_toggle(spad)
 
         self._build_activity(parent)
+
+    def _divider(self, parent):
+        self._tk.Frame(parent, bg=_C["outline_var"], height=1).pack(
+            fill="x", pady=(_px(14), _px(12)))
+
+    def _setting_row(self, parent, title, sub):
+        """A two-line list item; returns the frame its trailing control packs into."""
+        tk = self._tk
+        bg = parent.cget("bg")
+        f = tk.Frame(parent, bg=bg)
+        f.pack(fill="x", pady=(_px(10), 0))
+        trail = tk.Frame(f, bg=bg)
+        trail.pack(side="right", padx=(_px(12), 0))
+        col = tk.Frame(f, bg=bg)
+        col.pack(side="left", anchor="w", fill="x", expand=True)
+        tk.Label(col, text=title, bg=bg, fg=_C["on_surface"], font=self.f_md,
+                 anchor="w").pack(anchor="w")
+        tk.Label(col, text=sub, bg=bg, fg=_C["on_variant"], font=self.f_sm, anchor="w",
+                 justify="left", wraplength=_px(self.PAGE_W - 170)).pack(anchor="w")
+        return trail
 
     def _refresh_discovery_pill(self):
         pill = getattr(self, "_disc_pill", None)
@@ -4790,11 +5646,11 @@ class LazeRWindow:
         dot, val = pill
         net = self._net or {}
         if _MDNS_UNAVAILABLE[0]:
-            dot.config(fg=_C["faint"]); val.config(text="off — zeroconf not installed")
+            dot.config(fg=_C["outline"]); val.config(text="off — zeroconf not installed")
         elif net.get("zc") is not None:
             dot.config(fg=_C["ok"]); val.config(text=f"announcing {net.get('ip')}")
         elif not net.get("ip"):
-            dot.config(fg=_C["faint"]); val.config(text="waiting for a network")
+            dot.config(fg=_C["outline"]); val.config(text="waiting for a network")
         else:
             dot.config(fg=_C["warn"])
             val.config(text="not announcing (network blocks multicast?) — scan the QR")
@@ -4818,78 +5674,53 @@ class LazeRWindow:
             val.config(text="optional · typed-code phones are NOT encrypted")
 
     def _build_security_controls(self, parent):
-        """Require-encryption toggle + regenerate-code button + panic-key hint."""
-        tk = self._tk
-        tk.Frame(parent, bg=_C["border"], height=1).pack(fill="x", pady=(_px(14), _px(12)))
+        """Require-encryption switch + new-code button + panic-key hint."""
+        trail = self._setting_row(parent, "Require encryption",
+                                  "Only phones paired by QR can connect")
+        self._secure_btn = self._switch(trail, self._require_secure, self._toggle_secure,
+                                        enabled=_HAVE_CRYPTO)
+        self._secure_btn.pack()
 
-        f = tk.Frame(parent, bg=_C["card"])
-        f.pack(fill="x")
-        col = tk.Frame(f, bg=_C["card"])
-        col.pack(side="left", anchor="w")
-        tk.Label(col, text="Require encryption", bg=_C["card"], fg=_C["fg"],
-                 font=self.f_sm).pack(anchor="w")
-        tk.Label(col, text="Block plaintext (manual-code) phones — QR only",
-                 bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(anchor="w")
-        self._secure_btn = tk.Label(f, bg=_C["card2"], fg=_C["dim"],
-                                    font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(5))
-        self._secure_btn.pack(side="right")
-        self._clickable(self._secure_btn, self._toggle_secure)
-        if not _HAVE_CRYPTO:
-            self._secure_btn.config(text="n/a")
-        else:
-            self._refresh_secure_btn()
-
-        r = tk.Frame(parent, bg=_C["card"])
-        r.pack(fill="x", pady=(_px(10), 0))
-        col2 = tk.Frame(r, bg=_C["card"])
-        col2.pack(side="left", anchor="w")
-        tk.Label(col2, text="Pairing code", bg=_C["card"], fg=_C["fg"],
-                 font=self.f_sm).pack(anchor="w")
-        tk.Label(col2, text="Make a new code and QR; every paired phone must rescan",
-                 bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(anchor="w")
-        regen = tk.Label(r, text="Regenerate", bg=_C["accent2"], fg=_C["fg"],
-                         font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(5))
-        regen.pack(side="right")
-        self._clickable(regen, self._confirm_regenerate)
+        trail = self._setting_row(parent, "Pairing code",
+                                  "Make a new code and QR; every phone must rescan")
+        self._button(trail, "New code", self._confirm_regenerate, kind="tonal",
+                     small=True).pack()
 
         if sys.platform.startswith("win"):
             hint = ("Your own mouse and keyboard always win: touching them pauses the "
-                    "phone.\nPanic: press  Ctrl+Alt+Shift+L  to stop the remote until "
-                    "you click Resume.")
+                    "phone. Press Ctrl+Alt+Shift+L to stop the remote until you "
+                    "click Resume.")
         else:
             # LocalInputGuard is Windows-only: here the laptop's own input does NOT
             # pause the phone, and there is no panic key. Say so rather than show a
             # promise this platform doesn't keep.
             hint = ("On this system the laptop's own mouse doesn't pause the phone and "
-                    "there is no panic key.\nTo stop the remote, quit LazeR or tap back "
+                    "there is no panic key. To stop the remote, quit LazeR or tap back "
                     "on the phone.")
-        tk.Label(parent, text=hint, bg=_C["card"], fg=_C["faint"], font=self.f_sm,
-                 justify="left").pack(anchor="w", pady=(_px(10), 0))
+        self._hint_box(parent, hint)
+
+    def _hint_box(self, parent, text):
+        tk = self._tk
+        box = self._card(parent, color=_C["surface_low"], radius=16, pad=12,
+                         fill="x", pady=(_px(14), 0))
+        ic = self._icon("info", _px(18), _C["on_variant"])
+        lead = tk.Label(box, bg=_C["surface_low"], bd=0)
+        if ic is not None:
+            self._put(lead, ic)
+        lead.pack(side="left", anchor="n", padx=(0, _px(10)))
+        tk.Label(box, text=text, bg=_C["surface_low"], fg=_C["on_variant"],
+                 font=self.f_sm, justify="left", anchor="w",
+                 wraplength=_px(self.PAGE_W - 130)).pack(side="left", fill="x")
 
     def _build_startup_toggle(self, parent):
-        """Clickable row: launch LazeR automatically when Windows starts."""
-        tk = self._tk
-        tk.Frame(parent, bg=_C["border"], height=1).pack(fill="x", pady=(_px(14), _px(12)))
-        f = tk.Frame(parent, bg=_C["card"])
-        f.pack(fill="x")
-        col = tk.Frame(f, bg=_C["card"])
-        col.pack(side="left", anchor="w")
-        tk.Label(col, text="Start with Windows", bg=_C["card"], fg=_C["fg"],
-                 font=self.f_sm).pack(anchor="w")
-        tk.Label(col, text="Launch LazeR in the tray at login",
-                 bg=_C["card"], fg=_C["faint"], font=self.f_sm).pack(anchor="w")
-        self._startup_btn = tk.Label(f, bg=_C["accent2"], fg=_C["fg"],
-                                     font=self.f_sm, cursor="hand2", padx=_px(14), pady=_px(5))
-        self._startup_btn.pack(side="right")
-        self._clickable(self._startup_btn, self._toggle_startup)
-        self._refresh_startup_btn()
+        """Switch row: launch LazeR automatically when Windows starts."""
+        trail = self._setting_row(parent, "Start with Windows",
+                                  "Open in the tray when you sign in")
+        self._startup_btn = self._switch(trail, startup_enabled(), self._toggle_startup)
+        self._startup_btn.pack()
 
     def _refresh_startup_btn(self):
-        on = startup_enabled()
-        self._startup_btn.config(
-            text="On" if on else "Off",
-            bg=_C["accent"] if on else _C["card2"],
-            fg=_C["bg"] if on else _C["dim"])
+        self._startup_btn.set_on(startup_enabled())
 
     def _toggle_startup(self):
         if set_startup(not startup_enabled()):
@@ -4902,54 +5733,55 @@ class LazeRWindow:
                        f"run  {_self_invocation()} --enable-startup  in a terminal.")
 
     def _pill(self, parent, name, detail, ok):
-        tk = self._tk
-        f = tk.Frame(parent, bg=_C["card"])
-        f.pack(fill="x", pady=_px(3))
-        tk.Label(f, text="●", bg=_C["card"],
-                 fg=_C["ok"] if ok else _C["faint"], font=self.f_sm).pack(side="left")
-        tk.Label(f, text=name, bg=_C["card"], fg=_C["fg"],
-                 font=self.f_sm).pack(side="left", padx=(_px(7), 0))
-        tk.Label(f, text=detail, bg=_C["card"], fg=_C["faint"],
-                 font=self.f_sm).pack(side="left", padx=(_px(7), 0))
+        dot, _val = self._mutable_pill(parent, name, detail)
+        dot.config(fg=_C["ok"] if ok else _C["outline"])
 
     def _mutable_pill(self, parent, name, detail):
-        """Like _pill but returns (dot, detail) labels so status can change later."""
+        """A two-line status row — name, then a coloured dot and the detail.
+        Returns (dot, detail) labels so the status can change later."""
         tk = self._tk
-        f = tk.Frame(parent, bg=_C["card"])
-        f.pack(fill="x", pady=_px(3))
-        dot = tk.Label(f, text="●", bg=_C["card"], fg=_C["faint"], font=self.f_sm)
-        dot.pack(side="left")
-        tk.Label(f, text=name, bg=_C["card"], fg=_C["fg"],
-                 font=self.f_sm).pack(side="left", padx=(_px(7), 0))
-        val = tk.Label(f, text=detail, bg=_C["card"], fg=_C["faint"], font=self.f_sm)
-        val.pack(side="left", padx=(_px(7), 0))
+        bg = parent.cget("bg")
+        f = tk.Frame(parent, bg=bg)
+        f.pack(fill="x", pady=(_px(8), 0))
+        tk.Label(f, text=name, bg=bg, fg=_C["on_surface"], font=self.f_md,
+                 anchor="w").pack(anchor="w")
+        line = tk.Frame(f, bg=bg)
+        line.pack(anchor="w", fill="x")
+        dot = tk.Label(line, text="●", bg=bg, fg=_C["outline"], font=self.f_sm)
+        dot.pack(side="left", anchor="n")
+        val = tk.Label(line, text=detail, bg=bg, fg=_C["on_variant"], font=self.f_sm,
+                       anchor="w", justify="left", wraplength=_px(self.PAGE_W - 90))
+        val.pack(side="left", padx=(_px(6), 0), fill="x")
         return dot, val
 
     # ── activity feed ─────────────────────────────────────────────────────────
     def _build_activity(self, parent):
         tk = self._tk
-        card = self._card(parent, fill="both", expand=True, pady=(_px(14), 0))
-        pad = tk.Frame(card, bg=_C["card"], padx=_px(16), pady=_px(12))
-        pad.pack(fill="both", expand=True)
+        pad = self._card(parent, fill="both", expand=True, pady=(_px(12), 0), pad=20)
+        bg = pad.cget("bg")
         self._section_label(pad, "Activity")
 
-        wrap = tk.Frame(pad, bg=_C["card"])
+        wrap = tk.Frame(pad, bg=bg)
         wrap.pack(fill="both", expand=True, pady=(_px(8), 0))
-        sb = tk.Scrollbar(wrap, orient="vertical")
+        sb = self._ttk.Scrollbar(wrap, orient="vertical",
+                                 style="Card.Vertical.TScrollbar")
         sb.pack(side="right", fill="y")
         self._log_txt = tk.Text(
-            wrap, bg=_C["card"], fg=_C["dim"], font=self.f_log,
-            height=6, width=74, state="disabled", relief="flat", bd=0,
+            wrap, bg=bg, fg=_C["on_variant"], font=self.f_log,
+            height=6, width=48, state="disabled", relief="flat", bd=0, wrap="word",
             cursor="arrow", highlightthickness=0, padx=0, pady=0,
-            spacing1=1, spacing3=1, yscrollcommand=sb.set,
+            spacing1=2, spacing3=2, yscrollcommand=sb.set,
+            selectbackground=_C["primary_ctr"], selectforeground=_C["on_primary_ctr"],
         )
         self._log_txt.pack(side="left", fill="both", expand=True)
         sb.config(command=self._log_txt.yview)
-        self._log_txt.tag_config("ts", foreground=_C["faint"])
+        self._log_txt.tag_config("ts", foreground=_C["outline"])
         self._log_txt.tag_config("ok", foreground=_C["ok"])
-        self._log_txt.tag_config("act", foreground=_C["fg"])
-        self._log_txt.tag_config("info", foreground=_C["dim"])
+        self._log_txt.tag_config("act", foreground=_C["on_surface"])
+        self._log_txt.tag_config("info", foreground=_C["on_variant"])
         self._log_txt.tag_config("warn", foreground=_C["warn"])
+        self._log_txt.tag_config("body", lmargin2=self.f_log.measure("00:00:00  ")
+                                 if self.f_log else 0)
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _toggle_details(self):
@@ -4973,14 +5805,20 @@ class LazeRWindow:
         self._canvas.yview_moveto(max(0, top - 8) / max(1, self._outer.winfo_reqheight()))
 
     def _refresh_details_toggle(self):
+        icon = "chev_up" if self._details_open else "chev_down"
         if self._details_open:
-            self._toggle.config(text="Hide details  ▴", fg=_C["faint"])
+            text, fg = "Hide details", _C["primary"]
         elif self._warnings:
             n = self._warnings
-            self._toggle.config(text=f"Show details  ▾   ● {n} warning{'s' * (n != 1)}",
-                                fg=_C["warn"])
+            text, fg = f"Details · {n} warning{'s' * (n != 1)}", _C["warn"]
         else:
-            self._toggle.config(text="Show details  ▾", fg=_C["faint"])
+            text, fg = "Details", _C["primary"]
+        img = self._icon(icon, _px(18), fg)
+        self._toggle.config(text=text + "  ", fg=fg)
+        if img is not None:
+            self._put(self._toggle, img)
+        else:
+            self._toggle.config(image="")
 
     def _center(self):
         self._root.update_idletasks()
@@ -5014,17 +5852,16 @@ class LazeRWindow:
     def _copy(self, text):
         self._root.clipboard_clear()
         self._root.clipboard_append(text)
-        self._copy_btn.config(text="Copied", fg=_C["ok"])
-        self._root.after(1100,
-                         lambda: self._copy_btn.config(text="Copy", fg=_C["fg"]))
+        self._copy_btn.set_text("Copied")
+        self._root.after(1100, lambda: self._copy_btn.set_text("Copy"))
 
     def _log(self, msg, tag="info"):
         import time
         ts = time.strftime("%H:%M:%S")
         t = self._log_txt
         t.configure(state="normal")
-        t.insert("end", f"{ts}  ", "ts")
-        t.insert("end", f"{msg}\n", tag)
+        t.insert("end", f"{ts}  ", ("ts", "body"))
+        t.insert("end", f"{msg}\n", (tag, "body"))
         t.see("end")
         t.configure(state="disabled")
         lines = int(t.index("end-1c").split(".")[0])
@@ -5035,15 +5872,15 @@ class LazeRWindow:
 
     def _set_status(self, connected, who="", secure=True):
         if connected:
-            self._avatar.itemconfig(self._dotid, fill=_C["ok"])
+            self._paint_avatar_dot(True)
             txt = "Connected · encrypted" if secure else "Connected · NOT encrypted"
             if who:
                 txt += f" · {who.split(':')[0]}"
             self._status.config(fg=_C["ok"] if secure else _C["warn"], text=txt)
             self._show_connected_view()
         else:
-            self._avatar.itemconfig(self._dotid, fill=_C["faint"])
-            self._status.config(fg=_C["dim"], text="Waiting for phone to connect…")
+            self._paint_avatar_dot(False)
+            self._status.config(fg=_C["on_variant"], text="Waiting for your phone…")
             self._show_qr_view()
 
     def _poll(self):
@@ -5144,9 +5981,14 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
         print("[error] another LazeR is already running on this laptop. Close it "
               "first — two servers split the phone's packets between them.")
         _exit_process(1)
-    busy = _probe_udp_port()
+    busy = _probe_udp_port(retry_s=2.0)
     if busy is not None:
-        print(f"[error] {PORT_BUSY_TEXT} ({busy})")
+        kind, text, _ = diagnose_port_busy(busy)
+        print(f"[error] {text} ({busy})")
+        if kind == "reserved":
+            print(f"[error] Fix (admin terminal): net stop winnat, then netsh int ipv4 "
+                  f"add excludedportrange protocol=udp startport={PORT} "
+                  f"numberofports=1, then net start winnat.")
         _exit_process(1)
     uri = build_uri(ip, token, hostname, key) if ip else None
     zc, mdns_info = start_mdns(ip, hostname) if ip else (None, None)
@@ -5378,11 +6220,12 @@ def _dialog_text(text):
     return "\n".join(ln[:1].upper() + ln[1:] for ln in lines)
 
 
-def _cli_say(text, title="LazeR", error=False):
+def _cli_say(text, title="LazeR", error=False, box=False):
     """Report the outcome of a one-shot CLI action. Prints when there is a
     console; otherwise (a shortcut or Run entry to the windowed exe) shows a
-    message box, so the result is never silently lost."""
-    if sys.stdout is not None:
+    message box, so the result is never silently lost. [box] forces the message
+    box on Windows, for the GUI's own start-up errors."""
+    if sys.stdout is not None and not (box and sys.platform.startswith("win")):
         print(text)
         return
     if sys.platform.startswith("win"):
@@ -5425,22 +6268,224 @@ def _resume_outcome(reply):
             "than this one doesn't). Check its window.")
 
 
-def _probe_udp_port():
+def _probe_udp_port(retry_s=0.0):
     """None if UDP PORT can be bound, else the OSError. Run before starting, so
     a port already held (another LazeR, or anything else) is reported once, in
-    words, instead of as a receive loop that crashes and restarts forever."""
-    try:
-        s = open_socket()
-    except OSError as e:
-        return e
-    s.close()
-    return None
+    words, instead of as a receive loop that crashes and restarts forever.
+
+    [retry_s] keeps trying for that long first: a LazeR that was just quit (or
+    restarted by Start with Windows) can hold the port for a moment while it exits,
+    and that is no reason to show anyone an error."""
+    deadline = time.monotonic() + retry_s
+    while True:
+        try:
+            s = open_socket()
+        except OSError as e:
+            if time.monotonic() >= deadline:
+                return e
+            time.sleep(0.25)
+            continue
+        s.close()
+        return None
 
 
+# Why the port couldn't be bound. A blanket "another LazeR is running" was wrong
+# often enough to send people hunting through Task Manager for a copy that didn't
+# exist. In particular WinError 10013 (WSAEACCES) with nobody holding the port is
+# Windows' own port reservation: Hyper-V, WSL 2 and Docker reserve blocks of the
+# dynamic range (49152–65535, 50505 included) at boot, at random, so it can come
+# and go between reboots.
 PORT_BUSY_TEXT = (f"UDP port {PORT} is already in use — most likely another copy of "
                   "LazeR (check the tray and Task Manager). Close it and start LazeR "
                   "again. Two servers on one port split the phone's packets, which "
                   "looks like a flaky connection.")
+
+
+def _udp_port_owner(port):
+    """(pid, process name) of whoever holds UDP [port] here, or None. psutil reads
+    the owning PID straight from the UDP table — no admin, no subprocess."""
+    try:
+        import psutil
+        for c in psutil.net_connections(kind="udp"):
+            if c.laddr and c.laddr.port == port and c.pid and c.pid != os.getpid():
+                try:
+                    name = psutil.Process(c.pid).name()
+                except Exception:
+                    name = None
+                return c.pid, name
+    except Exception:
+        pass
+    return None
+
+
+def _is_lazer_process(pid, name):
+    """Is [pid] a LazeR server — the exe, or `python remote_server.py`?"""
+    own = os.path.basename(sys.executable).lower()
+    if name and ("lazer" in name.lower()
+                 or (getattr(sys, "frozen", False) and name.lower() == own)):
+        return True
+    try:
+        import psutil
+        return any("remote_server" in str(a) for a in psutil.Process(pid).cmdline())
+    except Exception:
+        return False
+
+
+def _windows_reserved_range(port):
+    """(start, end) of a Windows port reservation covering UDP [port], or None.
+    Reads `netsh int ipv4 show excludedportrange` — only ever on this error path.
+    The numbers aren't localized; the labels around them are ignored."""
+    if not sys.platform.startswith("win"):
+        return None
+    import subprocess
+    try:
+        r = subprocess.run(
+            [win_exe("netsh.exe"), "int", "ipv4", "show", "excludedportrange",
+             "protocol=udp"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=6,
+            creationflags=_no_window_flags())
+        return parse_reserved_range(r.stdout, port)
+    except Exception:
+        return None
+
+
+def parse_reserved_range(text, port):
+    for line in (text or "").splitlines():
+        nums = re.findall(r"\d+", line)
+        if len(nums) >= 2:
+            lo, hi = int(nums[0]), int(nums[1])
+            if lo <= port <= hi:
+                return lo, hi
+    return None
+
+
+def diagnose_port_busy(err):
+    """(kind, message, pid) for a failed bind. kind is "lazer" (another LazeR holds
+    it — pid set), "other" (another program — pid set), "reserved" (Windows
+    reserved it for Hyper-V/WSL/Docker) or "unknown"."""
+    owner = _udp_port_owner(PORT)
+    if owner is not None:
+        pid, name = owner
+        if _is_lazer_process(pid, name):
+            return ("lazer",
+                    f"Another copy of LazeR (process {pid}) is already using UDP port "
+                    f"{PORT} but isn't answering — it may be stuck, or running for "
+                    "another Windows user.", pid)
+        label = name or f"process {pid}"
+        return ("other",
+                f"UDP port {PORT} is being used by {label} (process {pid}). LazeR needs "
+                f"that port — close {label} and start LazeR again.", pid)
+    if getattr(err, "winerror", None) == 10013 or getattr(err, "errno", None) == 13:
+        rng = _windows_reserved_range(PORT)
+        where = f" (ports {rng[0]}–{rng[1]})" if rng else ""
+        return ("reserved",
+                f"Windows has reserved UDP port {PORT} for Hyper-V, WSL or Docker"
+                f"{where}, so LazeR isn't allowed to use it. This isn't another copy "
+                "of LazeR. It happens at random after a restart.", None)
+    return ("unknown", PORT_BUSY_TEXT, None)
+
+
+def _end_process(pid, timeout=4.0):
+    """Stop [pid]; True once it's gone. Fails (False) for another user's process."""
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        p.terminate()
+        try:
+            p.wait(timeout)
+        except psutil.TimeoutExpired:
+            p.kill()
+            p.wait(timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _reserve_port_for_lazer():
+    """Ask Windows (one UAC prompt) to keep PORT out of the dynamic reservations.
+
+    winnat holds the Hyper-V/WSL/Docker reservations, and an exclusion can't be
+    added over a range it holds, so it is stopped for the moment the exclusion is
+    added and started again — WSL/Docker networking blinks for about a second.
+    The exclusion is persistent: later reboots reserve around it.
+
+    winnat is stopped and started again only if it was running: starting a NAT
+    service the user (or their setup) had left stopped would be a side effect
+    nobody asked for. False when the user declined the UAC prompt."""
+    if not sys.platform.startswith("win"):
+        return False
+    net = f'"{win_exe("net.exe")}"'
+    netsh = f'"{win_exe("netsh.exe")}"'
+    add = (f'{netsh} int ipv4 add excludedportrange protocol=udp startport={PORT} '
+           f'numberofports=1 store=persistent >nul 2>nul')
+    if _winnat_running() is False:
+        chain = add
+    else:       # running, or can't tell: the stop/start pair is what makes room
+        chain = (f'{net} stop winnat >nul 2>nul & {add} & '
+                 f'{net} start winnat >nul 2>nul')
+    return _run_elevated_and_wait(win_exe("cmd.exe"), '/c "' + chain + '"', 60000)
+
+
+def _winnat_running():
+    """True/False for the winnat service, None when it can't be read. psutil asks
+    the service manager directly — no `sc.exe`."""
+    try:
+        import psutil
+        return psutil.win_service_get("winnat").status() == "running"
+    except Exception:
+        return None
+
+
+def _ask_yes_no(text, title="LazeR", box=False):
+    """A Yes/No question: a message box for the windowed app (or whenever [box]
+    is set — the GUI must not wait on a terminal prompt nobody is looking at), a
+    prompt in a terminal. False when nobody can answer."""
+    if sys.platform.startswith("win") and (box or sys.stdout is None):
+        try:
+            import ctypes
+            # MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND; IDYES = 6
+            return ctypes.windll.user32.MessageBoxW(
+                None, _dialog_text(text), title, 0x4 | 0x20 | 0x10000) == 6
+        except Exception:
+            return False
+    try:
+        return input(text + " [y/N] ").strip().lower() in ("y", "yes")
+    except Exception:
+        return False
+
+
+def resolve_port_busy(err, box=False):
+    """Explain a failed bind and offer the fix that fits. True when the port is
+    free afterwards and starting can continue. [box]: ask and report in message
+    boxes even when a console is attached (the GUI path)."""
+    kind, text, pid = diagnose_port_busy(err)
+
+    def say(msg):
+        _cli_say(msg, error=True, box=box)
+
+    if kind == "lazer":
+        if _ask_yes_no(text + "\n\nEnd it and start this one?", box=box):
+            if _end_process(pid) and _probe_udp_port(retry_s=3.0) is None:
+                return True
+            say("Couldn't end the other LazeR. Restart Windows, or end it in Task "
+                "Manager → Details as the user who started it.")
+        return False
+    if kind == "reserved":
+        if _ask_yes_no(text + f"\n\nLazeR can ask Windows to keep port {PORT} free "
+                       "for it from now on. This needs admin once, and briefly "
+                       "restarts Windows' NAT service (WSL and Docker networking "
+                       "blink for a second).\n\nFix it now?", box=box):
+            if not _reserve_port_for_lazer():
+                say("Nothing was changed — Windows didn't get admin permission. "
+                    "Start LazeR again to retry.")
+                return False
+            if _probe_udp_port(retry_s=3.0) is None:
+                return True
+            say("Windows still won't let LazeR use the port. Restart the laptop "
+                "and start LazeR again.")
+        return False
+    say(text + f"\n\n({err})")
+    return False
 
 
 def main():
@@ -5623,9 +6668,8 @@ def main():
                 else:
                     print("LazeR is already running — opened the existing window.")
                 return
-            busy = _probe_udp_port()
-            if busy is not None:
-                _cli_say(PORT_BUSY_TEXT + f"\n\n({busy})")
+            busy = _probe_udp_port(retry_s=2.0)
+            if busy is not None and not resolve_port_busy(busy, box=True):
                 return
             migrate_startup_command()
             if apply_startup_default():

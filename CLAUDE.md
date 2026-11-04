@@ -197,6 +197,23 @@ two working hooks and silently kill local-takeover detection for the session.
   output for its whole life and therefore never fired once. Modifiers are now read
   with `GetAsyncKeyState`, which answers for the generic codes and is side-agnostic.
 
+**No child processes in steady state.** Brightness, chassis and firewall reads go
+through WMI / `HNetCfg.FwPolicy2` over COM in-process. They used to start
+`powershell.exe` / `netsh.exe` on every poll, recheck, network change and wake —
+a PowerShell + conhost pair under LazeR in Task Manager and about a second of CPU
+each time. The subprocess versions remain only as fallbacks for when the COM
+route fails outright; netsh still runs for user-initiated fixes (UAC) and on the
+port-busy error path. The low-level **mouse** hook is installed only while a
+phone is connected (a 250 ms thread timer syncs it), so the laptop's own mouse
+doesn't wait on a Python callback for every move.
+
+**WinError 10013 on bind is usually not a second LazeR.** With nobody holding the
+port it's Windows' own reservation: Hyper-V / WSL 2 / Docker reserve random blocks
+of 49152–65535 at boot (`netsh int ipv4 show excludedportrange protocol=udp`).
+`diagnose_port_busy()` tells the cases apart (psutil names the owner) and
+`resolve_port_busy()` offers the fix: end a stuck LazeR, or add a persistent
+exclusion for 50505 (stop winnat → add → start winnat, one UAC).
+
 **COM is per-thread.** comtypes initializes only the importing thread, so anything
 touching pycaw from the UDP thread must `CoInitialize()` first or it fails every time
 with `CoInitialize has not been called` — which silently turned the volume-endpoint

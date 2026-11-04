@@ -3155,5 +3155,110 @@ class SharedContract(unittest.TestCase):
                          ["VOL 42 1", "VOL 42 0", "VOL 42"])
 
 
+class PortBusyDiagnosis(unittest.TestCase):
+    """A failed bind names the real culprit instead of always blaming a second LazeR."""
+
+    NETSH = ("\nProtocol udp Port Exclusion Ranges\n\n"
+             "Start Port    End Port\n----------    --------\n"
+             "     49690       49789\n     50460       50559\n"
+             "     55000       55000     *\n\n* - Administered port exclusions.\n")
+
+    def test_reserved_range_is_found_in_netsh_output(self):
+        self.assertEqual(rs.parse_reserved_range(self.NETSH, 50505), (50460, 50559))
+        self.assertIsNone(rs.parse_reserved_range(self.NETSH, 50600))
+        self.assertIsNone(rs.parse_reserved_range("", 50505))
+
+    def test_access_denied_with_no_owner_is_a_windows_reservation(self):
+        err = OSError(13, "forbidden")
+        err.winerror = 10013
+        with mock.patch.object(rs, "_udp_port_owner", lambda port: None), \
+             mock.patch.object(rs, "_windows_reserved_range", lambda port: (50460, 50559)):
+            kind, text, pid = rs.diagnose_port_busy(err)
+        self.assertEqual(kind, "reserved")
+        self.assertIn("50460", text)
+        self.assertNotIn("another copy of LazeR (check", text)
+        self.assertIsNone(pid)
+
+    def test_another_lazer_is_named_with_its_pid(self):
+        with mock.patch.object(rs, "_udp_port_owner", lambda port: (4242, "LazeR.exe")):
+            kind, text, pid = rs.diagnose_port_busy(OSError(98, "in use"))
+        self.assertEqual((kind, pid), ("lazer", 4242))
+        self.assertIn("4242", text)
+
+    def test_a_different_program_is_named(self):
+        with mock.patch.object(rs, "_udp_port_owner", lambda port: (77, "foo.exe")), \
+             mock.patch.object(rs, "_is_lazer_process", lambda pid, name: False):
+            kind, text, pid = rs.diagnose_port_busy(OSError(98, "in use"))
+        self.assertEqual(kind, "other")
+        self.assertIn("foo.exe", text)
+
+    def test_probe_retries_until_the_port_frees(self):
+        calls = []
+
+        class FakeSock:
+            def close(self):
+                pass
+
+        def flaky():
+            calls.append(1)
+            if len(calls) < 3:
+                raise OSError(98, "in use")
+            return FakeSock()
+        with mock.patch.object(rs, "open_socket", flaky), \
+             mock.patch.object(rs.time, "sleep", lambda s: None):
+            self.assertIsNone(rs._probe_udp_port(retry_s=5.0))
+        self.assertEqual(len(calls), 3)
+
+    def _reserved(self):
+        return ("reserved", "Windows has reserved UDP port 50505.", None)
+
+    def test_declined_admin_prompt_says_so_and_does_not_wait(self):
+        said, probes = [], []
+        with mock.patch.object(rs, "diagnose_port_busy", lambda e: self._reserved()), \
+             mock.patch.object(rs, "_ask_yes_no", lambda *a, **k: True), \
+             mock.patch.object(rs, "_reserve_port_for_lazer", lambda: False), \
+             mock.patch.object(rs, "_probe_udp_port", lambda **k: probes.append(k)), \
+             mock.patch.object(rs, "_cli_say", lambda t, **k: said.append(t)):
+            self.assertFalse(rs.resolve_port_busy(OSError(13, "x")))
+        self.assertEqual(probes, [])                      # no pointless 3 s wait
+        self.assertEqual(len(said), 1)
+        self.assertIn("admin permission", said[0])
+        self.assertNotIn("Restart the laptop", said[0])
+
+    def test_granted_fix_continues_once_the_port_is_free(self):
+        with mock.patch.object(rs, "diagnose_port_busy", lambda e: self._reserved()), \
+             mock.patch.object(rs, "_ask_yes_no", lambda *a, **k: True), \
+             mock.patch.object(rs, "_reserve_port_for_lazer", lambda: True), \
+             mock.patch.object(rs, "_probe_udp_port", lambda **k: None):
+            self.assertTrue(rs.resolve_port_busy(OSError(13, "x")))
+
+    def test_gui_path_asks_in_a_box_not_the_terminal(self):
+        seen = {}
+
+        def ask(text, title="LazeR", box=False):
+            seen["box"] = box
+            return False
+        with mock.patch.object(rs, "diagnose_port_busy", lambda e: self._reserved()), \
+             mock.patch.object(rs, "_ask_yes_no", ask):
+            rs.resolve_port_busy(OSError(13, "x"), box=True)
+        self.assertTrue(seen["box"])
+
+
+class ConnectedEventListeners(unittest.TestCase):
+    """_client_connected tells the input guard the moment a phone pairs — and,
+    since set() runs on the UDP thread, a failing listener must never escape."""
+
+    def test_listener_runs_on_set_and_errors_are_swallowed(self):
+        ev = rs._ConnectedEvent()
+        hits = []
+
+        def boom():
+            raise RuntimeError("listener bug")
+        ev.listeners += [boom, lambda: hits.append(1)]
+        ev.set()                                   # must not raise
+        self.assertTrue(ev.is_set())
+        self.assertEqual(hits, [1])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
