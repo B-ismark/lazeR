@@ -421,33 +421,44 @@ def make_mic():
         _eps = [None]           # [(device id, IAudioEndpointVolume)], None = re-acquire
         _checked = [0.0]
 
-        def _acquire():
-            from ctypes import cast, POINTER
-            from comtypes import CLSCTX_ALL
+        def _default_ids():
+            """The distinct default input device ids, console first. Cheap
+            (~2.5 ms): no endpoint is activated."""
             _com_init()
             en = AudioUtilities.GetDeviceEnumerator()
-            eps, seen = [], set()
+            ids = []
             for role in roles:
                 try:
-                    dev = en.GetDefaultAudioEndpoint(EDataFlow.eCapture.value, role)
+                    did = en.GetDefaultAudioEndpoint(EDataFlow.eCapture.value, role).GetId()
                 except Exception:
                     continue                # no default input for this role
-                did = dev.GetId()
-                if did in seen:
-                    continue
-                seen.add(did)
-                iface = dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                if did not in ids:
+                    ids.append(did)
+            return ids
+
+        def _acquire(ids):
+            from ctypes import cast, POINTER
+            from comtypes import CLSCTX_ALL
+            en = AudioUtilities.GetDeviceEnumerator()
+            eps = []
+            for did in ids:
+                iface = en.GetDevice(did).Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
                 eps.append((did, cast(iface, POINTER(IAudioEndpointVolume))))
             return eps
 
         def _endpoints():
             # Same reasoning as make_volume: a cached endpoint keeps answering for
             # the device it was bound to after the default moves (a headset plugged
-            # in), and goes stale outright across a sleep. Re-check once a second.
+            # in), and goes stale outright across a sleep. So compare the defaults
+            # at most once a second, and re-activate only when they have changed;
+            # a stale endpoint on an unchanged device fails its call instead, and
+            # _run re-acquires.
             now = time.monotonic()
             if _eps[0] is None or now - _checked[0] >= AUDIO_DEVICE_CHECK_S:
                 _checked[0] = now
-                _eps[0] = _acquire()    # errors reach _run, which retries once
+                ids = _default_ids()
+                if _eps[0] is None or ids != [d for d, _ in _eps[0]]:
+                    _eps[0] = _acquire(ids)     # errors reach _run, which retries once
             return _eps[0]
 
         def _run(call):
@@ -484,16 +495,21 @@ def make_mic():
     if plat != "darwin" and shutil.which("pactl"):
         def get_pactl():
             try:
+                # This runs on the UDP thread for every VGET: a hung PulseAudio
+                # must cost the mic button, never the phone's connection.
                 out = subprocess.check_output(
                     ["pactl", "get-source-mute", "@DEFAULT_SOURCE@"],
-                    stderr=subprocess.DEVNULL).decode().lower()
+                    stderr=subprocess.DEVNULL, timeout=1.0).decode().lower()
             except Exception:
                 return None
             return True if "yes" in out else False if "no" in out else None
 
         def toggle_pactl():
-            subprocess.run(["pactl", "set-source-mute", "@DEFAULT_SOURCE@", "toggle"],
-                           check=False)
+            try:
+                subprocess.run(["pactl", "set-source-mute", "@DEFAULT_SOURCE@", "toggle"],
+                               check=False, timeout=2.0)
+            except Exception:
+                pass
         return get_pactl, toggle_pactl
 
     # macOS has no input-mute switch to read back (only an input level), so the
