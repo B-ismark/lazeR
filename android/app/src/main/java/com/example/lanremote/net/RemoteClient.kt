@@ -344,7 +344,7 @@ class RemoteClient {
     fun keySpecial(name: String) = sendKey("KEYSP $name")  // enter | backspace | ...
     fun combo(spec: String) = send("COMBO $spec")          // "ctrl c", "alt tab", ...
     fun appSwitch(dir: String) = send("ASW $dir")          // next | prev | end (Alt-Tab session)
-    fun system(action: String) = send("SYS $action")       // lock | sleep | mute
+    fun system(action: String) = send("SYS $action")       // lock | sleep | mute | micmute
 
     /** Typing goes out padded when the laptop strips padding; see [padKeyBody]. */
     private fun sendKey(body: String) {
@@ -457,13 +457,14 @@ class RemoteClient {
     }
 }
 
-/** The laptop's volume, 0..100, and whether it is muted — null from a laptop too
- *  old to say, or one whose audio backend can't tell. */
-data class VolumeReading(val level: Int, val muted: Boolean?)
+/** The laptop's volume, 0..100, whether it is muted, and whether its microphone is
+ *  muted — each null from a laptop too old to say, or one that can't tell. */
+data class VolumeReading(val level: Int, val muted: Boolean?, val micMuted: Boolean? = null)
 
-/** A `VOL n [m]` reply, split into words. */
+/** A `VOL n [m [c]]` reply, split into words. `m` may be `-` (unknown) when only
+ *  the mic's state `c` is known. */
 internal fun parseVolume(words: List<String>): VolumeReading? {
     val level = words.getOrNull(1)?.toIntOrNull() ?: return null
-    val muted = when (words.getOrNull(2)) { "1" -> true; "0" -> false; else -> null }
-    return VolumeReading(level, muted)
+    fun flag(i: Int) = when (words.getOrNull(i)) { "1" -> true; "0" -> false; else -> null }
+    return VolumeReading(level, flag(2), flag(3))
 }

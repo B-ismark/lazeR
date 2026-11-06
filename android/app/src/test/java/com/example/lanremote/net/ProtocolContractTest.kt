@@ -117,4 +117,13 @@ class ProtocolContractTest {
         assertEquals("an older laptop", VolumeReading(42, null), v("VOL 42"))
         assertEquals(null, v("VOL"))
     }
+
+    @Test
+    fun `volume replies carry mic mute as a third word`() {
+        fun v(t: String) = parseVolume(t.split(' '))
+        assertEquals(VolumeReading(42, false, true), v("VOL 42 0 1"))
+        assertEquals(VolumeReading(42, true, false), v("VOL 42 1 0"))
+        assertEquals("unknown output mute", VolumeReading(42, null, true), v("VOL 42 - 1"))
+        assertEquals("no mic: no button", VolumeReading(42, false, null), v("VOL 42 0"))
+    }
 }

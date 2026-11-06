@@ -3154,6 +3154,21 @@ class SharedContract(unittest.TestCase):
         self.assertEqual([rs.volume_reply(42, m) for m in (True, False, None)],
                          ["VOL 42 1", "VOL 42 0", "VOL 42"])
 
+    def test_sys_micmute_toggles_the_mic(self):
+        calls = []
+        with mock.patch.object(rs, "toggle_mic_mute", lambda: calls.append(1)):
+            rs.do_system("micmute")
+        self.assertEqual(calls, [1])
+        with mock.patch.object(rs, "toggle_mic_mute", None):
+            rs.do_system("micmute")      # no backend: a quiet no-op
+
+    def test_volume_reply_carries_mic_mute(self):
+        # The mic's state is a third word; an unknown output mute holds its slot.
+        self.assertEqual(rs.volume_reply(42, False, True), "VOL 42 0 1")
+        self.assertEqual(rs.volume_reply(42, True, False), "VOL 42 1 0")
+        self.assertEqual(rs.volume_reply(42, None, True), "VOL 42 - 1")
+        self.assertEqual(rs.volume_reply(42, None, None), "VOL 42")
+
 
 class PortBusyDiagnosis(unittest.TestCase):
     """A failed bind names the real culprit instead of always blaming a second LazeR."""

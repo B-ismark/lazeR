@@ -102,6 +102,7 @@ data class UiState(
     val conn: ConnState = ConnState.Disconnected,
     val volume: Float = 50f,
     val muted: Boolean? = null,        // null: the laptop doesn't report it
+    val micMuted: Boolean? = null,     // null: no mic button (laptop can't report it)
     val brightness: Float = 50f,
     val brightnessAvailable: Boolean = false,
     // NOTE: the keyboard's staging text deliberately does NOT live here. It used to,
@@ -176,6 +177,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var sleptDeviceId: String? = null //   ...and to which laptop
     private var lastUserVolumeMs: Long = 0
     private var lastUserMuteMs: Long = 0
+    private var lastUserMicMs: Long = 0
     private var lastUserBrightnessMs: Long = 0
     private var lastInteractionMs: Long = 0   // drives adaptive health-poll backoff
     private var current: Device? = null   // device we're connected to / reconnecting
@@ -685,7 +687,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // connect screen, so a stale "Unrecognized QR code" would hide it.
         update { it.copy(conn = ConnState.Connecting, error = null, errorDetail = null,
             scanError = null, deviceName = dev.name,
-            muted = if (keepMute) it.muted else null) }
+            muted = if (keepMute) it.muted else null,
+            micMuted = if (keepMute) it.micMuted else null) }
         connectJob = viewModelScope.launch {
             val (connected, outcome) = connectResolving(dev, 2000)
             if (outcome.result == ConnectResult.Cancelled) return@launch
@@ -935,6 +938,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     // Same guard for mute, so a poll answered just before a tap
                     // reached the laptop doesn't flip the button back.
                     if (use && now - lastUserMuteMs > 1200) update { it.copy(muted = v.muted) }
+                    if (use && now - lastUserMicMs > 1200) update { it.copy(micMuted = v.micMuted) }
                     true
                 } else {
                     skipVolReading = true
@@ -1215,6 +1219,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
             // Show the toggle at once; the next volume poll confirms it.
             lastUserMuteMs = System.currentTimeMillis()
             update { s -> s.copy(muted = s.muted?.let { !it }) }
+        }
+        if (action == "micmute") {
+            lastUserMicMs = System.currentTimeMillis()
+            update { s -> s.copy(micMuted = s.micMuted?.let { !it }) }
         }
         if (action == "sleep") {
             sleepRequestedMs = System.currentTimeMillis()

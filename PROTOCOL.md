@@ -42,7 +42,7 @@ Every datagram is a single packet. No framing beyond the datagram boundary.
 | `<TOKEN> KEYSP <name>`        | Press one special key (see below).                   | none               |
 | `<TOKEN> COMBO <mods..> <key>`| Hold modifiers, tap key. e.g. `ctrl c`, `alt tab`.   | none               |
 | `<TOKEN> ASW <action>`        | App-switch session: `next`\|`prev`\|`end`.           | none               |
-| `<TOKEN> SYS <action>`        | `lock` \| `sleep` \| `mute`.                         | none               |
+| `<TOKEN> SYS <action>`        | `lock` \| `sleep` \| `mute` \| `micmute` (toggles the laptop's mic). | none |
 | `<TOKEN> BYE`                 | Client disconnects; server forgets it.               | none               |
 
 `KEYSP <name>` names: `enter`, `backspace`, `space`, `tab`, `esc`, `delete`,
@@ -84,7 +84,11 @@ mid-gesture can't leave `Alt` stuck. Maps to the Windows three-finger touchpad s
 - `VOL <0-100> [0|1]` — current laptop volume, sent in answer to `VGET`. Lets the
   phone keep its slider in sync with the laptop's real volume (two-way). The second
   word is the mute state (`1` = muted), sent only when the audio backend reports it
-  (Windows); an older phone reads only the number.
+  (Windows); an older phone reads only the number. A third word, `0|1`, is the
+  laptop-wide **microphone** mute (Windows default console + communications inputs,
+  or PulseAudio's default source), sent only when it can be read; the second word is
+  then `-` if output mute is unknown. The phone shows its mic button only when this
+  word is present, so it never offers `SYS micmute` to a laptop that can't do it.
 - `BRI <0-100>` — current laptop display brightness, sent in answer to `BGET`. Lets
   the phone keep its brightness slider in sync (two-way, same shape as `VOL`).
 - `PONG` — answer to `PING`; lets the phone confirm the laptop is still alive and
