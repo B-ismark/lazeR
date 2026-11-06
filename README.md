@@ -1,7 +1,7 @@
 # LazeR
 
 Phone-as-trackpad. Android (Kotlin + Jetpack Compose, **Material 3 Expressive**) client
-+ Python laptop server. Mouse move/click/scroll, pinch-zoom, system volume, display
++ Python laptop server. Mouse move/click/scroll, pinch-zoom, system volume, mic mute, display
 brightness, media keys, keyboard typing and app-switch gestures.
 
 Direct UDP on `50505` over the local network. Secure pairing (QR) is AES-256-GCM
@@ -26,6 +26,9 @@ PROTOCOL.md  wire format shared by both
 - Trackpad drags → `MOVE dx dy` (lossy UDP, low latency, with optional pointer
   acceleration). Tap → `CLICK`. Volume slider → `VOL 0-100`; brightness slider →
   `BRIGHT 0-100` (both two-way synced). Media buttons → `MEDIA play_pause|next|prev`.
+- Mic button (right of the volume title) → `SYS micmute`: mutes the laptop's
+  microphone for every app, and shows the real state (it hides on a laptop with no
+  mic, or one too old to report it).
 - Keyboard panel types text (`KEY`); the Shortcuts sheet fires shortcuts
   (`COMBO ctrl c`, …) for copy/cut/paste and undo/redo.
 - Two fingers → `SCROLL dx dy` on **both** axes, like a real trackpad; the app at the
@@ -73,10 +76,10 @@ python remote_server.py --resume        # clear a panic latch in a running LazeR
 Command Prompt or PowerShell to see their output.
 
 Platform notes:
-- **Windows** — volume uses `pycaw` (installed via requirements). Media/mouse work out of the box.
-- **macOS** — volume uses `osascript` (built in). Grant the terminal **Accessibility**
+- **Windows** — volume and mic mute use `pycaw` (installed via requirements). Media/mouse work out of the box.
+- **macOS** — volume uses `osascript` (built in); there is no mic mute (macOS has no input-mute switch to read back). Grant the terminal **Accessibility**
   permission (System Settings → Privacy & Security → Accessibility) so `pynput` can move the mouse.
-- **Linux** — volume uses `amixer` or `pactl` (install `alsa-utils` or `pulseaudio-utils`).
+- **Linux** — volume uses `amixer` or `pactl` (install `alsa-utils` or `pulseaudio-utils`); mic mute needs `pactl`.
   On Wayland, `pynput` mouse control may need an X11 session.
 
 **Firewall.** Phones reach the server over **inbound UDP `50505`**, which Windows

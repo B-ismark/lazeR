@@ -89,6 +89,8 @@ import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.PanTool
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.PauseCircle
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Settings
@@ -460,7 +462,46 @@ private fun ControlsPanel(state: UiState, a: ControlActions, keysBuffer: Mutable
  *  is none to show (an older laptop that doesn't report mute), so it's a plain tap. */
 private class LevelIconAction(val label: String, val on: Boolean?, val onClick: () -> Unit)
 
-/** Volume / brightness card: icon + percent, with −/＋ nudge buttons flanking the slider. */
+/** The 36 dp cookie badge that heads a [LevelCard]: a plain glyph, or — with an
+ *  [action] — a toggle. "On" (muted) swaps it to the error colours, and the caller
+ *  swaps the glyph for its slashed twin, so state reads from both colour and shape. */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun LevelBadge(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    action: LevelIconAction?,
+) {
+    // Expressive MaterialShapes flourish: the icon sits in a 9-sided "cookie"
+    // tonal badge instead of a bare glyph.
+    val on = action?.on == true
+    val bg by animateColorAsState(
+        if (on) MaterialTheme.colorScheme.errorContainer
+        else MaterialTheme.colorScheme.primaryContainer, label = "badge")
+    val fg by animateColorAsState(
+        if (on) MaterialTheme.colorScheme.onErrorContainer
+        else MaterialTheme.colorScheme.onPrimaryContainer, label = "badgeIcon")
+    var badge = Modifier as Modifier
+    if (action != null) {
+        // 48 dp of touch around the 36 dp badge.
+        badge = badge.minimumInteractiveComponentSize()
+    }
+    badge = badge.size(36.dp).clip(MaterialShapes.Cookie9Sided.toShape()).background(bg)
+    if (action != null) {
+        badge = if (action.on != null) {
+            badge.toggleable(value = action.on, role = Role.Switch,
+                onValueChange = { action.onClick() })
+        } else {
+            badge.clickable(role = Role.Button, onClick = action.onClick)
+        }
+    }
+    Box(modifier = badge, contentAlignment = Alignment.Center) {
+        Icon(icon, contentDescription = action?.label, tint = fg,
+            modifier = Modifier.size(20.dp))
+    }
+}
+
+/** Volume / brightness card: icon + percent, with −/＋ nudge buttons flanking the slider.
+ *  An optional [trailing] badge sits at the right end of the title row (the mic). */
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun LevelCard(
@@ -470,39 +511,14 @@ private fun LevelCard(
     onChange: (Float) -> Unit,
     onStep: (Float) -> Unit,
     iconAction: LevelIconAction? = null,
+    trailing: Pair<androidx.compose.ui.graphics.vector.ImageVector, LevelIconAction>? = null,
 ) {
     SectionCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            // Expressive MaterialShapes flourish: the level icon sits in a 9-sided
-            // "cookie" tonal badge instead of a bare glyph. When it's a button, "on"
-            // swaps the badge to the error colours (and the caller swaps the glyph).
-            val on = iconAction?.on == true
-            val bg by animateColorAsState(
-                if (on) MaterialTheme.colorScheme.errorContainer
-                else MaterialTheme.colorScheme.primaryContainer, label = "badge")
-            val fg by animateColorAsState(
-                if (on) MaterialTheme.colorScheme.onErrorContainer
-                else MaterialTheme.colorScheme.onPrimaryContainer, label = "badgeIcon")
-            var badge = Modifier as Modifier
-            if (iconAction != null) {
-                // 48 dp of touch around the 36 dp badge.
-                badge = badge.minimumInteractiveComponentSize()
-            }
-            badge = badge.size(36.dp).clip(MaterialShapes.Cookie9Sided.toShape()).background(bg)
-            if (iconAction != null) {
-                badge = if (iconAction.on != null) {
-                    badge.toggleable(value = iconAction.on, role = Role.Switch,
-                        onValueChange = { iconAction.onClick() })
-                } else {
-                    badge.clickable(role = Role.Button, onClick = iconAction.onClick)
-                }
-            }
-            Box(modifier = badge, contentAlignment = Alignment.Center) {
-                Icon(icon, contentDescription = iconAction?.label, tint = fg,
-                    modifier = Modifier.size(20.dp))
-            }
+            LevelBadge(icon, iconAction)
             Text("  $label  ${value.toInt()}%", style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.weight(1f))
+            if (trailing != null) LevelBadge(trailing.first, trailing.second)
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -537,6 +553,15 @@ private fun MediaPanel(state: UiState, a: ControlActions) {
             onChange = a.onVolume,
             onStep = { d -> a.onButtonTap(); a.onVolume((state.volume + d).coerceIn(0f, 100f)) },
             iconAction = LevelIconAction("Mute", state.muted) { a.onButtonTap(); a.onSystem("mute") },
+            // Laptop-wide mic mute, on the right of the same row. The glyph shows the
+            // mic's current state (Mic live, slashed MicOff muted) — the convention
+            // Meet, Zoom, Teams and Android itself use, and the same rule the speaker
+            // badge follows. Hidden when micMuted is null: an older laptop, or one
+            // with no mic, can't act on the toggle or report it.
+            trailing = state.micMuted?.let { m ->
+                (if (m) Icons.Filled.MicOff else Icons.Filled.Mic) to
+                    LevelIconAction("Mute microphone", m) { a.onButtonTap(); a.onSystem("micmute") }
+            },
         )
         SectionCard {
             Row(

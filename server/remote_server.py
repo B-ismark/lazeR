@@ -205,6 +205,20 @@ def resume_remote():
 
 
 # ── volume ────────────────────────────────────────────────────────────────────
+def _com_init():
+    """COM is per-thread, and comtypes only initializes the thread that imports
+    it — the main one. Audio reads run on the UDP receive thread, where COM calls
+    otherwise fail every time with "CoInitialize has not been called" (measured).
+    Idempotent, so it's free after the first call on a thread."""
+    import comtypes
+    try:
+        comtypes.CoInitialize()
+    except OSError:
+        # RPC_E_CHANGED_MODE: this thread already has an apartment of the other
+        # kind. That is fine — it has one, which is all we need.
+        pass
+
+
 def make_volume():
     """Return (get_volume, set_volume, label); fns may be None if unavailable.
     A getter that can also tell whether output is muted carries that as its
@@ -237,20 +251,9 @@ def make_volume():
         _ep_id = [None]         # the device _ep belongs to
         _checked = [0.0]        # when the default device was last compared to it
 
-        def _com():
-            # COM is per-thread, and comtypes only initializes the thread that
-            # imports it — the main one. Re-acquisition and the default-device
-            # check run on the UDP receive thread, where COM calls otherwise fail
-            # every time with "CoInitialize has not been called" (measured). That
-            # would have made both no-ops. Idempotent, so it's free after the first.
-            import comtypes
-            try:
-                comtypes.CoInitialize()
-            except OSError:
-                # RPC_E_CHANGED_MODE: this thread already has an apartment of
-                # the other kind. That is fine — it has one, which is all we
-                # need. Anything else surfaces on the COM call that follows.
-                pass
+        # Re-acquisition and the default-device check run on the UDP receive
+        # thread; without this both would be silent no-ops (see _com_init).
+        _com = _com_init
 
         def _device_id(dev):
             i = getattr(dev, "id", None)        # pycaw's AudioDevice
@@ -393,6 +396,128 @@ def make_volume():
 
 
 get_volume, set_volume, VOLUME_BACKEND = make_volume()
+
+
+# ── microphone mute ───────────────────────────────────────────────────────────
+def make_mic():
+    """Return (get_mic_muted, toggle_mic_mute); both None when unsupported.
+
+    Laptop-wide: it mutes the input device itself, so every app hears silence and
+    the state read back is the truth (unlike a meeting app's own shortcut, which is
+    a blind toggle). get returns True/False, or None when there is no mic to ask."""
+    plat = sys.platform
+
+    if plat.startswith("win"):
+        try:
+            from pycaw.pycaw import AudioUtilities, EDataFlow, ERole, IAudioEndpointVolume
+        except Exception:
+            return None, None
+
+        # Windows keeps two default inputs: one for "everything" (console) and one
+        # for calls (communications). Teams/Zoom/Meet often follow the second, and
+        # they can be different mics (a headset vs. the built-in array). Mute both,
+        # or the button would show "muted" while the call still hears you.
+        roles = (ERole.eConsole.value, ERole.eCommunications.value)
+        _eps = [None]           # [(device id, IAudioEndpointVolume)], None = re-acquire
+        _checked = [0.0]
+
+        def _default_ids():
+            """The distinct default input device ids, console first. Cheap
+            (~2.5 ms): no endpoint is activated."""
+            _com_init()
+            en = AudioUtilities.GetDeviceEnumerator()
+            ids = []
+            for role in roles:
+                try:
+                    did = en.GetDefaultAudioEndpoint(EDataFlow.eCapture.value, role).GetId()
+                except Exception:
+                    continue                # no default input for this role
+                if did not in ids:
+                    ids.append(did)
+            return ids
+
+        def _acquire(ids):
+            from ctypes import cast, POINTER
+            from comtypes import CLSCTX_ALL
+            en = AudioUtilities.GetDeviceEnumerator()
+            eps = []
+            for did in ids:
+                iface = en.GetDevice(did).Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                eps.append((did, cast(iface, POINTER(IAudioEndpointVolume))))
+            return eps
+
+        def _endpoints():
+            # Same reasoning as make_volume: a cached endpoint keeps answering for
+            # the device it was bound to after the default moves (a headset plugged
+            # in), and goes stale outright across a sleep. So compare the defaults
+            # at most once a second, and re-activate only when they have changed;
+            # a stale endpoint on an unchanged device fails its call instead, and
+            # _run re-acquires.
+            now = time.monotonic()
+            if _eps[0] is None or now - _checked[0] >= AUDIO_DEVICE_CHECK_S:
+                _checked[0] = now
+                ids = _default_ids()
+                if _eps[0] is None or ids != [d for d, _ in _eps[0]]:
+                    _eps[0] = _acquire(ids)     # errors reach _run, which retries once
+            return _eps[0]
+
+        def _run(call):
+            for _ in (0, 1):            # try, then once more on fresh endpoints
+                try:
+                    eps = _endpoints()
+                    return call([e for _, e in eps]) if eps else None
+                except Exception:
+                    _eps[0] = None
+            return None
+
+        def get_win():
+            # Muted only when every default input is: one live mic is a live mic.
+            return _run(lambda eps: all(bool(e.GetMute()) for e in eps))
+
+        def toggle_win():
+            def flip(eps):
+                target = 0 if all(bool(e.GetMute()) for e in eps) else 1
+                for e in eps:
+                    e.SetMute(target, None)
+                return True
+            _run(flip)
+
+        try:
+            if not _endpoints():
+                print("[mic] no input device; mic mute hidden on the phone")
+        except Exception as e:
+            print(f"[mic] Windows mic mute unavailable ({e})")
+            return None, None
+        return get_win, toggle_win
+
+    import shutil, subprocess
+
+    if plat != "darwin" and shutil.which("pactl"):
+        def get_pactl():
+            try:
+                # This runs on the UDP thread for every VGET: a hung PulseAudio
+                # must cost the mic button, never the phone's connection.
+                out = subprocess.check_output(
+                    ["pactl", "get-source-mute", "@DEFAULT_SOURCE@"],
+                    stderr=subprocess.DEVNULL, timeout=1.0).decode().lower()
+            except Exception:
+                return None
+            return True if "yes" in out else False if "no" in out else None
+
+        def toggle_pactl():
+            try:
+                subprocess.run(["pactl", "set-source-mute", "@DEFAULT_SOURCE@", "toggle"],
+                               check=False, timeout=2.0)
+            except Exception:
+                pass
+        return get_pactl, toggle_pactl
+
+    # macOS has no input-mute switch to read back (only an input level), so the
+    # phone simply doesn't show the button there.
+    return None, None
+
+
+get_mic_muted, toggle_mic_mute = make_mic()
 
 
 # ── brightness ──────────────────────────────────────────────────────────────
@@ -942,15 +1067,28 @@ def release_held_input():
     appswitch_reset()
 
 
-def volume_reply(vol, muted):
-    """The answer to VGET: "VOL n", plus " 1" / " 0" when mute is known. An older
-    phone reads only the number, so the extra word costs it nothing."""
-    return f"VOL {vol}" if muted is None else f"VOL {vol} {1 if muted else 0}"
+def volume_reply(vol, muted, mic_muted=None):
+    """The answer to VGET: "VOL n", plus " 1" / " 0" when mute is known, plus a
+    third word for the microphone's mute when that is known. An older phone reads
+    only the words it knows, so the extras cost it nothing. A known mic with an
+    unknown output mute holds the second slot with "-"."""
+    words = [f"VOL {vol}"]
+    if muted is not None or mic_muted is not None:
+        words.append("-" if muted is None else ("1" if muted else "0"))
+    if mic_muted is not None:
+        words.append("1" if mic_muted else "0")
+    return " ".join(words)
 
 
 def do_system(action):
-    """lock | sleep | mute — best effort per OS."""
+    """lock | sleep | mute | micmute — best effort per OS."""
     plat = sys.platform
+    if action == "micmute":
+        # Laptop-wide microphone mute toggle. The phone only offers the button
+        # when VGET reported a mic state, so a missing backend is a no-op.
+        if toggle_mic_mute is not None:
+            toggle_mic_mute()
+        return
     if action == "mute":
         # toggle mute via the media key (cross-platform-ish)
         k = getattr(Key, "media_volume_mute", None)
@@ -3955,7 +4093,12 @@ def serve_loop(wire, emit, net, hostname):
                             muted = getattr(get_volume, "muted", lambda: None)()
                         except Exception:
                             muted = None
-                        wire.reply(sock, addr, volume_reply(vol, muted))
+                        # Same for the mic: a failed read only hides its button.
+                        try:
+                            mic = get_mic_muted() if get_mic_muted is not None else None
+                        except Exception:
+                            mic = None
+                        wire.reply(sock, addr, volume_reply(vol, muted, mic))
                 continue
             if verb == "BGET":
                 if brightness_svc.available:
