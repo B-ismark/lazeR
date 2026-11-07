@@ -1,11 +1,16 @@
 package com.example.lanremote
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
@@ -32,6 +37,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
@@ -39,6 +45,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.lanremote.ui.ConnectionScreen
@@ -103,6 +110,48 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
         if (vm.state.value.settings.haptics) haptics.block()
     }
 
+    // Phone as microphone: what to explain when it can't start (null: nothing).
+    val micNotice = remember { mutableStateOf<RemoteViewModel.PhoneMicResult?>(null) }
+    val startPhoneMic: () -> Unit = remember(vm) {
+        {
+            scope.launch {
+                val r = vm.startPhoneMic()
+                if (r != RemoteViewModel.PhoneMicResult.Started) micNotice.value = r
+            }
+            Unit
+        }
+    }
+    // The mic, plus (Android 13+) the notification that says it's in use. Only
+    // the mic is required; without the notification it still works, unannounced
+    // except for Android's own mic indicator.
+    val micPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { granted ->
+        if (granted[Manifest.permission.RECORD_AUDIO] == true) startPhoneMic()
+        else micNotice.value = RemoteViewModel.PhoneMicResult.Failed
+    }
+    fun granted(p: String) =
+        ContextCompat.checkSelfPermission(context, p) == PackageManager.PERMISSION_GRANTED
+    // Rebuilt with the launcher, which is the same object across recompositions.
+    val onPhoneMic: (Boolean) -> Unit = remember(vm, micPermission) {
+        { on ->
+            val wanted = buildList {
+                add(Manifest.permission.RECORD_AUDIO)
+                if (Build.VERSION.SDK_INT >= 33) add("android.permission.POST_NOTIFICATIONS")
+            }.filterNot { granted(it) }
+            when {
+                !on -> vm.stopPhoneMic()
+                // Explain the laptop side before asking for the mic: a permission
+                // granted for a switch that then can't work reads as a trick.
+                vm.state.value.phoneMicAvailable != true ->
+                    micNotice.value = RemoteViewModel.PhoneMicResult.NeedsSetup
+                wanted.isEmpty() -> startPhoneMic()
+                else -> micPermission.launch(wanted.toTypedArray())
+            }
+            Unit
+        }
+    }
+
     val scanQr: () -> Unit = remember(vm) {
         { startQrScan(context = context, onResult = vm::applyScannedUri, onError = vm::reportScanError) }
     }
@@ -143,7 +192,7 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
         )
     }
 
-    val controlActions = remember(vm) {
+    val controlActions = remember(vm, onPhoneMic) {
         ControlActions(
             onMove = vm::move,
             onScroll = { dx, dy -> haptic { scrollTick() }; vm.scroll(dx, dy) },
@@ -162,6 +211,8 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
             onSpecialKey = vm::specialKey,
             onCombo = vm::combo,
             onSystem = vm::system,
+            onPhoneMic = onPhoneMic,
+            onPhoneMicMute = vm::togglePhoneMicMute,
             settings = settingsActions,
             onButtonTap = { haptic { tap() } },
             onDismissGestureHint = vm::dismissGestureHint,
@@ -201,6 +252,64 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
     state.pendingReplace?.let { p ->
         ReplacePairingDialog(p.existing.name, vm::confirmReplace, vm::cancelReplace)
     }
+    micNotice.value?.let { r -> PhoneMicDialog(r) { micNotice.value = null } }
+    state.phoneMicProblem?.let { p -> PhoneMicProblemDialog(p, vm::clearPhoneMicProblem) }
+}
+
+/** Something about the phone mic that went wrong after it started. */
+@Composable
+private fun PhoneMicProblemDialog(problem: PhoneMicProblem, onDismiss: () -> Unit) {
+    val (title, body) = when (problem) {
+        PhoneMicProblem.BackgroundRefused ->
+            "Keep LazeR open" to
+                "Android didn't let the phone mic keep running in the background, so " +
+                "it will go quiet if you lock the phone or switch apps. Keep LazeR on " +
+                "screen while you talk."
+        PhoneMicProblem.Lost ->
+            "The phone mic stopped" to
+                "Something else took the phone's microphone, or Android stopped it, and " +
+                "it couldn't come back. The laptop is back on its own mic. Pick Phone " +
+                "again to retry."
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(body) },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("OK") } },
+    )
+}
+
+/** Why the phone couldn't become the laptop's microphone, and what to do about it. */
+@Composable
+private fun PhoneMicDialog(result: RemoteViewModel.PhoneMicResult, onDismiss: () -> Unit) {
+    val (title, body) = when (result) {
+        RemoteViewModel.PhoneMicResult.NeedsSetup ->
+            "The laptop isn't ready" to
+                "The laptop needs VB-CABLE, a free virtual microphone, to hear your phone.\n\n" +
+                "1. On the laptop, open LazeR → Details and click the Phone microphone " +
+                "line (or visit vb-audio.com/Cable).\n" +
+                "2. Install it and restart the laptop.\n" +
+                "3. In Zoom, Teams or Meet, choose “CABLE Output” as the microphone.\n\n" +
+                "Already installed? That same line on the laptop says what's wrong.\n\n" +
+                "Tip: use headphones on the laptop, or its speakers will echo through " +
+                "the phone."
+        RemoteViewModel.PhoneMicResult.NeedsSecure ->
+            "Pair with the QR code" to
+                "Your voice only travels over the encrypted connection, and this laptop " +
+                "was added with a typed code. Scan the QR code in LazeR on the laptop " +
+                "to pair securely, then try again."
+        else ->
+            "Couldn't use the microphone" to
+                "LazeR needs permission to use the microphone, and nothing else (a call, " +
+                "a recorder) can be using it. You can allow it in Android Settings → " +
+                "Apps → LazeR → Permissions."
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(body) },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("OK") } },
+    )
 }
 
 /** A scanned QR that would swap a saved laptop's pairing asks first: a QR can be

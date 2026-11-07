@@ -124,6 +124,10 @@ class ProtocolContractTest {
         assertEquals(VolumeReading(42, false, true), v("VOL 42 0 1"))
         assertEquals(VolumeReading(42, true, false), v("VOL 42 1 0"))
         assertEquals("unknown output mute", VolumeReading(42, null, true), v("VOL 42 - 1"))
+        // The fourth word: can the phone be the laptop's microphone?
+        assertEquals(VolumeReading(42, false, true, true), v("VOL 42 0 1 1"))
+        assertEquals("needs VB-CABLE", VolumeReading(42, false, false, false), v("VOL 42 0 0 0"))
+        assertEquals("no mic, phone mic ready", VolumeReading(42, true, null, true), v("VOL 42 1 - 1"))
         assertEquals("no mic: no button", VolumeReading(42, false, null), v("VOL 42 0"))
     }
 }

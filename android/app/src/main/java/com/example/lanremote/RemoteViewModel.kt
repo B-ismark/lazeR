@@ -11,6 +11,8 @@ import android.os.Build
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.lanremote.audio.PhoneMic
+import com.example.lanremote.audio.PhoneMicService
 import com.example.lanremote.data.ApkUpdater
 import com.example.lanremote.data.Device
 import com.example.lanremote.data.DeviceStore
@@ -38,6 +40,10 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.hypot
@@ -83,11 +89,19 @@ private const val DISCOVERY_QUIET_MS = 8_000L
 // a network problem, and is described that way.
 private const val SLEEP_EXPLAINS_MS = 30 * 60_000L
 private const val TAG = "LazeR.RemoteViewModel"
+// The laptop has been gone this long: stop recording until it's back.
+private const val MIC_AWAY_GRACE_MS = 20_000L
 
 /** A scanned QR that would replace the pairing of a saved laptop, waiting for the
  *  user to confirm. [existing] is the saved record it replaces. */
 data class PendingPairing(val existing: Device, val name: String, val ip: String,
                           val port: Int, val token: String, val key: String)
+
+/** Things about the phone mic that went wrong on their own and need saying. */
+enum class PhoneMicProblem {
+    BackgroundRefused,   // works only while LazeR is on screen
+    Lost,                // the recording stopped and couldn't come back
+}
 
 data class UiState(
     // The typed-code form only. Deliberately NOT the connected device, or "Enter
@@ -103,6 +117,14 @@ data class UiState(
     val volume: Float = 50f,
     val muted: Boolean? = null,        // null: the laptop doesn't report it
     val micMuted: Boolean? = null,     // null: no mic button (laptop can't report it)
+    // Can the phone be the laptop's microphone? null: the laptop can't (too old, or
+    // not Windows) so no switch is shown; false: it needs VB-CABLE installed first.
+    val phoneMicAvailable: Boolean? = null,
+    val phoneMicOn: Boolean = false,       // the phone is the laptop's mic right now
+    val phoneMicMuted: Boolean = false,    // muted on the phone (sends nothing)
+    val phoneMicSilenced: Boolean = false, // another app (a call) has taken the mic
+    val phoneMicWasOn: Boolean = false,    // switched back this session: remind about the app
+    val phoneMicProblem: PhoneMicProblem? = null,   // something to explain, once
     val brightness: Float = 50f,
     val brightnessAvailable: Boolean = false,
     // NOTE: the keyboard's staging text deliberately does NOT live here. It used to,
@@ -178,6 +200,14 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var lastUserVolumeMs: Long = 0
     private var lastUserMuteMs: Long = 0
     private var lastUserMicMs: Long = 0
+    // The phone as the laptop's mic. Frames go out through the client, which drops
+    // them while there's no session, so a reconnect needs nothing here: the voice
+    // resumes when the link does.
+    private val phoneMic = PhoneMic(app,
+        onFrame = { client.audio(it) },
+        onSilenced = { s -> update { it.copy(phoneMicSilenced = s) } })
+    private var micWatchJob: Job? = null
+    private var micPaused = false     // stopped while the laptop is away; resumes on return
     private var lastUserBrightnessMs: Long = 0
     private var lastInteractionMs: Long = 0   // drives adaptive health-poll backoff
     private var current: Device? = null   // device we're connected to / reconnecting
@@ -677,6 +707,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         } else dev0
         // Another laptop's mute state isn't this one's; the first VGET fills it in.
         val keepMute = current?.id == dev.id
+        // Nor is the phone mic: a voice meant for one laptop must not start coming
+        // out of another's.
+        if (!keepMute && _state.value.phoneMicOn) stopPhoneMic(userChose = false)
         current = dev
         reconnectJob?.cancel()
         // Cancel the watchdog too: a health loop left alive could declare the link
@@ -688,7 +721,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         update { it.copy(conn = ConnState.Connecting, error = null, errorDetail = null,
             scanError = null, deviceName = dev.name,
             muted = if (keepMute) it.muted else null,
-            micMuted = if (keepMute) it.micMuted else null) }
+            micMuted = if (keepMute) it.micMuted else null,
+            phoneMicAvailable = if (keepMute) it.phoneMicAvailable else null) }
         connectJob = viewModelScope.launch {
             val (connected, outcome) = connectResolving(dev, 2000)
             if (outcome.result == ConnectResult.Cancelled) return@launch
@@ -939,6 +973,13 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     // reached the laptop doesn't flip the button back.
                     if (use && now - lastUserMuteMs > 1200) update { it.copy(muted = v.muted) }
                     if (use && now - lastUserMicMs > 1200) update { it.copy(micMuted = v.micMuted) }
+                    if (use) update { it.copy(phoneMicAvailable = v.phoneMic) }
+                    // The recording ended on its own (the mic was taken away): say so
+                    // instead of showing Phone over a mic that sends nothing.
+                    if (_state.value.phoneMicOn && !micPaused && !phoneMic.isRunning) {
+                        stopPhoneMic(userChose = false)
+                        update { it.copy(phoneMicProblem = PhoneMicProblem.Lost) }
+                    }
                     true
                 } else {
                     skipVolReading = true
@@ -980,7 +1021,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                 // back to 0) or confirmed-dead within ~2.5s — recovery feels instant, not
                 // "came back after a while".
                 val active = System.currentTimeMillis() - lastInteractionMs < 5000
-                delay(if (misses > 0) 500L else if (active) 1500L else Protocol.IDLE_POLL_MS)
+                // A streaming phone mic polls briskly too: a dropped session is
+                // found in seconds, not left swallowing the user's voice.
+                val brisk = active || _state.value.phoneMicOn
+                delay(if (misses > 0) 500L else if (brisk) 1500L else Protocol.IDLE_POLL_MS)
             }
         }
     }
@@ -1116,6 +1160,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // An intentional leave: don't auto-reconnect next launch.
         if (forget) settingsStore.lastDeviceId = null
         current = null
+        stopPhoneMic(userChose = false)     // a deliberate leave hands the mic back
+        update { it.copy(phoneMicWasOn = false) }
         client.disconnect()
         holdWifi(false)                     // let the radio power-save again
         // Clear the error too. The reconnect loop now writes its diagnosis into
@@ -1231,6 +1277,85 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         client.system(action)
     }
 
+    // --- phone as microphone ---
+    enum class PhoneMicResult { Started, NeedsSetup, NeedsSecure, Failed }
+
+    /** Make the phone the laptop's microphone. The caller must already hold
+     *  RECORD_AUDIO, and the app must be on screen: Android only lets a microphone
+     *  service start from the foreground. Opening the recorder takes a moment,
+     *  so it happens off the main thread. */
+    suspend fun startPhoneMic(): PhoneMicResult {
+        if (_state.value.phoneMicOn) return PhoneMicResult.Started
+        if (_state.value.phoneMicAvailable != true) return PhoneMicResult.NeedsSetup
+        if (!client.isSecure) return PhoneMicResult.NeedsSecure
+        phoneMic.muted = false
+        val ok = withContext(Dispatchers.Default) { phoneMic.start() }
+        if (!ok) return PhoneMicResult.Failed
+        // Only once recording works: a foreground service started and then stopped
+        // before it reaches startForeground is one Android punishes with a crash.
+        val app = getApplication<Application>()
+        PhoneMicService.onRefused = {
+            update { it.copy(phoneMicProblem = PhoneMicProblem.BackgroundRefused) }
+        }
+        PhoneMicService.start(app)
+        micPaused = false
+        update { it.copy(phoneMicOn = true, phoneMicMuted = false, phoneMicWasOn = false,
+            phoneMicProblem = null) }
+        watchConnectionForMic()
+        return PhoneMicResult.Started
+    }
+
+    /** Hand the microphone back to the laptop. [userChose]: the user tapped
+     *  Laptop, so remind them to switch their meeting app back too. */
+    fun stopPhoneMic(userChose: Boolean = true) {
+        micWatchJob?.cancel()
+        micWatchJob = null
+        micPaused = false
+        phoneMic.stop()
+        PhoneMicService.stop(getApplication())
+        update { s ->
+            s.copy(phoneMicOn = false, phoneMicMuted = false, phoneMicSilenced = false,
+                phoneMicWasOn = s.phoneMicWasOn || (userChose && s.phoneMicOn))
+        }
+    }
+
+    /** While the laptop is away (asleep, lid shut, out of range) there's no one to
+     *  hear the phone: after a short grace — long enough to ride out a Wi-Fi blip
+     *  — stop recording, so the mic isn't live for hours, and pick it back up when
+     *  the laptop returns. The microphone service keeps that restart allowed even
+     *  with the phone locked. */
+    private fun watchConnectionForMic() {
+        micWatchJob?.cancel()
+        micWatchJob = viewModelScope.launch {
+            _state.map { it.conn }.distinctUntilChanged().collectLatest { c ->
+                if (c == ConnState.Connected) {
+                    if (micPaused) {
+                        val ok = withContext(Dispatchers.Default) { phoneMic.start() }
+                        micPaused = false
+                        if (!ok) {
+                            stopPhoneMic(userChose = false)
+                            update { it.copy(phoneMicProblem = PhoneMicProblem.Lost) }
+                        }
+                    }
+                } else {
+                    delay(MIC_AWAY_GRACE_MS)
+                    if (phoneMic.isRunning) {
+                        micPaused = true
+                        phoneMic.stop()
+                    }
+                }
+            }
+        }
+    }
+
+    fun togglePhoneMicMute() {
+        val m = !phoneMic.muted
+        phoneMic.muted = m
+        update { it.copy(phoneMicMuted = m) }
+    }
+
+    fun clearPhoneMicProblem() = update { it.copy(phoneMicProblem = null) }
+
     // --- volume ---
     fun setVolume(v: Float) {
         lastUserVolumeMs = System.currentTimeMillis()
@@ -1281,6 +1406,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         healthJob?.cancel()
         reconnectJob?.cancel()
+        stopPhoneMic(userChose = false)
+        PhoneMicService.onRefused = null
         stopDiscovery()
         client.disconnect()
         holdWifi(false)   // safety net: never leak the Wi-Fi lock if the VM dies mid-session

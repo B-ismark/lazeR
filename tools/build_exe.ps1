@@ -90,7 +90,10 @@ $pyiArgs = @(
     "--collect-submodules", "pynput",
     "--collect-submodules", "cryptography",
     "--collect-all", "pystray",
-    "--hidden-import", "PIL._tkinter_finder"
+    "--hidden-import", "PIL._tkinter_finder",
+    # Phone-as-microphone: imported lazily (Windows only), so name it outright.
+    # pyinstaller-hooks-contrib's sounddevice hook bundles the PortAudio DLL.
+    "--hidden-import", "sounddevice"
 )
 foreach ($m in $exclude) { $pyiArgs += @("--exclude-module", $m) }
 # UPX (optional): if upx.exe sits in tools\upx\, PyInstaller compresses the bundled
