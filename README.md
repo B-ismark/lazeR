@@ -29,7 +29,9 @@ PROTOCOL.md  wire format shared by both
 - Mic button (right of the volume title) → `SYS micmute`: mutes the laptop's
   microphone for every app, and shows the real state (it hides on a laptop with no
   mic, or one too old to report it).
-- **Phone as microphone** (Windows): the Mic switch under the volume slider picks
+- **Phone as microphone** (Windows, off by default — turn on **Settings → Microphone →
+  Use phone as microphone**; the laptop mic mute works either way): the Mic switch
+  under the volume slider picks
   **Laptop** or **Phone**. On Phone, your voice streams to the laptop over the
   encrypted link (`AUD`) and the mic badge mutes the phone instead. One-time setup on
   the laptop: install the free [VB-CABLE](https://vb-audio.com/Cable/) virtual
@@ -245,7 +247,7 @@ in Play Services. No volume-button hooks.
 ### The only internet access: updates
 
 LazeR is LAN-only; v2.0 removed off-LAN access entirely. The exceptions are the
-update check and the phone's download of an update you ask for, because a sideloaded
+update check and the download of an update you ask for, because a sideloaded
 app has no store to notify you and would otherwise sit on a stale version
 indefinitely.
 
@@ -256,7 +258,13 @@ indefinitely.
   header is the `User-Agent` GitHub requires. Nothing about you or your laptop is
   sent — GitHub sees a request, as it would for any public URL.
 - **It only checks.** The check reads the release's tag and asset links, never the
-  files. The laptop only ever shows a notice. On the phone, **Download & install**
+  files. On the laptop, a banner offers **Update now** (the `LazeR.exe` build only; a
+  source run links to the release page): it downloads the new `LazeR.exe` from this
+  project's GitHub releases only, over https, checks it against the
+  `LazeR.exe.sha256` published with it (while writing and again from disk), puts it in
+  place of the running copy (which steps aside as `LazeR.exe.old`, removed on the next
+  launch) and restarts LazeR; the phone reconnects by itself. Any failure leaves the
+  current copy untouched. On the phone, **Download & install**
   fetches the new `LazeR.apk` only when you tap it: from this project's GitHub
   releases only, checked against the `LazeR.apk.sha256` published with it (and
   checked again just before install), then handed to Android's installer, which also
@@ -270,7 +278,7 @@ indefinitely.
   install), a dot on the Settings button (the app usually reconnects straight to the
   pad, past that card), and the status line under **Settings → Updates**, which also offers
   **Check now**.
-- **Frequency:** server, once per launch. Phone, at most once a day on its own
+- **Frequency:** server, at launch and every 6 hours while it runs. Phone, at most once a day on its own
   (checked on launch and whenever the app comes back to the front), or whenever you
   tap **Check now**.
 - **Turning it off:** server — `--no-update-check`. Phone — **Settings → Updates →

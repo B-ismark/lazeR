@@ -56,6 +56,7 @@ class SettingsActions(
     val onHaptics: (Boolean) -> Unit,
     val onAcceleration: (Boolean) -> Unit,
     val onUpdateCheck: (Boolean) -> Unit,
+    val onPhoneMicSetting: (Boolean) -> Unit,
     val onCheckUpdateNow: () -> Unit,   // ask GitHub now, skipping the daily throttle
     val onOpenRelease: () -> Unit,      // the release page in a browser (fallback)
     val onDownloadUpdate: () -> Unit,
@@ -102,6 +103,14 @@ internal fun SettingsSheet(state: UiState, a: SettingsActions, onDismiss: () -> 
             SheetTitle("Feedback")
             ToggleRow("Haptic feedback", "Vibrate on clicks and scroll",
                 state.settings.haptics, a.onHaptics)
+
+            Spacer(Modifier.height(16.dp))
+            SheetTitle("Microphone")
+            ToggleRow("Use phone as microphone",
+                "Adds a Laptop / Phone switch under the volume, so meeting apps on the " +
+                    "laptop can hear this phone (needs the free VB-CABLE on the laptop). " +
+                    "The laptop mic mute button works either way.",
+                state.settings.phoneMic, a.onPhoneMicSetting)
 
             Spacer(Modifier.height(20.dp))
             SheetTitle("Updates")

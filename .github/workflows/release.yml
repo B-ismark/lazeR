@@ -194,7 +194,9 @@ jobs:
           ls -l out
           # Re-check the checksum travelled with the APK it describes.
           (cd out && sha256sum -c LazeR.apk.sha256)
-          assets="out/LazeR.exe out/LazeR.apk out/LazeR.apk.sha256"
+          # The laptop's in-app updater installs LazeR.exe only if it matches this.
+          (cd out && sha256sum LazeR.exe > LazeR.exe.sha256 && cat LazeR.exe.sha256)
+          assets="out/LazeR.exe out/LazeR.exe.sha256 out/LazeR.apk out/LazeR.apk.sha256"
           notes="tools/release-notes/$TAG.md"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" $assets --clobber

@@ -3670,5 +3670,170 @@ class FirewallReadsStayInProcess(unittest.TestCase):
             self.assertEqual(rs.firewall_block_rules(), ["IT block"])
 
 
+class _FakeResp:
+    def __init__(self, body, url, length=True):
+        self._b = body
+        self._i = 0
+        self._url = url
+        self.headers = {"Content-Length": str(len(body))} if length else {}
+
+    def read(self, n=-1):
+        if n < 0:
+            n = len(self._b)
+        out = self._b[self._i:self._i + n]
+        self._i += len(out)
+        return out
+
+    def geturl(self):
+        return self._url
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _HTTP404(Exception):
+    code = 404
+
+
+def _fake_opener(exe, sha=None, missing=()):
+    import hashlib
+    sha = hashlib.sha256(exe).hexdigest() if sha is None else sha
+    seen = []
+
+    def opener(url, timeout):
+        seen.append(url)
+        name = url.rsplit("/", 1)[-1]
+        if name in missing:
+            raise _HTTP404()
+        if name == "LazeR.exe.sha256":
+            return _FakeResp(f"{sha}  LazeR.exe\n".encode(), url)
+        return _FakeResp(exe, url)
+    opener.seen = seen
+    return opener
+
+
+class SelfUpdate(unittest.TestCase):
+    EXE = b"MZ" + b"\x90" * 300_000
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.dest = os.path.join(self.dir, "LazeR.exe.new")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_only_this_repos_release_downloads(self):
+        self.assertEqual(rs.release_asset_url("v2.7.0", "LazeR.exe"),
+                         "https://github.com/B-ismark/lazeR/releases/download/v2.7.0/LazeR.exe")
+        for bad in ("v2.7.0/../../x", "latest", "", None, "v2.7"):
+            with self.assertRaises(rs.UpdateError):
+                rs.release_asset_url(bad, "LazeR.exe")
+        with self.assertRaises(rs.UpdateError):
+            rs._open_https("https://example.com/LazeR.exe", 1)
+
+    def test_downloads_and_verifies(self):
+        op = _fake_opener(self.EXE)
+        seen = []
+        rs.download_update("v2.7.0", self.dest, progress=lambda g, t: seen.append((g, t)),
+                           opener=op)
+        with open(self.dest, "rb") as f:
+            self.assertEqual(f.read(), self.EXE)
+        self.assertEqual(seen[-1], (len(self.EXE), len(self.EXE)))
+        self.assertTrue(op.seen[0].endswith("/v2.7.0/LazeR.exe.sha256"))
+
+    def test_a_checksum_mismatch_leaves_nothing_behind(self):
+        op = _fake_opener(self.EXE, sha="0" * 64)
+        with self.assertRaisesRegex(rs.UpdateError, "checksum"):
+            rs.download_update("v2.7.0", self.dest, opener=op)
+        self.assertFalse(os.path.exists(self.dest))
+
+    def test_a_release_without_a_checksum_is_refused(self):
+        op = _fake_opener(self.EXE, missing=("LazeR.exe.sha256",))
+        with self.assertRaisesRegex(rs.UpdateError, "release page"):
+            rs.download_update("v2.7.0", self.dest, opener=op)
+        self.assertEqual(len(op.seen), 1)          # never fetched the exe
+        self.assertFalse(os.path.exists(self.dest))
+
+    def test_not_a_windows_program_is_refused(self):
+        body = b"<html>nope</html>"
+        with self.assertRaisesRegex(rs.UpdateError, "Windows program"):
+            rs.download_update("v2.7.0", self.dest, opener=_fake_opener(body))
+        self.assertFalse(os.path.exists(self.dest))
+
+    def test_size_cap_and_cancel(self):
+        with mock.patch.object(rs, "EXE_UPDATE_CAP", 1000):
+            with self.assertRaisesRegex(rs.UpdateError, "bigger"):
+                rs.download_update("v2.7.0", self.dest, opener=_fake_opener(self.EXE))
+        stop = threading.Event()
+        stop.set()
+        with self.assertRaisesRegex(rs.UpdateError, "cancelled"):
+            rs.download_update("v2.7.0", self.dest, cancel=stop,
+                               opener=_fake_opener(self.EXE))
+        self.assertFalse(os.path.exists(self.dest))
+
+    def _files(self):
+        exe = os.path.join(self.dir, "LazeR.exe")
+        with open(exe, "wb") as f:
+            f.write(b"old")
+        with open(self.dest, "wb") as f:
+            f.write(b"new")
+        return exe
+
+    def test_install_swaps_and_starts_the_new_copy(self):
+        exe = self._files()
+        started = []
+        rs.install_update(self.dest, exe=exe, spawn=started.append)
+        self.assertEqual(started, [exe])
+        with open(exe, "rb") as f:
+            self.assertEqual(f.read(), b"new")
+        with open(exe + ".old", "rb") as f:
+            self.assertEqual(f.read(), b"old")
+        rs.cleanup_after_update(exe)
+        self.assertEqual(sorted(os.listdir(self.dir)), ["LazeR.exe"])
+
+    def test_install_puts_everything_back_if_the_new_copy_wont_start(self):
+        exe = self._files()
+
+        def boom(path):
+            raise OSError("blocked")
+        with self.assertRaises(OSError):
+            rs.install_update(self.dest, exe=exe, spawn=boom)
+        with open(exe, "rb") as f:
+            self.assertEqual(f.read(), b"old")
+        self.assertFalse(os.path.exists(exe + ".old"))
+
+    def test_cleanup_leaves_other_files_alone(self):
+        exe = os.path.join(self.dir, "LazeR.exe")
+        for n in ("LazeR.exe", "LazeR.exe.old", "LazeR.exe.123.old", "LazeR.exe.new",
+                  "notes.old", "Other.exe.old"):
+            open(os.path.join(self.dir, n), "wb").close()
+        rs.cleanup_after_update(exe)
+        self.assertEqual(sorted(os.listdir(self.dir)),
+                         ["LazeR.exe", "Other.exe.old", "notes.old"])
+
+    def test_child_env_forgets_our_unpack_folder(self):
+        mei = os.path.join(os.sep, "tmp", "_MEI123")
+        env = {"_PYI_APPLICATION_HOME_DIR": mei, "_MEIPASS2": mei,
+               "TCL_LIBRARY": os.path.join(mei, "tcl"), "HOME": "/home/x",
+               "PATH": os.pathsep.join([mei, "/usr/bin"])}
+        out = rs._clean_child_env(env, mei)
+        self.assertEqual(out["PATH"], "/usr/bin")
+        self.assertEqual(out["HOME"], "/home/x")
+        self.assertEqual(out["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+        for k in ("_PYI_APPLICATION_HOME_DIR", "_MEIPASS2", "TCL_LIBRARY"):
+            self.assertNotIn(k, out)
+
+    def test_a_source_run_never_replaces_itself(self):
+        with mock.patch.object(rs.sys, "frozen", False, create=True):
+            self.assertFalse(rs.self_update_supported())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

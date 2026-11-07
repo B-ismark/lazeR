@@ -2896,6 +2896,244 @@ def check_for_update(url=RELEASES_API, timeout=UPDATE_TIMEOUT_S):
     return tag, is_newer_version(tag, APP_VERSION)
 
 
+# ── self-update (Windows exe only) ───────────────────────────────────────────
+# The laptop counterpart of the phone's ApkUpdater: only ever on a click, only
+# from this repo's release downloads, https all the way, size- and time-capped,
+# and installed only if it matches the release's LazeR.exe.sha256.
+RELEASE_DL_PREFIX = "https://github.com/B-ismark/lazeR/releases/download/"
+EXE_UPDATE_CAP = 100 * 1024 * 1024        # bytes
+EXE_UPDATE_DEADLINE_S = 600
+UPDATE_RECHECK_MS = 6 * 3600 * 1000       # LazeR stays open for days in the tray
+_RELEASE_TAG_RE = re.compile(r"v\d{1,4}\.\d{1,4}\.\d{1,4}")
+
+
+class UpdateError(Exception):
+    """Why an update didn't happen, in words for the window."""
+
+
+def self_update_supported():
+    """Only the frozen Windows exe can replace itself; a source run updates
+    with git, so it keeps the "open the release page" link."""
+    return sys.platform.startswith("win") and bool(getattr(sys, "frozen", False))
+
+
+def release_asset_url(tag, name):
+    if not isinstance(tag, str) or not _RELEASE_TAG_RE.fullmatch(tag):
+        raise UpdateError("the release has an unexpected name")
+    return f"{RELEASE_DL_PREFIX}{tag}/{name}"
+
+
+def _open_https(url, timeout):
+    """GET [url], refusing any hop off https (GitHub redirects release assets to
+    its CDN). Returns the open response."""
+    import urllib.request
+
+    class _HttpsOnly(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not str(newurl).lower().startswith("https://"):
+                raise UpdateError("the download was redirected away from https")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    if not url.startswith(RELEASE_DL_PREFIX):
+        raise UpdateError("refusing a download from outside LazeR's releases")
+    opener = urllib.request.build_opener(_HttpsOnly)
+    r = opener.open(urllib.request.Request(
+        url, headers={"User-Agent": f"LazeR/{APP_VERSION}"}), timeout=timeout)
+    if not str(r.geturl()).lower().startswith("https://"):
+        r.close()
+        raise UpdateError("the download was redirected away from https")
+    return r
+
+
+def _http_code(e):
+    return getattr(e, "code", None)
+
+
+def fetch_expected_sha256(tag, opener=_open_https, timeout=UPDATE_TIMEOUT_S):
+    try:
+        with opener(release_asset_url(tag, "LazeR.exe.sha256"), timeout) as r:
+            raw = r.read(1024).decode("ascii", "ignore")
+    except UpdateError:
+        raise
+    except Exception as e:
+        if _http_code(e) == 404:
+            raise UpdateError("this release has no checksum for LazeR.exe, so it "
+                              "can't be checked — get it from the release page")
+        raise UpdateError(f"couldn't reach GitHub ({type(e).__name__})")
+    m = re.match(r"\s*([0-9a-fA-F]{64})(\s|$)", raw)
+    if not m:
+        raise UpdateError("the release's checksum file is malformed")
+    return m.group(1).lower()
+
+
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def download_update(tag, dest, progress=None, cancel=None, opener=_open_https,
+                    now=time.monotonic):
+    """Download [tag]'s LazeR.exe to [dest] and verify it. Returns [dest];
+    raises UpdateError (and leaves no file behind) otherwise."""
+    expected = fetch_expected_sha256(tag, opener=opener)
+    import hashlib
+    h = hashlib.sha256()
+    got = 0
+    start = now()
+    try:
+        with opener(release_asset_url(tag, "LazeR.exe"), 30) as r, \
+                open(dest, "wb") as f:
+            try:
+                total = int(r.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError, AttributeError):
+                total = 0
+            if total > EXE_UPDATE_CAP:
+                raise UpdateError("the download is far bigger than LazeR should be")
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise UpdateError("cancelled")
+                if now() - start > EXE_UPDATE_DEADLINE_S:
+                    raise UpdateError("the download took too long")
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                got += len(chunk)
+                if got > EXE_UPDATE_CAP:
+                    raise UpdateError("the download is far bigger than LazeR should be")
+                h.update(chunk)
+                f.write(chunk)
+                if progress is not None:
+                    progress(got, total)
+            f.flush()
+            os.fsync(f.fileno())
+        if h.hexdigest() != expected:
+            raise UpdateError("the download didn't match the release's checksum")
+        # Again from disk: what gets run is the file, not the bytes we hashed.
+        if _sha256_file(dest) != expected:
+            raise UpdateError("the saved file didn't match the release's checksum")
+        with open(dest, "rb") as f:
+            if f.read(2) != b"MZ":
+                raise UpdateError("the download isn't a Windows program")
+    except UpdateError:
+        _remove_quietly(dest)
+        raise
+    except Exception as e:
+        _remove_quietly(dest)
+        if _http_code(e) == 404:
+            raise UpdateError("this release has no LazeR.exe")
+        raise UpdateError(f"the download failed ({type(e).__name__})")
+    return dest
+
+
+def _clean_child_env(env=None, mei=None):
+    """The environment for a separately running copy of the exe. A onefile child
+    that inherits PyInstaller's variables (or Tcl/Tk paths into OUR unpack
+    folder, which is deleted as we exit) starts from the dying parent's files."""
+    env = dict(os.environ if env is None else env)
+    mei = getattr(sys, "_MEIPASS", None) if mei is None else mei
+    out = {}
+    for k, v in env.items():
+        if k.startswith("_PYI") or k == "_MEIPASS2":
+            continue
+        if mei and isinstance(v, str):
+            if k.upper() == "PATH":
+                v = os.pathsep.join(p for p in v.split(os.pathsep)
+                                    if not p.startswith(mei))
+            elif v.startswith(mei):
+                continue
+        out[k] = v
+    out["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return out
+
+
+def _spawn_updated(exe):
+    import subprocess
+    flags = 0x00000008 | 0x00000200   # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen([exe, "--after-update", str(os.getpid())],
+                     env=_clean_child_env(), close_fds=True,
+                     cwd=os.path.dirname(exe) or None, creationflags=flags)
+
+
+def install_update(new_path, exe=None, spawn=_spawn_updated):
+    """Swap [new_path] in for the running exe and start it. Windows can't
+    overwrite a running program but can rename it, so the old one steps aside
+    as LazeR.exe.old (removed by the next launch). Any failure puts everything
+    back as it was. The same path keeps the launch-at-login entry and the
+    firewall rule (both name the program by path) working."""
+    exe = exe or sys.executable
+    old = exe + ".old"
+    _remove_quietly(old)
+    if os.path.exists(old):                 # still locked by an earlier copy
+        old = f"{exe}.{os.getpid()}.old"
+    os.replace(exe, old)
+    try:
+        os.replace(new_path, exe)
+    except OSError:
+        os.replace(old, exe)
+        raise
+    try:
+        spawn(exe)
+    except Exception:
+        try:
+            os.replace(exe, new_path)
+            os.replace(old, exe)
+        except OSError:
+            pass
+        raise
+
+
+def cleanup_after_update(exe=None):
+    """Remove what an update left: the previous exe (.old) and a half-finished
+    download (.new). Quiet: a copy still locked goes on the next launch."""
+    exe = exe or sys.executable
+    folder, base = os.path.split(exe)
+    try:
+        names = os.listdir(folder or ".")
+    except OSError:
+        return
+    low = base.lower()
+    for name in names:
+        n = name.lower()
+        if n == low + ".new" or (n.startswith(low + ".") and n.endswith(".old")):
+            _remove_quietly(os.path.join(folder, name))
+
+
+def wait_for_exit(pid, timeout=30.0):
+    """After an update: let the copy that started us finish quitting, so it
+    has let go of the ports before we take them."""
+    deadline = time.monotonic() + timeout
+    try:
+        import psutil
+    except Exception:
+        psutil = None
+    while time.monotonic() < deadline:
+        if psutil is not None:
+            try:
+                if not psutil.pid_exists(pid):
+                    return True
+            except Exception:
+                psutil = None
+                continue
+        else:
+            try:
+                socket.create_connection(("127.0.0.1", SINGLETON_PORT), timeout=0.3).close()
+            except OSError:
+                return True
+        time.sleep(0.2)
+    return False
+
+
 # Not in the socket module, whose ioctl() takes only three codes: asking it for this
 # one raised AttributeError, which was caught, so the setting never took effect.
 SIO_UDP_CONNRESET = 0x9800000C
@@ -4753,6 +4991,10 @@ class LazeRWindow:
         self._require_secure = require_secure
         self._update_check = update_check
         self._update_tag = None      # newest release tag once known
+        self._upd_busy = False       # a download/install is under way
+        self._upd_dismissed = None   # the tag whose banner the user closed
+        self._upd_announced = None   # the tag already logged / notified
+        self._upd_cancel = None
         self._hostname = socket.gethostname()
         self._warnings = 0           # unread warnings, badged on Show details
         self._close_noticed = False  # told the user once that close != quit
@@ -4861,6 +5103,7 @@ class LazeRWindow:
         self._build_notice_banner(outer)
         self._build_pause_banner(outer)
         self._build_firewall_banner(outer)
+        self._build_update_banner(outer)
 
         # swap area: QR card (not connected) <-> connected panel
         self._swap = tk.Frame(outer, bg=_C["surface"])
@@ -5728,6 +5971,11 @@ class LazeRWindow:
         if not self._update_check:
             self._set_update_pill("off — started with --no-update-check", "faint")
             return
+        # Again every few hours: LazeR lives in the tray for days, and a check
+        # only at launch missed every release that came out meanwhile.
+        self._root.after(UPDATE_RECHECK_MS, self._check_update)
+        if self._upd_busy:
+            return
 
         def work():
             tag, newer = check_for_update()
@@ -5735,17 +5983,161 @@ class LazeRWindow:
         threading.Thread(target=work, daemon=True).start()
 
     def _on_update_result(self, tag, newer):
+        if self._upd_busy:
+            return
         if tag is None:
             # Offline, rate limited, or GitHub had a bad day. Not an error worth
-            # anyone's attention — just say we don't know.
-            self._set_update_pill("couldn't check — no internet?", "faint")
+            # anyone's attention — just say we don't know. A newer tag already
+            # found stays on show.
+            if self._update_tag is None:
+                self._set_update_pill("couldn't check — no internet?", "faint")
             return
         if not newer:
             self._set_update_pill(f"up to date (v{APP_VERSION})", "ok")
             return
         self._update_tag = tag
-        self._set_update_pill(f"{tag} available — click to open", "warn", link=True)
-        self._log(f"Update available: {tag} (running v{APP_VERSION})", "info")
+        self._set_update_pill(
+            f"{tag} available — click to " +
+            ("update" if self_update_supported() else "open"), "warn", link=True)
+        if self._upd_announced != tag:
+            self._upd_announced = tag
+            self._log(f"Update available: {tag} (running v{APP_VERSION})", "info")
+            self._tray_note(f"LazeR {tag} is available. Open LazeR to update.")
+        if self._upd_dismissed != tag:
+            self._show_update_banner()
+
+    def _tray_note(self, text):
+        """A tray balloon, only while the window is hidden (in view, the banner
+        says it)."""
+        if self._tray is None:
+            return
+        try:
+            if self._root.state() == "withdrawn":
+                self._tray.notify(text, "LazeR")
+        except Exception:
+            pass
+
+    # ── update banner ──
+    def _build_update_banner(self, parent):
+        tk = self._tk
+        self._upd_wrap, col = self._banner(parent, "info")
+        self._upd_title = tk.Label(col, text="", bg=_C["warn_ctr"], fg=_C["on_warn_ctr"],
+                                   font=self.f_title, anchor="w")
+        self._upd_title.pack(anchor="w")
+        self._upd_sub = tk.Label(col, text="", bg=_C["warn_ctr"], fg=_C["on_warn_ctr"],
+                                 font=self.f_md, justify="left", anchor="w",
+                                 wraplength=_px(self.PAGE_W - 120))
+        self._upd_sub.pack(anchor="w", fill="x", pady=(_px(2), _px(10)))
+        self._upd_btns = tk.Frame(col, bg=_C["warn_ctr"])
+        self._upd_btns.pack(anchor="w")
+        self._upd_go = self._button(
+            self._upd_btns, "Update now" if self_update_supported() else "Get it",
+            self._start_update, kind="warn", small=True)
+        self._upd_go.pack(side="left")
+        self._upd_notes = self._button(self._upd_btns, "What's new", self._open_releases,
+                                       kind="text", small=True, ink=_C["on_warn_ctr"])
+        self._upd_notes.pack(side="left", padx=(_px(4), 0))
+        self._upd_later = self._button(self._upd_btns, "Later", self._dismiss_update_banner,
+                                       kind="text", small=True, ink=_C["on_warn_ctr"])
+        self._upd_later.pack(side="left", padx=(_px(4), 0))
+
+    def _update_blurb(self):
+        if self_update_supported():
+            return (f"You have v{APP_VERSION}. Update now downloads it from GitHub "
+                    "(about 25 MB), checks it, and restarts LazeR. Your phone "
+                    "reconnects by itself.")
+        return (f"You have v{APP_VERSION}. Download the new LazeR.exe from the "
+                "release page.")
+
+    def _show_update_banner(self):
+        tag = self._update_tag
+        if tag is None:
+            return
+        self._upd_title.config(text=f"LazeR {tag} is available")
+        if not self._upd_busy:
+            self._upd_sub.config(text=self._update_blurb())
+            self._upd_btns.pack(anchor="w")
+        if not self._upd_wrap.winfo_ismapped():
+            self._upd_wrap.pack(fill="x", before=self._swap)
+        self._resize()
+
+    def _dismiss_update_banner(self):
+        self._upd_dismissed = self._update_tag
+        try:
+            self._upd_wrap.pack_forget()
+        except Exception:
+            pass
+        self._resize()
+
+    def _start_update(self):
+        tag = self._update_tag
+        if tag is None or self._upd_busy:
+            return
+        if not self_update_supported():
+            self._open_releases()
+            return
+        exe = sys.executable
+        if not os.access(os.path.dirname(exe) or ".", os.W_OK):
+            self._update_failed(f"LazeR can't write to its folder "
+                                f"({os.path.dirname(exe)}). Get the new version from "
+                                "the release page, or move LazeR.exe somewhere you can "
+                                "write to.")
+            return
+        self._upd_busy = True
+        self._upd_btns.pack_forget()
+        self._upd_sub.config(text="Downloading…")
+        self._resize()
+        cancel = self._upd_cancel = threading.Event()
+        dest = exe + ".new"
+        last = {"pct": -1}
+
+        def progress(got, total):
+            pct = int(got * 100 / total) if total else -1
+            if pct == last["pct"]:
+                return
+            last["pct"] = pct
+            text = (f"Downloading… {pct}%" if pct >= 0
+                    else f"Downloading… {got // (1024 * 1024)} MB")
+            self._root.after(0, lambda: self._upd_sub.config(text=text))
+
+        def work():
+            try:
+                download_update(tag, dest, progress=progress, cancel=cancel)
+            except UpdateError as e:
+                msg = str(e)
+                self._root.after(0, lambda: self._update_failed(msg))
+                return
+            except Exception as e:
+                msg = f"unexpected error ({type(e).__name__})"
+                self._root.after(0, lambda: self._update_failed(msg))
+                return
+            self._root.after(0, lambda: self._finish_update(tag, dest))
+        threading.Thread(target=work, daemon=True, name="LazeR-update").start()
+
+    def _finish_update(self, tag, dest):
+        self._upd_sub.config(text=f"Installing {tag} and restarting…")
+        self._log(f"Installing {tag}; LazeR will restart", "info")
+        try:
+            self._root.update_idletasks()
+        except Exception:
+            pass
+        try:
+            install_update(dest)
+        except Exception as e:
+            _remove_quietly(dest)
+            self._update_failed(f"couldn't swap in the new LazeR.exe ({e})")
+            return
+        self._real_quit()
+
+    def _update_failed(self, msg):
+        self._upd_busy = False
+        self._upd_sub.config(text=f"The update didn't finish: {msg}. Nothing was "
+                                  "changed.")
+        self._log(f"Update didn't finish: {msg}", "warn")
+        self._upd_btns.pack(anchor="w")
+        if not self._upd_wrap.winfo_ismapped():
+            self._upd_wrap.pack(fill="x", before=self._swap)
+        self._resize()
 
     def _set_update_pill(self, text, colour, link=False):
         pill = getattr(self, "_upd_pill", None)
@@ -5758,7 +6150,7 @@ class LazeRWindow:
             # Only clickable once there IS something to open, so a dead pointer
             # cursor never invites a click that does nothing.
             val.config(fg=_C["primary"], cursor="hand2")
-            self._clickable(val, self._open_releases)
+            self._clickable(val, self._show_update_banner)
         else:
             val.config(fg=_C["on_variant"], cursor="")
             val.unbind("<Button-1>")
@@ -7179,7 +7571,14 @@ def main():
                     help="remove everything LazeR set up — the launch-at-login entry, "
                          "its firewall rule (one admin prompt) and the saved pairing "
                          "— and exit. Then delete the exe")
+    # Internal: set by the in-app updater on the copy it starts. Wait for the
+    # old copy to let go of the ports, then tidy up what the swap left.
+    ap.add_argument("--after-update", type=int, metavar="PID", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.after_update:
+        wait_for_exit(args.after_update)
+    if getattr(sys, "frozen", False):
+        cleanup_after_update()
     if not args.uninstall:
         migrate_legacy_secrets()
 
@@ -7273,6 +7672,8 @@ def main():
     # Startup notices, (tag, text). Printed in a terminal; the window logs them and
     # raises the warnings, since the windowed exe has no terminal to print them to.
     notices = []
+    if args.after_update:
+        notices.append(("info", f"Updated to v{APP_VERSION}."))
     if SECRET_WRITE_ERRORS:
         notices.append(("warn", "Couldn't save the pairing code, so phones will need to "
                                 "scan the QR again after LazeR closes. Check that "

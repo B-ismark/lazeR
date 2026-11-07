@@ -16,14 +16,23 @@ See [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md) for the full picture.
 ## Update checks — the only internet access
 
 Both halves check GitHub's public releases API for a newer tag and show a
-notice (server: a "Version" pill in Details; phone: a card on the connect
+notice (server: a banner with **Update now**, a tray balloon while hidden, and a
+"Version" pill in Details — at launch and every 6 h; phone: a card on the connect
 screen, a dot on the Settings button, and a status line under **Settings →
 Updates**). Anonymous GET, no token. A failure never interrupts; on the phone its
 only trace is that Settings status line ("Couldn't check for updates"). Off via
 `--no-update-check` (server) / **Settings → Updates** (phone, reachable from the
 connect screen too).
 
-**The check never downloads.** The server is notify-only. The phone can download
+**The check never downloads.** Both halves download only on a click. The server
+(frozen Windows exe only) downloads `LazeR.exe` when the user clicks **Update now**:
+same rules as the phone — only `RELEASE_DL_PREFIX` URLs, https after redirects, 100 MB
+/ 10 min caps, SHA-256 against the release's `LazeR.exe.sha256` (while writing and from
+disk), then renames the running exe to `.old`, moves the new one in, starts it with
+`--after-update <pid>` (it waits for us to exit, then `cleanup_after_update()`), and
+quits. The child gets `_clean_child_env()` — a onefile child inheriting `_PYI*` / Tcl
+paths would start from the parent's soon-deleted unpack folder. There's no code
+signature on the exe, so the checksum is the only gate. The phone can download
 and install the new APK, but only when the user taps **Download & install**
 (`data/ApkUpdater.kt`, after Twitwa's updater): only URLs under
 `https://github.com/B-ismark/lazeR/releases/download/`, https after redirects, a
@@ -31,14 +40,15 @@ and install the new APK, but only when the user taps **Download & install**
 release's `LazeR.apk.sha256` and again just before handing it to Android's
 installer (FileProvider + `REQUEST_INSTALL_PACKAGES`). Android itself refuses an
 APK not signed with the release key. **Every release must publish
-`LazeR.apk.sha256`** (`release.yml` and `publish_release.ps1` both do); a release
-without it can only be installed from the release page.
+`LazeR.apk.sha256` and `LazeR.exe.sha256`** (`release.yml` and `publish_release.ps1`
+both do; v2.6.0 and older have no exe checksum); a release without them can only be
+installed from the release page.
 
 `APP_VERSION` in `remote_server.py` **must match** `versionName` in
 `android/app/build.gradle.kts` — a test asserts it, since a stale value would
 either nag forever or never nag. Bump both when you bump either.
 
-These (the check, and the phone's user-started download of a release asset) are
+These (the check, and either half's user-started download of a release asset) are
 the ONLY outbound internet requests in the product; everything else is LAN-only.
 Keep it that way — if a feature needs the internet, that's a design discussion,
 not an implementation detail.

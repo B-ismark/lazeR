@@ -19,6 +19,10 @@ data class Settings(
     // user for it, so without this a stale install stays stale silently — but it is
     // a plain toggle, and off means UpdateChecker is never called at all.
     val updateCheck: Boolean = true,
+    // Phone as the laptop's microphone. Off by default: it records audio, so it's
+    // something to opt into, and most people only want the laptop mic mute (which
+    // stays available either way). Off hides the Laptop/Phone switch.
+    val phoneMic: Boolean = false,
 )
 
 class SettingsStore(context: Context) {
@@ -31,6 +35,7 @@ class SettingsStore(context: Context) {
         haptics = prefs.getBoolean("haptics", true),
         acceleration = prefs.getBoolean("acceleration", true),
         updateCheck = prefs.getBoolean("updateCheck", true),
+        phoneMic = prefs.getBoolean("phoneMic", false),
     )
 
     fun save(s: Settings) {
@@ -41,6 +46,7 @@ class SettingsStore(context: Context) {
             .putBoolean("haptics", s.haptics)
             .putBoolean("acceleration", s.acceleration)
             .putBoolean("updateCheck", s.updateCheck)
+            .putBoolean("phoneMic", s.phoneMic)
             .apply()
     }
 
