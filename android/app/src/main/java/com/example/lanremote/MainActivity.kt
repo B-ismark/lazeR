@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -111,28 +112,41 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
 
     // Phone as microphone: what to explain when it can't start (null: nothing).
     val micNotice = remember { mutableStateOf<RemoteViewModel.PhoneMicResult?>(null) }
-    fun startPhoneMic() {
-        val r = vm.setPhoneMic(true)
-        if (r != RemoteViewModel.PhoneMicResult.Started) micNotice.value = r
+    val startPhoneMic: () -> Unit = remember(vm) {
+        {
+            scope.launch {
+                val r = vm.startPhoneMic()
+                if (r != RemoteViewModel.PhoneMicResult.Started) micNotice.value = r
+            }
+            Unit
+        }
     }
+    // The mic, plus (Android 13+) the notification that says it's in use. Only
+    // the mic is required; without the notification it still works, unannounced
+    // except for Android's own mic indicator.
     val micPermission = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
+        ActivityResultContracts.RequestMultiplePermissions()
     ) { granted ->
-        if (granted) startPhoneMic()
+        if (granted[Manifest.permission.RECORD_AUDIO] == true) startPhoneMic()
         else micNotice.value = RemoteViewModel.PhoneMicResult.Failed
     }
+    fun granted(p: String) =
+        ContextCompat.checkSelfPermission(context, p) == PackageManager.PERMISSION_GRANTED
     // Rebuilt with the launcher, which is the same object across recompositions.
     val onPhoneMic: (Boolean) -> Unit = remember(vm, micPermission) {
         { on ->
+            val wanted = buildList {
+                add(Manifest.permission.RECORD_AUDIO)
+                if (Build.VERSION.SDK_INT >= 33) add("android.permission.POST_NOTIFICATIONS")
+            }.filterNot { granted(it) }
             when {
-                !on -> vm.setPhoneMic(false)
+                !on -> vm.stopPhoneMic()
                 // Explain the laptop side before asking for the mic: a permission
                 // granted for a switch that then can't work reads as a trick.
                 vm.state.value.phoneMicAvailable != true ->
                     micNotice.value = RemoteViewModel.PhoneMicResult.NeedsSetup
-                ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
-                    == PackageManager.PERMISSION_GRANTED -> startPhoneMic()
-                else -> micPermission.launch(Manifest.permission.RECORD_AUDIO)
+                wanted.isEmpty() -> startPhoneMic()
+                else -> micPermission.launch(wanted.toTypedArray())
             }
             Unit
         }
@@ -239,6 +253,30 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
         ReplacePairingDialog(p.existing.name, vm::confirmReplace, vm::cancelReplace)
     }
     micNotice.value?.let { r -> PhoneMicDialog(r) { micNotice.value = null } }
+    state.phoneMicProblem?.let { p -> PhoneMicProblemDialog(p, vm::clearPhoneMicProblem) }
+}
+
+/** Something about the phone mic that went wrong after it started. */
+@Composable
+private fun PhoneMicProblemDialog(problem: PhoneMicProblem, onDismiss: () -> Unit) {
+    val (title, body) = when (problem) {
+        PhoneMicProblem.BackgroundRefused ->
+            "Keep LazeR open" to
+                "Android didn't let the phone mic keep running in the background, so " +
+                "it will go quiet if you lock the phone or switch apps. Keep LazeR on " +
+                "screen while you talk."
+        PhoneMicProblem.Lost ->
+            "The phone mic stopped" to
+                "Something else took the phone's microphone, or Android stopped it, and " +
+                "it couldn't come back. The laptop is back on its own mic. Pick Phone " +
+                "again to retry."
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(body) },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("OK") } },
+    )
 }
 
 /** Why the phone couldn't become the laptop's microphone, and what to do about it. */
@@ -246,13 +284,15 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
 private fun PhoneMicDialog(result: RemoteViewModel.PhoneMicResult, onDismiss: () -> Unit) {
     val (title, body) = when (result) {
         RemoteViewModel.PhoneMicResult.NeedsSetup ->
-            "Set up the laptop first" to
+            "The laptop isn't ready" to
                 "The laptop needs VB-CABLE, a free virtual microphone, to hear your phone.\n\n" +
                 "1. On the laptop, open LazeR → Details and click the Phone microphone " +
-                "pill (or visit vb-audio.com/Cable).\n" +
+                "line (or visit vb-audio.com/Cable).\n" +
                 "2. Install it and restart the laptop.\n" +
                 "3. In Zoom, Teams or Meet, choose “CABLE Output” as the microphone.\n\n" +
-                "Then come back and pick Phone."
+                "Already installed? That same line on the laptop says what's wrong.\n\n" +
+                "Tip: use headphones on the laptop, or its speakers will echo through " +
+                "the phone."
         RemoteViewModel.PhoneMicResult.NeedsSecure ->
             "Pair with the QR code" to
                 "Your voice only travels over the encrypted connection, and this laptop " +

@@ -37,7 +37,8 @@ class PhoneMicService : Service() {
             ServiceCompat.startForeground(this, NOTIFICATION_ID, notification(), type)
         } catch (_: Exception) {
             // Refused (e.g. not started from the foreground): the mic still works
-            // while the app is open, so carry on without the background guarantee.
+            // while the app is open, but goes quiet once it isn't — say so.
+            refused()
             stopSelf()
         }
         // Not restarted by the system: after a crash the view model that owns the
@@ -73,11 +74,21 @@ class PhoneMicService : Service() {
         private const val CHANNEL = "phone_mic"
         private const val NOTIFICATION_ID = 0x4d1c
 
+        /** Told (on the main thread) when Android won't let the mic run in the
+         *  background, so the app can explain instead of going quietly silent. */
+        @Volatile var onRefused: (() -> Unit)? = null
+
+        private fun refused() {
+            android.os.Handler(android.os.Looper.getMainLooper()).post { onRefused?.invoke() }
+        }
+
         fun start(ctx: Context) {
             try {
                 ContextCompat.startForegroundService(ctx, Intent(ctx, PhoneMicService::class.java))
             } catch (_: Exception) {
-                // Not allowed right now (app in the background): foreground use still works.
+                // Not allowed right now (app in the background): foreground use
+                // still works, background use won't.
+                refused()
             }
         }
 

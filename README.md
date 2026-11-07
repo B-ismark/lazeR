@@ -35,6 +35,12 @@ PROTOCOL.md  wire format shared by both
   the laptop: install the free [VB-CABLE](https://vb-audio.com/Cable/) virtual
   microphone (LazeR → Details → Phone microphone links to it), restart, then choose
   **CABLE Output** as the microphone in Zoom, Teams or Meet. Needs QR pairing.
+  Good to know: wear headphones on the laptop (its speakers will otherwise echo
+  through the phone); switching back to **Laptop** doesn't change the meeting app's
+  mic, so pick the laptop mic there too; muting on the phone isn't visible to the
+  meeting app; a Bluetooth headset on the phone isn't used — the phone's own mic is;
+  it streams about 45 KB/s over Wi‑Fi while on, and pauses 20 s after losing the
+  laptop.
 - Keyboard panel types text (`KEY`); the Shortcuts sheet fires shortcuts
   (`COMBO ctrl c`, …) for copy/cut/paste and undo/redo.
 - Two fingers → `SCROLL dx dy` on **both** axes, like a real trackpad; the app at the

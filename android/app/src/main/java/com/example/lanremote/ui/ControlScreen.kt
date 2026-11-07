@@ -551,7 +551,22 @@ private fun LevelCard(
  *  The phone choice works through VB-CABLE on the laptop; tapping it before
  *  that's installed opens the setup steps instead (the caller decides). */
 @Composable
-private fun MicSourceRow(phoneOn: Boolean, onChoose: (Boolean) -> Unit) {
+private fun MicSourceRow(state: UiState, onChoose: (Boolean) -> Unit) {
+    val phoneOn = state.phoneMicOn
+    // One line under the switch for what the user can't see from here, most
+    // urgent first: the meeting app never learns about this switch or the
+    // phone-side mute, so the copy says what to do there.
+    val note: String? = when {
+        phoneOn && state.phoneMicSilenced -> "Another app is using the phone's mic"
+        phoneOn && state.phoneMicAvailable == false ->
+            "The laptop can't play it right now — check LazeR on the laptop"
+        phoneOn && state.phoneMicMuted ->
+            "Muted on the phone — your meeting app won't show it as muted"
+        phoneOn -> "Meeting app mic: “CABLE Output”. Headphones on the laptop avoid echo."
+        state.phoneMicWasOn -> "In your meeting app, switch the mic back from “CABLE Output”"
+        else -> null
+    }
+    Column(Modifier.fillMaxWidth()) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -578,6 +593,12 @@ private fun MicSourceRow(phoneOn: Boolean, onChoose: (Boolean) -> Unit) {
                 }) },
             ) { Text("Phone") }
         }
+    }
+    note?.let {
+        Text(it, style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 6.dp))
+    }
     }
 }
 
@@ -616,7 +637,7 @@ private fun MediaPanel(state: UiState, a: ControlActions) {
             // Shown only when the laptop can take the phone's voice at all (Windows,
             // a new enough LazeR). Not yet set up still shows it: Phone then explains.
             footer = if (state.phoneMicAvailable != null || state.phoneMicOn) {
-                { MicSourceRow(state.phoneMicOn) { on -> a.onButtonTap(); a.onPhoneMic(on) } }
+                { MicSourceRow(state) { on -> a.onButtonTap(); a.onPhoneMic(on) } }
             } else null,
         )
         SectionCard {

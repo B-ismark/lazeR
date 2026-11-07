@@ -91,16 +91,28 @@ mid-gesture can't leave `Alt` stuck. Maps to the Windows three-finger touchpad s
   then `-` if output mute is unknown. The phone shows its mic button only when this
   word is present, so it never offers `SYS micmute` to a laptop that can't do it.
   A fourth word says whether the phone can be the laptop's **microphone**: `1` ready
-  (VB-CABLE's "CABLE Input" is present), `0` the laptop needs VB-CABLE first. It is
-  absent where the feature doesn't exist (not Windows, or an older laptop), and the
-  phone then hides its Laptop/Phone mic switch. Earlier unknown words are `-`.
-- Phone as microphone: the phone records at 16 kHz with Android's call-audio
-  processing (echo cancelling, noise suppression) and sends each 20 ms frame as
-  `AUD`. The laptop plays them into VB-CABLE's "CABLE Input" through a small cushion
-  (60 ms to start, capped at 200 ms so lag can't build up); apps pick "CABLE Output"
-  as their microphone. The audio device is opened when frames arrive and released
-  1.5 s after they stop, so nothing runs while the feature is off. VB-CABLE is a
-  free third-party driver the user installs from vb-audio.com; LazeR only links to it.
+  (VB-CABLE's "CABLE Input" is present and opens), `0` not usable (VB-CABLE missing,
+  or present but failing to open — the laptop's Details pane says which). It is
+  absent where the feature doesn't exist (not Windows, or an older laptop) and while
+  the laptop is still checking at startup; the phone then hides its Laptop/Phone mic
+  switch. Earlier unknown words are `-`.
+- Phone as microphone: the phone records at 16 kHz (or at 48 kHz, low-pass filtered
+  down to 16 kHz) with Android's call-audio processing and sends each 20 ms frame as
+  `AUD`. That processing cancels the *phone's* own playback, not the laptop's
+  speakers, so laptop speakers within earshot of the phone echo into the call —
+  the apps tell the user to wear headphones on the laptop. The laptop plays frames
+  into VB-CABLE's "CABLE Input" through a small cushion: 60 ms to start (anything
+  older is trimmed when playback starts), and one frame dropped whenever more than
+  100 ms has stayed queued for a second, so clock drift can't build lag (hard cap
+  200 ms). Apps pick "CABLE Output" as their microphone. The audio device is opened
+  when frames arrive and released 1.5 s after they stop, so nothing runs while the
+  feature is off. A stream that dies (device removed, driver restarted, no callback
+  for 1 s) is reopened; a failed open backs off up to 30 s and is reported as
+  `0`. Packets that authenticate but belong to an old session or arrive reordered
+  are dropped quietly and don't count toward the flood alarm (a phone streaming
+  audio sends 50 a second). The phone stops recording 20 s after it loses the
+  laptop and resumes on reconnect. VB-CABLE is a free third-party driver the user
+  installs from vb-audio.com; LazeR only links to it.
 - `BRI <0-100>` — current laptop display brightness, sent in answer to `BGET`. Lets
   the phone keep its brightness slider in sync (two-way, same shape as `VOL`).
 - `PONG` — answer to `PING`; lets the phone confirm the laptop is still alive and
