@@ -346,6 +346,17 @@ class RemoteClient {
     fun appSwitch(dir: String) = send("ASW $dir")          // next | prev | end (Alt-Tab session)
     fun system(action: String) = send("SYS $action")       // lock | sleep | mute | micmute
 
+    /** One 20 ms frame of the phone's voice (16 kHz, 16-bit mono PCM). Encrypted
+     *  wire only: the laptop drops it otherwise, and so do we. */
+    fun audio(pcm: ByteArray) {
+        val s = session ?: return
+        if (s.channel == null) return
+        send(s, "AUD " + android.util.Base64.encodeToString(pcm, android.util.Base64.NO_WRAP))
+    }
+
+    /** True while connected over the encrypted (QR-paired) wire. */
+    val isSecure: Boolean get() = session?.channel != null
+
     /** Typing goes out padded when the laptop strips padding; see [padKeyBody]. */
     private fun sendKey(body: String) {
         val s = session ?: return
@@ -457,14 +468,21 @@ class RemoteClient {
     }
 }
 
-/** The laptop's volume, 0..100, whether it is muted, and whether its microphone is
- *  muted — each null from a laptop too old to say, or one that can't tell. */
-data class VolumeReading(val level: Int, val muted: Boolean?, val micMuted: Boolean? = null)
+/** The laptop's volume, 0..100, whether it is muted, whether its microphone is
+ *  muted, and whether the phone can be its microphone (true: ready; false: the
+ *  laptop needs VB-CABLE first) — each null from a laptop too old to say, or one
+ *  that can't tell. */
+data class VolumeReading(
+    val level: Int,
+    val muted: Boolean?,
+    val micMuted: Boolean? = null,
+    val phoneMic: Boolean? = null,
+)
 
-/** A `VOL n [m [c]]` reply, split into words. `m` may be `-` (unknown) when only
- *  the mic's state `c` is known. */
+/** A `VOL n [m [c [p]]]` reply, split into words. A word may be `-` (unknown)
+ *  when a later one is known. */
 internal fun parseVolume(words: List<String>): VolumeReading? {
     val level = words.getOrNull(1)?.toIntOrNull() ?: return null
     fun flag(i: Int) = when (words.getOrNull(i)) { "1" -> true; "0" -> false; else -> null }
-    return VolumeReading(level, flag(2), flag(3))
+    return VolumeReading(level, flag(2), flag(3), flag(4))
 }

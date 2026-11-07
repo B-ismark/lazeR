@@ -11,6 +11,8 @@ import android.os.Build
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.lanremote.audio.PhoneMic
+import com.example.lanremote.audio.PhoneMicService
 import com.example.lanremote.data.ApkUpdater
 import com.example.lanremote.data.Device
 import com.example.lanremote.data.DeviceStore
@@ -103,6 +105,11 @@ data class UiState(
     val volume: Float = 50f,
     val muted: Boolean? = null,        // null: the laptop doesn't report it
     val micMuted: Boolean? = null,     // null: no mic button (laptop can't report it)
+    // Can the phone be the laptop's microphone? null: the laptop can't (too old, or
+    // not Windows) so no switch is shown; false: it needs VB-CABLE installed first.
+    val phoneMicAvailable: Boolean? = null,
+    val phoneMicOn: Boolean = false,       // the phone is the laptop's mic right now
+    val phoneMicMuted: Boolean = false,    // muted on the phone (sends nothing)
     val brightness: Float = 50f,
     val brightnessAvailable: Boolean = false,
     // NOTE: the keyboard's staging text deliberately does NOT live here. It used to,
@@ -178,6 +185,10 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     private var lastUserVolumeMs: Long = 0
     private var lastUserMuteMs: Long = 0
     private var lastUserMicMs: Long = 0
+    // The phone as the laptop's mic. Frames go out through the client, which drops
+    // them while there's no session, so a reconnect needs nothing here: the voice
+    // resumes when the link does.
+    private val phoneMic = PhoneMic { client.audio(it) }
     private var lastUserBrightnessMs: Long = 0
     private var lastInteractionMs: Long = 0   // drives adaptive health-poll backoff
     private var current: Device? = null   // device we're connected to / reconnecting
@@ -688,7 +699,8 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         update { it.copy(conn = ConnState.Connecting, error = null, errorDetail = null,
             scanError = null, deviceName = dev.name,
             muted = if (keepMute) it.muted else null,
-            micMuted = if (keepMute) it.micMuted else null) }
+            micMuted = if (keepMute) it.micMuted else null,
+            phoneMicAvailable = if (keepMute) it.phoneMicAvailable else null) }
         connectJob = viewModelScope.launch {
             val (connected, outcome) = connectResolving(dev, 2000)
             if (outcome.result == ConnectResult.Cancelled) return@launch
@@ -939,6 +951,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     // reached the laptop doesn't flip the button back.
                     if (use && now - lastUserMuteMs > 1200) update { it.copy(muted = v.muted) }
                     if (use && now - lastUserMicMs > 1200) update { it.copy(micMuted = v.micMuted) }
+                    if (use) update { it.copy(phoneMicAvailable = v.phoneMic) }
                     true
                 } else {
                     skipVolReading = true
@@ -1116,6 +1129,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         // An intentional leave: don't auto-reconnect next launch.
         if (forget) settingsStore.lastDeviceId = null
         current = null
+        setPhoneMic(false)                  // a deliberate leave hands the mic back
         client.disconnect()
         holdWifi(false)                     // let the radio power-save again
         // Clear the error too. The reconnect loop now writes its diagnosis into
@@ -1231,6 +1245,38 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         client.system(action)
     }
 
+    // --- phone as microphone ---
+    enum class PhoneMicResult { Started, Stopped, NeedsSetup, NeedsSecure, Failed }
+
+    /** Make the phone the laptop's microphone (on) or hand it back (off). The caller
+     *  must already hold RECORD_AUDIO, and the app must be on screen: Android only
+     *  lets a microphone service start from the foreground. */
+    fun setPhoneMic(on: Boolean): PhoneMicResult {
+        val app = getApplication<Application>()
+        if (!on) {
+            if (phoneMic.isRunning) phoneMic.stop()
+            PhoneMicService.stop(app)
+            update { it.copy(phoneMicOn = false, phoneMicMuted = false) }
+            return PhoneMicResult.Stopped
+        }
+        if (_state.value.phoneMicAvailable != true) return PhoneMicResult.NeedsSetup
+        if (!client.isSecure) return PhoneMicResult.NeedsSecure
+        PhoneMicService.start(app)
+        phoneMic.muted = false
+        if (!phoneMic.start()) {
+            PhoneMicService.stop(app)
+            return PhoneMicResult.Failed
+        }
+        update { it.copy(phoneMicOn = true, phoneMicMuted = false) }
+        return PhoneMicResult.Started
+    }
+
+    fun togglePhoneMicMute() {
+        val m = !phoneMic.muted
+        phoneMic.muted = m
+        update { it.copy(phoneMicMuted = m) }
+    }
+
     // --- volume ---
     fun setVolume(v: Float) {
         lastUserVolumeMs = System.currentTimeMillis()
@@ -1281,6 +1327,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         healthJob?.cancel()
         reconnectJob?.cancel()
+        setPhoneMic(false)
         stopDiscovery()
         client.disconnect()
         holdWifi(false)   // safety net: never leak the Wi-Fi lock if the VM dies mid-session

@@ -86,6 +86,8 @@ import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Keyboard
+import androidx.compose.material.icons.filled.LaptopWindows
+import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.PanTool
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
@@ -131,6 +133,9 @@ import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -202,6 +207,8 @@ class ControlActions(
     val onSpecialKey: (String) -> Unit,
     val onCombo: (String) -> Unit,
     val onSystem: (String) -> Unit,
+    val onPhoneMic: (Boolean) -> Unit = {},   // true: the phone becomes the laptop's mic
+    val onPhoneMicMute: () -> Unit = {},      // mute/unmute the phone's mic, on the phone
     val settings: SettingsActions,
     val onButtonTap: () -> Unit,        // light haptic for generic button presses
     val onDismissGestureHint: () -> Unit,
@@ -512,6 +519,7 @@ private fun LevelCard(
     onStep: (Float) -> Unit,
     iconAction: LevelIconAction? = null,
     trailing: Pair<androidx.compose.ui.graphics.vector.ImageVector, LevelIconAction>? = null,
+    footer: (@Composable () -> Unit)? = null,
 ) {
     SectionCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -533,6 +541,42 @@ private fun LevelCard(
             PressIconButton(onClick = { onStep(5f) }, size = 44.dp, shape = RoundedCornerShape(14.dp)) {
                 Icon(Icons.Filled.Add, contentDescription = "$label up")
             }
+        }
+        footer?.invoke()
+    }
+}
+
+/** Which microphone the laptop hears: its own, or this phone's. The chosen side
+ *  shows a check, the other its device glyph (the standard segmented pattern).
+ *  The phone choice works through VB-CABLE on the laptop; tapping it before
+ *  that's installed opens the setup steps instead (the caller decides). */
+@Composable
+private fun MicSourceRow(phoneOn: Boolean, onChoose: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("Mic", style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier.padding(end = 12.dp))
+        SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) {
+            SegmentedButton(
+                selected = !phoneOn,
+                onClick = { if (phoneOn) onChoose(false) },
+                shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+                icon = { SegmentedButtonDefaults.Icon(!phoneOn, inactiveContent = {
+                    Icon(Icons.Filled.LaptopWindows, null,
+                        modifier = Modifier.size(SegmentedButtonDefaults.IconSize))
+                }) },
+            ) { Text("Laptop") }
+            SegmentedButton(
+                selected = phoneOn,
+                onClick = { if (!phoneOn) onChoose(true) },
+                shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+                icon = { SegmentedButtonDefaults.Icon(phoneOn, inactiveContent = {
+                    Icon(Icons.Filled.PhoneAndroid, null,
+                        modifier = Modifier.size(SegmentedButtonDefaults.IconSize))
+                }) },
+            ) { Text("Phone") }
         }
     }
 }
@@ -558,10 +602,22 @@ private fun MediaPanel(state: UiState, a: ControlActions) {
             // Meet, Zoom, Teams and Android itself use, and the same rule the speaker
             // badge follows. Hidden when micMuted is null: an older laptop, or one
             // with no mic, can't act on the toggle or report it.
-            trailing = state.micMuted?.let { m ->
+            // With the phone as the mic, the same badge mutes the phone instead —
+            // one mute control, whichever mic is live.
+            trailing = if (state.phoneMicOn) {
+                (if (state.phoneMicMuted) Icons.Filled.MicOff else Icons.Filled.Mic) to
+                    LevelIconAction("Mute phone microphone", state.phoneMicMuted) {
+                        a.onButtonTap(); a.onPhoneMicMute()
+                    }
+            } else state.micMuted?.let { m ->
                 (if (m) Icons.Filled.MicOff else Icons.Filled.Mic) to
                     LevelIconAction("Mute microphone", m) { a.onButtonTap(); a.onSystem("micmute") }
             },
+            // Shown only when the laptop can take the phone's voice at all (Windows,
+            // a new enough LazeR). Not yet set up still shows it: Phone then explains.
+            footer = if (state.phoneMicAvailable != null || state.phoneMicOn) {
+                { MicSourceRow(state.phoneMicOn) { on -> a.onButtonTap(); a.onPhoneMic(on) } }
+            } else null,
         )
         SectionCard {
             Row(

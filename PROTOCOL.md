@@ -34,7 +34,7 @@ Every datagram is a single packet. No framing beyond the datagram boundary.
 | `<TOKEN> MUP`                 | Release left button (drag-lock end). Idempotent; the phone sends it twice, since a lost one would leave the button held. | none |
 | `<TOKEN> PING`                | Liveness probe (reconnect watchdog).                 | `PONG`             |
 | `<TOKEN> VOL <0-100>`         | Set system volume to absolute percent.               | none               |
-| `<TOKEN> VGET`                | Ask server for current system volume.                | `VOL <0-100> [0\|1]` |
+| `<TOKEN> VGET`                | Ask server for current system volume.                | `VOL <0-100> [m [c [p]]]` |
 | `<TOKEN> BRIGHT <0-100>`      | Set display brightness to absolute percent.          | none               |
 | `<TOKEN> BGET`                | Ask server for current display brightness.           | `BRI <0-100>`      |
 | `<TOKEN> MEDIA <action>`      | `play_pause` \| `next` \| `prev`.                    | none               |
@@ -43,6 +43,7 @@ Every datagram is a single packet. No framing beyond the datagram boundary.
 | `<TOKEN> COMBO <mods..> <key>`| Hold modifiers, tap key. e.g. `ctrl c`, `alt tab`.   | none               |
 | `<TOKEN> ASW <action>`        | App-switch session: `next`\|`prev`\|`end`.           | none               |
 | `<TOKEN> SYS <action>`        | `lock` \| `sleep` \| `mute` \| `micmute` (toggles the laptop's mic). | none |
+| `<TOKEN> AUD <base64>`        | 20 ms of the phone's voice: 16 kHz, 16-bit little-endian mono PCM (640 bytes). **Encrypted wire only**; dropped otherwise, and while the panic chord is latched. | none |
 | `<TOKEN> BYE`                 | Client disconnects; server forgets it.               | none               |
 
 `KEYSP <name>` names: `enter`, `backspace`, `space`, `tab`, `esc`, `delete`,
@@ -89,6 +90,17 @@ mid-gesture can't leave `Alt` stuck. Maps to the Windows three-finger touchpad s
   or PulseAudio's default source), sent only when it can be read; the second word is
   then `-` if output mute is unknown. The phone shows its mic button only when this
   word is present, so it never offers `SYS micmute` to a laptop that can't do it.
+  A fourth word says whether the phone can be the laptop's **microphone**: `1` ready
+  (VB-CABLE's "CABLE Input" is present), `0` the laptop needs VB-CABLE first. It is
+  absent where the feature doesn't exist (not Windows, or an older laptop), and the
+  phone then hides its Laptop/Phone mic switch. Earlier unknown words are `-`.
+- Phone as microphone: the phone records at 16 kHz with Android's call-audio
+  processing (echo cancelling, noise suppression) and sends each 20 ms frame as
+  `AUD`. The laptop plays them into VB-CABLE's "CABLE Input" through a small cushion
+  (60 ms to start, capped at 200 ms so lag can't build up); apps pick "CABLE Output"
+  as their microphone. The audio device is opened when frames arrive and released
+  1.5 s after they stop, so nothing runs while the feature is off. VB-CABLE is a
+  free third-party driver the user installs from vb-audio.com; LazeR only links to it.
 - `BRI <0-100>` — current laptop display brightness, sent in answer to `BGET`. Lets
   the phone keep its brightness slider in sync (two-way, same shape as `VOL`).
 - `PONG` — answer to `PING`; lets the phone confirm the laptop is still alive and

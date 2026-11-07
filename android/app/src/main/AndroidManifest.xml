@@ -12,6 +12,12 @@
          release APK to Android's installer. Android still refuses any APK not
          signed by LazeR's own key. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Phone as the laptop's microphone (audio/PhoneMic). Asked for only when the
+         user picks Phone mic; the foreground service keeps it working with the
+         screen off, under a "Phone is the laptop's microphone" notification. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 
     <application
         android:allowBackup="false"
@@ -38,6 +44,11 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/update_paths" />
         </provider>
+
+        <service
+            android:name=".audio.PhoneMicService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
 
         <activity
             android:name=".MainActivity"

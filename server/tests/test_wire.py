@@ -3170,6 +3170,140 @@ class SharedContract(unittest.TestCase):
         self.assertEqual(rs.volume_reply(42, None, None), "VOL 42")
 
 
+class _FakeStream:
+    def __init__(self, **kw):
+        self.kw = kw
+        self.started = self.closed = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeSD:
+    """Stands in for sounddevice: a WASAPI and an MME copy of VB-CABLE."""
+    def __init__(self, cable=True):
+        self.cable = cable
+        self.streams = []
+        self.reinits = 0
+
+    def query_hostapis(self):
+        return [{"name": "MME"}, {"name": "Windows WASAPI"}]
+
+    def query_devices(self):
+        devs = [{"name": "Speakers", "max_output_channels": 2, "hostapi": 1}]
+        if self.cable:
+            devs += [{"name": "CABLE Input (VB-Audio Virtual C", "max_output_channels": 2, "hostapi": 0},
+                     {"name": "CABLE Input (VB-Audio Virtual Cable)", "max_output_channels": 2, "hostapi": 1},
+                     {"name": "CABLE Output (VB-Audio Virtual Cable)", "max_output_channels": 0, "hostapi": 1}]
+        return devs
+
+    def _terminate(self):
+        self.reinits += 1
+
+    def _initialize(self):
+        pass
+
+    def WasapiSettings(self, auto_convert=False):
+        return ("wasapi", auto_convert)
+
+    def RawOutputStream(self, **kw):
+        st = _FakeStream(**kw)
+        self.streams.append(st)
+        return st
+
+
+class PhoneMic(unittest.TestCase):
+    """The phone as a microphone, played into VB-CABLE."""
+
+    def test_picks_the_wasapi_cable_input(self):
+        sd = _FakeSD()
+        self.assertEqual(rs.pick_cable_device(sd.query_devices(), sd.query_hostapis()), 2)
+        self.assertIsNone(rs.pick_cable_device(_FakeSD(cable=False).query_devices(),
+                                               sd.query_hostapis()))
+
+    def test_status_words(self):
+        self.assertEqual(rs.PhoneMicSink(None).phone_word(), None)
+        self.assertEqual(rs.PhoneMicSink(_FakeSD(cable=False)).phone_word(), "0")
+        self.assertEqual(rs.PhoneMicSink(_FakeSD()).phone_word(), "1")
+
+    def test_volume_reply_carries_phone_mic(self):
+        self.assertEqual(rs.volume_reply(42, False, True, "1"), "VOL 42 0 1 1")
+        self.assertEqual(rs.volume_reply(42, None, None, "0"), "VOL 42 - - 0")
+        self.assertEqual(rs.volume_reply(42, True, None, None), "VOL 42 1")
+
+    def test_decode_audio(self):
+        import base64 as b64
+        self.assertEqual(rs.decode_audio(b64.b64encode(b"\x01\x02").decode()), b"\x01\x02")
+        self.assertIsNone(rs.decode_audio("not base64!"))
+        self.assertIsNone(rs.decode_audio(""))
+        self.assertIsNone(rs.decode_audio("A" * (rs.PHONE_MIC_MAX_B64 + 4)))
+
+    def test_nothing_opens_until_the_phone_streams(self):
+        sd = _FakeSD()
+        sink = rs.PhoneMicSink(sd)
+        self.assertEqual(sd.streams, [])
+        self.assertEqual(sink.status(), "ready")
+
+    def test_streams_then_releases_the_device(self):
+        sd = _FakeSD()
+        sink = rs.PhoneMicSink(sd)
+        with mock.patch.object(rs, "PHONE_MIC_IDLE_S", 0.4):
+            sink.feed(b"\x00\x01" * rs.PHONE_MIC_FRAME)
+            deadline = time.monotonic() + 2
+            while not sd.streams and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(sd.streams), 1)
+            st = sd.streams[0]
+            self.assertTrue(st.started)
+            self.assertEqual(st.kw["samplerate"], 16000)
+            self.assertEqual(st.kw["device"], 2)
+            self.assertEqual(st.kw["extra_settings"], ("wasapi", True))
+            time.sleep(0.05)
+            self.assertEqual(sink.status(), "live")
+            deadline = time.monotonic() + 3
+            while not st.closed and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(st.closed, "the device is released once frames stop")
+            self.assertEqual(sink.status(), "ready")
+
+    def test_callback_waits_for_a_cushion_then_plays(self):
+        sink = rs.PhoneMicSink(_FakeSD())
+        n = rs.PHONE_MIC_FRAME
+        out = bytearray(n * 2)
+        sink._buf += b"\x11" * (rs.PHONE_MIC_PREBUF - 2)
+        sink._callback(out, n, None, None)
+        self.assertEqual(bytes(out), b"\x00" * (n * 2), "silence until 60 ms are queued")
+        sink._buf += b"\x11" * 2
+        sink._callback(out, n, None, None)
+        self.assertEqual(bytes(out), b"\x11" * (n * 2))
+
+    def test_buffer_is_capped(self):
+        sink = rs.PhoneMicSink(_FakeSD(cable=False))
+        sink._scanned = time.monotonic()            # don't start a scan worker
+        for _ in range(100):
+            sink.feed(b"\x01\x02" * rs.PHONE_MIC_FRAME)
+        self.assertLessEqual(len(sink._buf), rs.PHONE_MIC_MAX_BUF)
+        self.assertEqual(len(sink._buf) % 2, 0)
+
+    def test_missing_cable_is_looked_for_again_when_the_phone_streams(self):
+        sd = _FakeSD(cable=False)
+        sink = rs.PhoneMicSink(sd)
+        sd.cable = True                              # installed meanwhile
+        sink._scanned = 0.0
+        sink.feed(b"\x00\x00" * rs.PHONE_MIC_FRAME)
+        deadline = time.monotonic() + 2
+        while sink.status() == "missing" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertNotEqual(sink.status(), "missing")
+        self.assertGreaterEqual(sd.reinits, 1)
+
+
 class PortBusyDiagnosis(unittest.TestCase):
     """A failed bind names the real culprit instead of always blaming a second LazeR."""
 
