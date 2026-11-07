@@ -577,7 +577,7 @@ class PhoneMicSink:
     Costs nothing while no phone streams: the audio thread sleeps on the event
     with no timeout, no device is open and nothing is scanned."""
 
-    def __init__(self, backend=None, loader=None):
+    def __init__(self, backend=None, loader=None, start=True):
         self._sd = backend
         self._loader = loader
         self._lock = threading.Lock()
@@ -598,11 +598,24 @@ class PhoneMicSink:
         self._retry_at = 0.0        # no new open attempt before this
         self.error = None           # why VB-CABLE wouldn't open, for the GUI
         self.supported = backend is not None or loader is not None
+        self._started = False
         if backend is not None:
             self._scan(refresh=False)
-        if self.supported:
-            threading.Thread(target=self._run, daemon=True,
-                             name="LazeR-phone-mic").start()
+        if start:
+            self.start()
+
+    def start(self):
+        """Start the audio thread (once). The module-level sink is created
+        stopped and started by serve_forever: a thread loading PortAudio at
+        import time was still inside it when a short command (--help,
+        --setup-firewall) exited, and the interpreter's shutdown under it
+        killed the process (0xC0000409) — the v2.6.0 build check caught that."""
+        with self._lock:
+            if self._started or not self.supported:
+                return
+            self._started = True
+        threading.Thread(target=self._run, daemon=True,
+                         name="LazeR-phone-mic").start()
 
     @classmethod
     def create(cls):
@@ -612,7 +625,7 @@ class PhoneMicSink:
         def load():
             import sounddevice
             return sounddevice
-        return cls(loader=load)
+        return cls(loader=load, start=False)
 
     # ── state ──
     def status(self):
@@ -4518,6 +4531,7 @@ def serve_forever(wire, emit, net, hostname):
     starts, so a restart is also the correct recovery for a socket that has gone bad.
     Session state is not carried over — the phone re-handshakes within seconds,
     which is a blink next to needing a human to restart the app."""
+    phone_mic.start()
     failures = 0
     while not _stop.is_set():
         started = time.monotonic()
@@ -6624,6 +6638,7 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
     print(f"  Laptop IP : {ip or 'no network yet'}")
     print(f"  Port      : {PORT}")
     if phone_mic.supported:
+        phone_mic.start()
         # Startup is looking for the cable off-thread; a moment is plenty.
         for _ in range(30):
             if phone_mic.status() != "checking":

@@ -3243,6 +3243,26 @@ class PhoneMic(unittest.TestCase):
         self.assertIsNone(rs.pick_cable_device(_FakeSD(cable=False).query_devices(),
                                                sd.query_hostapis()))
 
+    def test_module_sink_waits_for_the_server_to_start_it(self):
+        # A short command (--help) must exit with no audio thread inside PortAudio:
+        # v2.6.0's first build died at exit (0xC0000409) because one was.
+        loads = []
+        sink = rs.PhoneMicSink(loader=lambda: loads.append(1) or _FakeSD(), start=False)
+        time.sleep(0.05)
+        self.assertEqual(loads, [])
+        self.assertEqual(sink.status(), "checking")
+        sink.start()
+        sink.start()   # idempotent: one thread, one load
+        for _ in range(100):
+            if sink.status() != "checking":
+                break
+            time.sleep(0.02)
+        self.assertEqual(sink.status(), "ready")
+        self.assertEqual(loads, [1])
+
+    def test_the_shared_sink_is_created_stopped(self):
+        self.assertFalse(rs.phone_mic._started)
+
     def test_status_words(self):
         self.assertEqual(rs.PhoneMicSink(None).phone_word(), None)
         self.assertEqual(rs.PhoneMicSink(_FakeSD(cable=False)).phone_word(), "0")
