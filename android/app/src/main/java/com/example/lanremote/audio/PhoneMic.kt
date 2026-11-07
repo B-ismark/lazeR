@@ -70,7 +70,10 @@ class PhoneMic(private val onFrame: (ByteArray) -> Unit) {
                     val pcm = if (factor == 3) downsample3(raw) else raw
                     onFrame(toBytes(pcm))
                 }
+            } catch (_: Exception) {
+                // Anything unexpected ends this recording rather than the app.
             } finally {
+                running.set(false)   // isRunning tells the truth if the loop died
                 try { rec.stop() } catch (_: Exception) {}
                 effects.forEach { it.release() }
                 rec.release()

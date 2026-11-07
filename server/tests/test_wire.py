@@ -3232,6 +3232,38 @@ class PhoneMic(unittest.TestCase):
         self.assertEqual(rs.PhoneMicSink(_FakeSD(cable=False)).phone_word(), "0")
         self.assertEqual(rs.PhoneMicSink(_FakeSD()).phone_word(), "1")
 
+    def _wait_loaded(self, sink):
+        deadline = time.monotonic() + 2
+        while sink.status() == "checking" and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def test_audio_library_starts_off_the_calling_thread(self):
+        gate = threading.Event()
+        sd = _FakeSD()
+
+        def slow_load():
+            gate.wait(2)
+            return sd
+        sink = rs.PhoneMicSink(loader=slow_load)
+        # Back at once, still looking: the phone is told nothing yet.
+        self.assertEqual(sink.status(), "checking")
+        self.assertIsNone(sink.phone_word())
+        sink.feed(b"\x00\x01" * rs.PHONE_MIC_FRAME)   # ignored, never raises
+        gate.set()
+        self._wait_loaded(sink)
+        self.assertEqual(sink.phone_word(), "1")
+
+    def test_a_failed_import_means_no_feature(self):
+        def broken():
+            raise OSError("PortAudio library not found")
+        with mock.patch("sys.stdout"):
+            sink = rs.PhoneMicSink(loader=broken)
+            deadline = time.monotonic() + 2
+            while sink.supported and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertEqual(sink.status(), "unsupported")
+        self.assertIsNone(sink.phone_word())
+
     def test_volume_reply_carries_phone_mic(self):
         self.assertEqual(rs.volume_reply(42, False, True, "1"), "VOL 42 0 1 1")
         self.assertEqual(rs.volume_reply(42, None, None, "0"), "VOL 42 - - 0")

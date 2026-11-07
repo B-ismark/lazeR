@@ -688,6 +688,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         } else dev0
         // Another laptop's mute state isn't this one's; the first VGET fills it in.
         val keepMute = current?.id == dev.id
+        // Nor is the phone mic: a voice meant for one laptop must not start coming
+        // out of another's.
+        if (!keepMute && phoneMic.isRunning) setPhoneMic(false)
         current = dev
         reconnectJob?.cancel()
         // Cancel the watchdog too: a health loop left alive could declare the link
@@ -952,6 +955,9 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
                     if (use && now - lastUserMuteMs > 1200) update { it.copy(muted = v.muted) }
                     if (use && now - lastUserMicMs > 1200) update { it.copy(micMuted = v.micMuted) }
                     if (use) update { it.copy(phoneMicAvailable = v.phoneMic) }
+                    // The recording ended on its own (the mic was taken away): say so
+                    // instead of showing Phone over a mic that sends nothing.
+                    if (_state.value.phoneMicOn && !phoneMic.isRunning) setPhoneMic(false)
                     true
                 } else {
                     skipVolReading = true
@@ -1261,12 +1267,11 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (_state.value.phoneMicAvailable != true) return PhoneMicResult.NeedsSetup
         if (!client.isSecure) return PhoneMicResult.NeedsSecure
-        PhoneMicService.start(app)
         phoneMic.muted = false
-        if (!phoneMic.start()) {
-            PhoneMicService.stop(app)
-            return PhoneMicResult.Failed
-        }
+        if (!phoneMic.start()) return PhoneMicResult.Failed
+        // Only once recording works: a foreground service started and then stopped
+        // before it reaches startForeground is one Android punishes with a crash.
+        PhoneMicService.start(app)
         update { it.copy(phoneMicOn = true, phoneMicMuted = false) }
         return PhoneMicResult.Started
     }

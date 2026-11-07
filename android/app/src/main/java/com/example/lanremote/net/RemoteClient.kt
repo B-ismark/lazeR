@@ -55,6 +55,10 @@ class RemoteClient {
         val padKeys: Boolean,
     ) {
         val sender: ExecutorService = Executors.newSingleThreadExecutor()
+        // Voice frames queued but not yet sent. A stalled radio would otherwise
+        // let them pile up: the voice falls ever further behind, and the trackpad's
+        // packets wait in line behind it.
+        val audioPending = java.util.concurrent.atomic.AtomicInteger(0)
         private val sendLock = Any()   // serialize counter-assign + send
 
         /** Blocking send on the current thread. Encrypted if on the secure wire.
@@ -351,7 +355,24 @@ class RemoteClient {
     fun audio(pcm: ByteArray) {
         val s = session ?: return
         if (s.channel == null) return
-        send(s, "AUD " + android.util.Base64.encodeToString(pcm, android.util.Base64.NO_WRAP))
+        // More than ~60 ms already waiting: drop this one. Late audio is worse
+        // than a gap, and the laptop smooths over a missing frame.
+        if (s.audioPending.get() >= 3) return
+        val body = "AUD " + android.util.Base64.encodeToString(pcm, android.util.Base64.NO_WRAP)
+        s.audioPending.incrementAndGet()
+        try {
+            s.sender.execute {
+                try {
+                    s.sendNow(body)
+                } catch (_: Exception) {
+                    // lossy by design
+                } finally {
+                    s.audioPending.decrementAndGet()
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            s.audioPending.decrementAndGet()
+        }
     }
 
     /** True while connected over the encrypted (QR-paired) wire. */
