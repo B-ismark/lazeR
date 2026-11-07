@@ -357,6 +357,15 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
     fun setHaptics(v: Boolean) = updateSettings { it.copy(haptics = v) }
     fun setAcceleration(v: Boolean) = updateSettings { it.copy(acceleration = v) }
 
+    /** Off also stops the phone mic if it's live: the switch disappears with the
+     *  setting, and a mic left recording with no visible control is the one thing
+     *  this must never do. */
+    fun setPhoneMicEnabled(v: Boolean) {
+        if (!v && _state.value.phoneMicOn) stopPhoneMic()
+        if (!v) update { it.copy(phoneMicWasOn = false, phoneMicProblem = null) }
+        updateSettings { it.copy(phoneMic = v) }
+    }
+
     /** Turning the check off also clears any banner already on screen — leaving it
      *  up would look like the setting hadn't taken. Turning it on re-checks now
      *  rather than waiting out the throttle, so the toggle gives visible feedback. */
@@ -1286,6 +1295,7 @@ class RemoteViewModel(app: Application) : AndroidViewModel(app) {
      *  so it happens off the main thread. */
     suspend fun startPhoneMic(): PhoneMicResult {
         if (_state.value.phoneMicOn) return PhoneMicResult.Started
+        if (!_state.value.settings.phoneMic) return PhoneMicResult.Failed
         if (_state.value.phoneMicAvailable != true) return PhoneMicResult.NeedsSetup
         if (!client.isSecure) return PhoneMicResult.NeedsSecure
         phoneMic.muted = false

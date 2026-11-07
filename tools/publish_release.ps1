@@ -168,12 +168,16 @@ Write-Host "Signer OK: $got" -ForegroundColor Green
 $sha = (Get-FileHash $apkOut -Algorithm SHA256).Hash.ToLower()
 $shaOut = Join-Path $root "dist\LazeR.apk.sha256"
 [IO.File]::WriteAllText($shaOut, "$sha  LazeR.apk`n", [Text.Encoding]::ASCII)
+# ...and the laptop's in-app updater installs LazeR.exe only if it matches this.
+$exeSha = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+$exeShaOut = Join-Path $root "dist\LazeR.exe.sha256"
+[IO.File]::WriteAllText($exeShaOut, "$exeSha  LazeR.exe`n", [Text.Encoding]::ASCII)
 
 # --- create or refresh the release --------------------------------------------
 & gh release view $Tag --repo $repo *>$null
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Release $Tag exists - uploading assets (--clobber)." -ForegroundColor Cyan
-    & gh release upload $Tag $exe $apkOut $shaOut --repo $repo --clobber
+    & gh release upload $Tag $exe $exeShaOut $apkOut $shaOut --repo $repo --clobber
 } else {
     Write-Host "Creating release $Tag." -ForegroundColor Cyan
     if ($Notes) {
@@ -181,12 +185,12 @@ if ($LASTEXITCODE -eq 0) {
         # --notes as globs and choke ("no matches found for ...").
         $nf = Join-Path $env:TEMP "lazer_release_notes.txt"
         $Notes | Set-Content -Path $nf -Encoding utf8
-        & gh release create $Tag $exe $apkOut $shaOut --repo $repo --title $Title --notes-file $nf
+        & gh release create $Tag $exe $exeShaOut $apkOut $shaOut --repo $repo --title $Title --notes-file $nf
         Remove-Item $nf -ErrorAction SilentlyContinue
     } else {
-        & gh release create $Tag $exe $apkOut $shaOut --repo $repo --title $Title --generate-notes
+        & gh release create $Tag $exe $exeShaOut $apkOut $shaOut --repo $repo --title $Title --generate-notes
     }
 }
 if ($LASTEXITCODE -ne 0) { Write-Host "Release publish failed." -ForegroundColor Red; exit 1 }
-Write-Host "Published $Tag with LazeR.exe + LazeR.apk + LazeR.apk.sha256." -ForegroundColor Green
+Write-Host "Published $Tag with LazeR.exe (+ .sha256) and LazeR.apk (+ .sha256)." -ForegroundColor Green
 & gh release view $Tag --repo $repo --web *>$null

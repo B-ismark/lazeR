@@ -164,6 +164,7 @@ private fun RemoteApp(vm: RemoteViewModel = viewModel()) {
             onHaptics = vm::setHaptics,
             onAcceleration = vm::setAcceleration,
             onUpdateCheck = vm::setUpdateCheck,
+            onPhoneMicSetting = vm::setPhoneMicEnabled,
             onCheckUpdateNow = vm::checkForUpdatesNow,
             // The fallback when the app can't install a release itself. A device
             // with no browser at all would throw; a toast rather than the error

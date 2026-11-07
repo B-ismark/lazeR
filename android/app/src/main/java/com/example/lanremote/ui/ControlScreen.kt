@@ -636,7 +636,9 @@ private fun MediaPanel(state: UiState, a: ControlActions) {
             },
             // Shown only when the laptop can take the phone's voice at all (Windows,
             // a new enough LazeR). Not yet set up still shows it: Phone then explains.
-            footer = if (state.phoneMicAvailable != null || state.phoneMicOn) {
+            // Only when the user turned the feature on in Settings (off by default).
+            footer = if (state.phoneMicOn ||
+                (state.settings.phoneMic && state.phoneMicAvailable != null)) {
                 { MicSourceRow(state) { on -> a.onButtonTap(); a.onPhoneMic(on) } }
             } else null,
         )
