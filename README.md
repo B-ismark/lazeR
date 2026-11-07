@@ -29,6 +29,12 @@ PROTOCOL.md  wire format shared by both
 - Mic button (right of the volume title) → `SYS micmute`: mutes the laptop's
   microphone for every app, and shows the real state (it hides on a laptop with no
   mic, or one too old to report it).
+- **Phone as microphone** (Windows): the Mic switch under the volume slider picks
+  **Laptop** or **Phone**. On Phone, your voice streams to the laptop over the
+  encrypted link (`AUD`) and the mic badge mutes the phone instead. One-time setup on
+  the laptop: install the free [VB-CABLE](https://vb-audio.com/Cable/) virtual
+  microphone (LazeR → Details → Phone microphone links to it), restart, then choose
+  **CABLE Output** as the microphone in Zoom, Teams or Meet. Needs QR pairing.
 - Keyboard panel types text (`KEY`); the Shortcuts sheet fires shortcuts
   (`COMBO ctrl c`, …) for copy/cut/paste and undo/redo.
 - Two fingers → `SCROLL dx dy` on **both** axes, like a real trackpad; the app at the

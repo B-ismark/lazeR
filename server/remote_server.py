@@ -520,6 +520,238 @@ def make_mic():
 get_mic_muted, toggle_mic_mute = make_mic()
 
 
+# ── phone as microphone (via VB-CABLE) ────────────────────────────────────────
+# Windows only lists microphones that a signed driver provides, and signing our
+# own costs money every year. So we borrow one: VB-CABLE (free for end users,
+# https://vb-audio.com/Cable/) is a signed virtual cable whose playback side,
+# "CABLE Input", comes out of its recording side, "CABLE Output", which every app
+# lists as a microphone. We play the phone's voice into the first; Zoom / Teams /
+# Meet pick the second. The user installs VB-CABLE themselves — its licence does
+# not let us bundle it — and LazeR never downloads anything for them.
+#
+# Wire: the phone sends "AUD <base64>" — 20 ms of 16 kHz, 16-bit mono PCM — only on
+# the encrypted wire (a voice never crosses the LAN in the clear). The VGET reply
+# carries the readiness as its fourth word (see volume_reply).
+PHONE_MIC_RATE = 16000
+PHONE_MIC_FRAME = 320                    # samples per 20 ms frame
+PHONE_MIC_MAX_BUF = 16000 * 2 // 5       # bytes: 200 ms; older audio is dropped
+PHONE_MIC_PREBUF = 16000 * 2 * 3 // 50   # bytes: 60 ms cushion against Wi-Fi jitter
+PHONE_MIC_IDLE_S = 1.5                   # no frames this long → release the device
+PHONE_MIC_RESCAN_S = 5.0                 # rate limit for looking for the cable again
+PHONE_MIC_MAX_B64 = 4096                 # a sane AUD is ~856 chars; refuse the absurd
+VB_CABLE_PAGE = "https://vb-audio.com/Cable/"
+
+
+def pick_cable_device(devices, hostapis):
+    """Index of VB-CABLE's playback side ("CABLE Input"), or None. Prefers the
+    WASAPI copy, which can convert our 16 kHz to whatever rate the cable runs at
+    (MME lists the same device too, under a name cut to 31 characters)."""
+    best = None
+    for i, d in enumerate(devices):
+        if d.get("max_output_channels", 0) < 1:
+            continue
+        if not str(d.get("name", "")).startswith("CABLE Input"):
+            continue
+        try:
+            api = hostapis[d["hostapi"]]["name"]
+        except Exception:
+            api = ""
+        if "WASAPI" in api:
+            return i
+        if best is None:
+            best = i
+    return best
+
+
+class PhoneMicSink:
+    """Plays the phone's voice into VB-CABLE. Costs nothing until a phone streams:
+    no device is opened and nothing is scanned in the background. While it streams,
+    PortAudio's own thread pulls 20 ms at a time from a small buffer; the UDP thread
+    only appends to that buffer (feed), so it never waits on audio."""
+
+    def __init__(self, backend=None, loader=None):
+        self._sd = backend
+        self._lock = threading.Lock()
+        self._buf = bytearray()
+        self._primed = False
+        self._stream = None
+        self._busy = False          # a worker is opening the stream or scanning
+        self._last = 0.0            # monotonic time of the last frame
+        self._scanned = 0.0
+        self._device = None
+        self._wasapi = False
+        self.supported = backend is not None or loader is not None
+        if backend is not None:
+            self._scan(refresh=False)
+        elif loader is not None:
+            # Importing sounddevice starts PortAudio, which walks every audio
+            # device on the machine — up to a second or two with some drivers.
+            # Off the main thread, so the window never waits for it. Marked busy
+            # so a phone streaming meanwhile can't start a second worker.
+            self._busy = True
+            threading.Thread(target=self._load, args=(loader,), daemon=True).start()
+
+    @classmethod
+    def create(cls):
+        if not sys.platform.startswith("win"):
+            return cls(None)
+
+        def load():
+            import sounddevice
+            return sounddevice
+        return cls(loader=load)
+
+    def _load(self, loader):
+        try:
+            try:
+                sd = loader()
+            except Exception as e:
+                print(f"[phone mic] unavailable ({type(e).__name__}); pip install sounddevice")
+                self.supported = False
+                return
+            self._sd = sd
+            self._scan(refresh=False)
+        finally:
+            with self._lock:
+                self._busy = False
+
+    # ── state ──
+    def status(self):
+        """unsupported | checking (still starting) | missing (no VB-CABLE) |
+        ready | live."""
+        if not self.supported:
+            return "unsupported"
+        if self._sd is None:
+            return "checking"
+        if self._device is None:
+            return "missing"
+        if self._stream is not None and time.monotonic() - self._last < PHONE_MIC_IDLE_S:
+            return "live"
+        return "ready"
+
+    def phone_word(self):
+        """The fourth word of the VGET reply: None (no such feature), "0" (needs
+        VB-CABLE on the laptop) or "1" (ready)."""
+        st = self.status()
+        if st in ("unsupported", "checking"):
+            return None
+        return "0" if st == "missing" else "1"
+
+    # ── device discovery ──
+    def _scan(self, refresh):
+        try:
+            if refresh:
+                # PortAudio lists devices once, when it starts; a cable installed
+                # since then is only visible after a restart of the library. Only
+                # ever done with no stream open (callers guarantee it).
+                self._sd._terminate()
+                self._sd._initialize()
+            devs = list(self._sd.query_devices())
+            apis = list(self._sd.query_hostapis())
+            idx = pick_cable_device(devs, apis)
+            self._wasapi = idx is not None and "WASAPI" in apis[devs[idx]["hostapi"]]["name"]
+        except Exception:
+            idx = None
+        self._device = idx
+        self._scanned = time.monotonic()
+
+    def rescan_soon(self):
+        """Look for the cable again, off the calling thread (the GUI's "check
+        again"). A no-op while a stream is open or a worker is already busy."""
+        if not self.supported or self._sd is None:
+            return
+        with self._lock:
+            if self._stream is not None or self._busy:
+                return
+            self._busy = True
+        threading.Thread(target=self._worker, args=(True,), daemon=True).start()
+
+    # ── streaming ──
+    def feed(self, pcm):
+        """One frame from the phone. Called on the UDP thread: append and return."""
+        if not self.supported or self._sd is None or not pcm:
+            return
+        if len(pcm) % 2:
+            pcm = pcm[:-1]
+        now = time.monotonic()
+        start = False
+        with self._lock:
+            self._last = now
+            self._buf += pcm
+            over = len(self._buf) - PHONE_MIC_MAX_BUF
+            if over > 0:
+                del self._buf[:over + (over & 1)]   # keep whole 16-bit samples
+            if self._stream is None and not self._busy and (
+                    self._device is not None or now - self._scanned >= PHONE_MIC_RESCAN_S):
+                self._busy = start = True
+        if start:
+            threading.Thread(target=self._worker, args=(self._device is None,),
+                             daemon=True).start()
+
+    def _callback(self, outdata, frames, time_info, status):
+        n = frames * 2
+        with self._lock:
+            if not self._primed and len(self._buf) >= PHONE_MIC_PREBUF:
+                self._primed = True
+            chunk = b""
+            if self._primed:
+                chunk = bytes(self._buf[:n])
+                del self._buf[:n]
+                if len(chunk) < n:
+                    self._primed = False    # ran dry: rebuild the cushion first
+        outdata[:] = chunk + b"\x00" * (n - len(chunk))
+
+    def _worker(self, refresh):
+        """Open the stream (scanning first if asked), hold it while frames keep
+        coming, and release the device once they stop. One worker at a time."""
+        try:
+            if refresh or self._device is None:
+                self._scan(refresh=True)
+            if self._device is None or time.monotonic() - self._last >= PHONE_MIC_IDLE_S:
+                return
+            extra = self._sd.WasapiSettings(auto_convert=True) if self._wasapi else None
+            try:
+                st = self._sd.RawOutputStream(
+                    samplerate=PHONE_MIC_RATE, channels=1, dtype="int16",
+                    device=self._device, blocksize=PHONE_MIC_FRAME, latency="low",
+                    callback=self._callback, extra_settings=extra)
+                st.start()
+            except Exception as e:
+                print(f"[phone mic] couldn't open VB-CABLE ({type(e).__name__}: {e})")
+                self._device = None         # gone or broken: look again next time
+                return
+            with self._lock:
+                self._stream = st
+                self._primed = False
+            while time.monotonic() - self._last < PHONE_MIC_IDLE_S:
+                time.sleep(0.25)
+            with self._lock:
+                self._stream = None
+                self._buf.clear()
+            try:
+                st.stop()
+                st.close()
+            except Exception:
+                pass
+        finally:
+            with self._lock:
+                self._busy = False
+
+
+phone_mic = PhoneMicSink.create()
+
+
+def decode_audio(rest):
+    """PCM bytes from an AUD payload, or None if it isn't one."""
+    rest = rest.strip()
+    if not rest or len(rest) > PHONE_MIC_MAX_B64:
+        return None
+    try:
+        return base64.b64decode(rest, validate=True)
+    except Exception:
+        return None
+
+
 # ── brightness ──────────────────────────────────────────────────────────────
 # ── in-process WMI (no PowerShell) ─────────────────────────────────────────────
 # Brightness and the chassis type used to be read by starting `powershell.exe` —
@@ -1067,17 +1299,19 @@ def release_held_input():
     appswitch_reset()
 
 
-def volume_reply(vol, muted, mic_muted=None):
-    """The answer to VGET: "VOL n", plus " 1" / " 0" when mute is known, plus a
-    third word for the microphone's mute when that is known. An older phone reads
-    only the words it knows, so the extras cost it nothing. A known mic with an
-    unknown output mute holds the second slot with "-"."""
+def volume_reply(vol, muted, mic_muted=None, phone_mic=None):
+    """The answer to VGET: "VOL n [m [c [p]]]". m is output mute, c the laptop
+    mic's mute, p whether the phone can be the microphone ("1" ready, "0" needs
+    VB-CABLE on the laptop). Each word is sent only when known; an unknown word
+    that a later one needs holds its slot with "-". An older phone reads only the
+    words it knows, so the extras cost it nothing."""
+    def flag(v):
+        return "-" if v is None else ("1" if v else "0")
     words = [f"VOL {vol}"]
-    if muted is not None or mic_muted is not None:
-        words.append("-" if muted is None else ("1" if muted else "0"))
-    if mic_muted is not None:
-        words.append("1" if mic_muted else "0")
-    return " ".join(words)
+    tail = [flag(muted), flag(mic_muted), phone_mic if phone_mic is not None else "-"]
+    while tail and tail[-1] == "-":
+        tail.pop()
+    return " ".join(words + tail)
 
 
 def do_system(action):
@@ -4098,7 +4332,22 @@ def serve_loop(wire, emit, net, hostname):
                             mic = get_mic_muted() if get_mic_muted is not None else None
                         except Exception:
                             mic = None
-                        wire.reply(sock, addr, volume_reply(vol, muted, mic))
+                        wire.reply(sock, addr,
+                                   volume_reply(vol, muted, mic, phone_mic.phone_word()))
+                continue
+            if verb == "AUD":
+                # The phone's voice, 50 packets a second: no activity-log line, no
+                # handler dispatch, and its own guard (this is above the handler
+                # guard). Encrypted wire only. Still flows while the user has
+                # taken over the laptop's mouse — talking while typing is the
+                # point — but stops on a panic, which means "stop the phone".
+                if secure and not _panic_latched.is_set():
+                    try:
+                        pcm = decode_audio(rest)
+                        if pcm:
+                            phone_mic.feed(pcm)
+                    except Exception:
+                        pass
                 continue
             if verb == "BGET":
                 if brightness_svc.available:
@@ -5402,6 +5651,53 @@ class LazeRWindow:
             val.config(fg=_C["on_variant"], cursor="")
             val.unbind("<Button-1>")
 
+    # Phone microphone: what the row says in each state. Reading the state is a few
+    # attribute reads, so polling it once a second costs nothing.
+    _PMIC_TEXT = {
+        "missing": ("Needs VB-CABLE, a free virtual mic — click to get it. "
+                    "Install it, restart the PC, then reopen LazeR.", "warn"),
+        "ready":   ("Ready — in Zoom, Teams or Meet, choose \u201cCABLE Output\u201d "
+                    "as the microphone, then pick Phone mic on the phone.", "ok"),
+        "live":    ("Live — your phone is the microphone (\u201cCABLE Output\u201d).",
+                    "primary"),
+        "checking": ("checking…", "outline"),
+    }
+
+    def _poll_phone_mic_pill(self):
+        st = phone_mic.status()
+        if st != self._pmic_state:
+            if st == "live" and self._pmic_state is not None:
+                self._log("Phone microphone on", "act")
+            elif self._pmic_state == "live":
+                self._log("Phone microphone off", "info")
+            self._pmic_state = st
+            dot, val = self._pmic_pill
+            text, colour = self._PMIC_TEXT.get(st, ("unavailable", "outline"))
+            dot.config(fg=_C[colour])
+            val.config(text=text)
+            for ev in ("<Button-1>", "<Return>", "<space>"):
+                val.unbind(ev)
+            if st == "missing":
+                val.config(fg=_C["primary"], cursor="hand2")
+                self._clickable(val, self._get_vb_cable)
+            else:
+                val.config(fg=_C["on_variant"], cursor="", takefocus=0,
+                           highlightthickness=0)
+        self._root.after(1000, self._poll_phone_mic_pill)
+
+    def _get_vb_cable(self):
+        """Open VB-Audio's own page (the user installs it; we never download it),
+        and look for the cable again in case it is already there."""
+        import webbrowser
+        try:
+            webbrowser.open(VB_CABLE_PAGE)
+        except Exception as e:
+            self._log(f"Couldn't open {VB_CABLE_PAGE} ({type(e).__name__})", "warn")
+        self._log("Phone mic setup: install VB-CABLE from vb-audio.com, restart the "
+                  "PC, then choose \u201cCABLE Output\u201d as the microphone in your "
+                  "meeting app.", "info")
+        phone_mic.rescan_soon()
+
     def _open_releases(self):
         import webbrowser
         try:
@@ -5803,6 +6099,10 @@ class LazeRWindow:
         vol_ok = VOLUME_BACKEND is not None
         self._pill(pad, "Volume control",
                    VOLUME_BACKEND if vol_ok else "unavailable", vol_ok)
+        if phone_mic.supported:
+            self._pmic_pill = self._mutable_pill(pad, "Phone microphone", "")
+            self._pmic_state = None
+            self._poll_phone_mic_pill()
         # Both driven by live state: a registered mDNS record (not zeroconf importing),
         # and the Require-encryption toggle.
         self._disc_pill = self._mutable_pill(pad, "Auto-discovery", "checking…")
@@ -6203,6 +6503,17 @@ def run_terminal(token, key, ip, require_secure, update_check=True):
     print(f"  Laptop    : {hostname}")
     print(f"  Laptop IP : {ip or 'no network yet'}")
     print(f"  Port      : {PORT}")
+    if phone_mic.supported:
+        # Startup is looking for the cable off-thread; a moment is plenty.
+        for _ in range(30):
+            if phone_mic.status() != "checking":
+                break
+            time.sleep(0.1)
+        st = phone_mic.status()
+        if st in ("ready", "live"):
+            print("  Phone mic : ready (choose \"CABLE Output\" in your meeting app)")
+        elif st == "missing":
+            print(f"  Phone mic : needs VB-CABLE (free): {VB_CABLE_PAGE}")
     print(f"  Token     : {token}")
     sec = "ON (QR scan)" if _HAVE_CRYPTO else "unavailable (pip install cryptography)"
     print(f"  Encryption: {sec}" + ("  · plaintext blocked" if require_secure else ""))
